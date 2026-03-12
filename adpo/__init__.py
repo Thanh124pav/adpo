@@ -1,2 +1,3 @@
 # ADPO: Advantage Decomposition Policy Optimization
-__version__ = "0.1.0"
+# Phase-level credit assignment via log-probability boundaries + LLM-as-Judge.
+__version__ = "0.2.0"

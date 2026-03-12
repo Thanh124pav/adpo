@@ -1,11 +1,11 @@
 """
 Main entry point for ADPO training with verl.
 
-Registers the ADPO advantage estimator, then delegates to verl's standard
-GRPO training pipeline.
+Registers the ADPO phase-based advantage decomposition, then delegates
+to verl's standard GRPO training pipeline.
 
 Usage:
-    python -m adpo.main_adpo algorithm.adpo_beta=1.0 ...
+    python -m adpo.main_adpo algorithm.judge_type=vllm ...
 """
 
 import hydra
@@ -15,40 +15,31 @@ import logging
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo import core_algos
 
-from adpo.adpo_algorithm import compute_grpo_outcome_advantage_adpo
+from adpo.adpo_trainer import patch_verl_grpo_with_adpo
 
 logger = logging.getLogger(__name__)
-
-
-def register_adpo_advantage(beta: float = 1.0, norm_adv_by_std: bool = True):
-    """Register ADPO as a custom advantage estimator in verl."""
-    _original_grpo = core_algos.compute_grpo_outcome_advantage
-
-    def adpo_compute_advantage(token_level_scores, response_mask, index, **kwargs):
-        token_log_probs = kwargs.pop("token_log_probs", None)
-        if token_log_probs is None:
-            logger.warning("[ADPO] token_log_probs not provided, falling back to GRPO.")
-            return _original_grpo(token_level_scores, response_mask, index, **kwargs)
-        return compute_grpo_outcome_advantage_adpo(
-            token_log_probs=token_log_probs,
-            rewards=token_level_scores,
-            response_mask=response_mask,
-            index=index,
-            beta=beta,
-            norm_adv_by_std=norm_adv_by_std,
-        )
-
-    core_algos.compute_grpo_outcome_advantage = adpo_compute_advantage
-    logger.info(f"[ADPO] Registered advantage estimator (beta={beta})")
 
 
 @hydra.main(config_path="../configs", config_name="adpo_trainer", version_base=None)
 def main(config: DictConfig):
     """Launch ADPO training."""
     print(OmegaConf.to_yaml(config))
-    adpo_beta = config.algorithm.get("adpo_beta", 1.0)
-    norm_adv = config.algorithm.get("norm_adv_by_std_in_grpo", True)
-    register_adpo_advantage(beta=adpo_beta, norm_adv_by_std=norm_adv)
+
+    algo = config.algorithm
+
+    # Patch verl with ADPO phase decomposition
+    patch_verl_grpo_with_adpo(
+        judge_type=algo.get("judge_type", "rule"),
+        judge_model=algo.get("judge_model", "Qwen/Qwen2.5-7B-Instruct"),
+        phase_method=algo.get("phase_method", "adaptive"),
+        phase_percentile=algo.get("phase_percentile", 85.0),
+        phase_min_len=algo.get("phase_min_len", 10),
+        phase_max_K=algo.get("phase_max_K", 10),
+        phase_sigma=algo.get("phase_sigma", 0.0),
+        norm_by_std=algo.get("norm_adv_by_std_in_grpo", True),
+    )
+
+    # Launch verl trainer
     trainer = RayPPOTrainer(config)
     trainer.fit()
 
