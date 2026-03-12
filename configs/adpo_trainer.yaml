@@ -1,0 +1,64 @@
+defaults:
+  - _self_
+
+algorithm:
+  adv_estimator: grpo
+  adpo_beta: 1.0
+  norm_adv_by_std_in_grpo: true
+  use_kl_in_reward: false
+  kl_ctrl:
+    type: fixed
+    kl_coef: 0.001
+
+actor_rollout_ref:
+  model:
+    path: Qwen/Qwen2.5-Math-7B
+    override_config: {}
+    enable_gradient_checkpointing: true
+  actor:
+    ppo_mini_batch_size: 128
+    ppo_epochs: 1
+    loss_agg_mode: token-mean
+    use_kl_loss: true
+    kl_loss_coef: 0.001
+    kl_loss_type: low_var_kl
+    clip_ratio: 0.2
+    entropy_coeff: 0.0
+  rollout:
+    name: vllm
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    n: 8
+    max_new_tokens: 2048
+    tensor_model_parallel_size: 1
+    gpu_memory_utilization: 0.4
+  ref:
+    fsdp_config:
+      param_offload: true
+
+data:
+  train_files: data/processed/train/math.parquet
+  val_files: data/processed/eval/math500.parquet
+  train_batch_size: 128
+  max_prompt_length: 1024
+  max_response_length: 2048
+  shuffle: true
+
+custom_reward_function:
+  path: adpo/reward_functions.py
+  name: compute_score
+
+trainer:
+  total_epochs: 3
+  save_freq: 50
+  test_freq: 50
+  log_freq: 1
+  project_name: adpo
+  experiment_name: adpo-qwen-7b-math
+  logger:
+    - wandb
+  default_local_dir: checkpoints/
+
+resources:
+  num_gpus: 8
