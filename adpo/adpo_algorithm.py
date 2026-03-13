@@ -330,8 +330,7 @@ def compute_global_advantages(
 
     Returns:
         global_advantages: (batch, max_K) -- same value per phase within a response.
-        global_stds: (max_K,) std of per-phase rewards across group.
-                     Indexed by phase k for the adaptive lambda formula.
+        global_std: (scalar per group) std of response scores across G generations.
     """
     batch_size, max_K = phase_rewards.shape
     device = phase_rewards.device
@@ -341,8 +340,9 @@ def compute_global_advantages(
     response_scores = (phase_rewards * phase_mask).sum(dim=1) / phase_count  # (batch,)
 
     global_advantages = torch.zeros_like(phase_rewards)
-    # sigma_k^global: std of phase k rewards across all G responses in group
-    global_stds = torch.zeros(max_K, device=device)
+    # sigma^global: std of response scores across G generations (one scalar per group)
+    # We store per-sample so each response knows its group's std
+    global_stds = torch.zeros(batch_size, device=device)
 
     unique_indices = torch.unique(index)
 
@@ -350,17 +350,15 @@ def compute_global_advantages(
         group_mask = (index == uid)
         group_scores = response_scores[group_mask]
         group_mean = group_scores.mean()
+        group_std = group_scores.std() if group_scores.numel() > 1 else torch.tensor(0.0, device=device)
 
         # A_global = score_i - mean(scores) (Dr.GRPO: no division by std)
         adv = group_scores - group_mean
         # Broadcast same global advantage to all phases
         global_advantages[group_mask] = adv.unsqueeze(1) * phase_mask[group_mask]
 
-        # Compute sigma_k^global for each phase k across this group
-        for k in range(max_K):
-            k_mask = group_mask & (phase_mask[:, k] > 0)
-            if k_mask.sum() > 1:
-                global_stds[k] = phase_rewards[k_mask, k].std()
+        # sigma^global = std of response scores in this group
+        global_stds[group_mask] = group_std
 
     return global_advantages, global_stds
 
@@ -373,17 +371,19 @@ def compute_phase_advantages(
 ) -> torch.Tensor:
     """Compute ADPO advantages: adaptive weighted mean of local and global.
 
-    A_{i,k} = lambda_k * A_{i,k}^local + (1 - lambda_k) * A_{i,k}^global
+    A_{i,k} = lambda * A_{i,k}^local + (1 - lambda) * A_{i,k}^global
 
     where:
-        lambda_k = sigma_k^global / (sigma_k^global + sigma_i^local + eps)
+        lambda = sigma^global / (sigma^global + sigma_i^local + eps)
+
+        sigma^global = std of response scores across G generations
+        sigma_i^local = std of phase rewards within response i
 
     Intuition:
-    - sigma_k^global HIGH (cross-generation variance large for phase k)
-      → lambda_k HIGH → trust local signal more (global is noisy)
-    - sigma_i^local HIGH (within-response variance large)
-      → lambda_k LOW → trust global signal more (local is noisy)
-    - Both low → balanced mix
+    - sigma^global HIGH (responses vary a lot across group)
+      → lambda HIGH → trust local signal more (global is noisy)
+    - sigma_i^local HIGH (phases vary a lot within response)
+      → lambda LOW → trust global signal more (local is noisy)
 
     This avoids Dr.GRPO's problem: instead of dividing by std (which
     amplifies noise when std≈0), we adaptively weight between two
@@ -396,21 +396,21 @@ def compute_phase_advantages(
     local_adv, local_stds = compute_local_advantages(
         phase_rewards, phase_mask, eps=eps,
     )
+    # local_stds: (batch,) -- sigma_i^local per response
 
     # Global: response i vs other responses (GRPO-style, no std division)
     global_adv, global_stds = compute_global_advantages(
         phase_rewards, phase_mask, index, eps=eps,
     )
+    # global_stds: (batch,) -- sigma^global per response (same within a group)
 
-    # Adaptive lambda_k = sigma_k^global / (sigma_k^global + sigma_i^local + eps)
-    # global_stds: (max_K,)  -- per phase across group
-    # local_stds:  (batch,)  -- per response across phases
-    lambda_k = global_stds.unsqueeze(0) / (
-        global_stds.unsqueeze(0) + local_stds.unsqueeze(1) + eps
-    )  # (batch, max_K)
+    # Adaptive lambda = sigma^global / (sigma^global + sigma_i^local + eps)
+    # Both are (batch,), broadcast to (batch, max_K) via unsqueeze
+    lam = global_stds / (global_stds + local_stds + eps)  # (batch,)
+    lam = lam.unsqueeze(1).expand_as(phase_rewards)       # (batch, max_K)
 
     # Adaptive weighted mean
-    phase_advantages = lambda_k * local_adv + (1 - lambda_k) * global_adv
+    phase_advantages = lam * local_adv + (1 - lam) * global_adv
     phase_advantages = phase_advantages * phase_mask
 
     return phase_advantages
