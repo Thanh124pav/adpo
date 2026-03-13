@@ -10,14 +10,19 @@ Usage:
 """
 
 import argparse
+import gc
 import json
 import os
 
 import datasets
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+BATCH_SIZE = 10_000  # write parquet every N records to avoid OOM
 
 
-SYSTEM_PROMPT = "Please reason step by step, and put your final answer within \\boxed{}."
+SYSTEM_PROMPT = "Please reason step by step, each reasoning phase should ended with '.', and put your final answer within \\boxed{}."
 
 
 def make_prompt(question: str) -> list:
@@ -46,7 +51,10 @@ def load_gsm8k(split="train"):
 
 
 def load_math(split="train"):
-    ds = datasets.load_dataset("hendrycks/competition_math", split=split)
+    try:
+        ds = datasets.load_dataset("lighteval/MATH", split=split)
+    except Exception:
+        ds = datasets.load_dataset("DigitalLearningGmbH/MATH-lighteval", split=split)
     records = []
     for i, row in enumerate(ds):
         records.append({
@@ -80,85 +88,94 @@ def load_math500():
 
 
 def load_numina_math(split="train"):
-    ds = datasets.load_dataset("AI-MO/NuminaMath-1.5", split=split)
-    records = []
+    ds = datasets.load_dataset("AI-MO/NuminaMath-1.5", split=split, streaming=True)
     for i, row in enumerate(ds):
         question = row.get("problem", row.get("question", ""))
         answer = row.get("solution", row.get("answer", ""))
-        records.append({
+        yield {
             "data_source": "numina_math",
             "prompt": make_prompt(question),
             "ability": "math",
             "reward_model": {"ground_truth": answer},
             "extra_info": {"split": split, "index": i, "source": row.get("source", "")},
-        })
-    return records
+        }
 
 
-def load_open_math_reasoning(split="train"):
+def load_open_math_reasoning(split="cot"):
     ds = datasets.load_dataset("nvidia/OpenMathReasoning", split=split, streaming=True)
-    records = []
     for i, row in enumerate(ds):
         question = row.get("problem", row.get("question", ""))
         answer = row.get("expected_answer", row.get("solution", ""))
-        records.append({
+        yield {
             "data_source": "open_math_reasoning",
             "prompt": make_prompt(question),
             "ability": "math",
             "reward_model": {"ground_truth": answer},
             "extra_info": {"split": split, "index": i},
-        })
+        }
         if i >= 500_000:
             break
-    return records
 
 
 def load_aops_instruct(split="train"):
-    ds = datasets.load_dataset("qq8933/AoPS-Instruct", split=split)
-    records = []
+    """AoPS problems via OpenMathReasoning (AoPS-sourced subset)."""
+    ds = datasets.load_dataset("nvidia/OpenMathReasoning", split="cot", streaming=True)
+    count = 0
     for i, row in enumerate(ds):
+        source = row.get("problem_source", "")
+        if "aops" not in source.lower():
+            continue
         question = row.get("problem", row.get("question", ""))
-        answer = row.get("solution", row.get("answer", ""))
-        records.append({
+        answer = row.get("expected_answer", row.get("solution", ""))
+        yield {
             "data_source": "aops_instruct",
             "prompt": make_prompt(question),
             "ability": "math",
             "reward_model": {"ground_truth": answer},
-            "extra_info": {"split": split, "index": i},
-        })
-    return records
+            "extra_info": {"split": split, "index": i, "source": source},
+        }
+        count += 1
+        if count >= 100_000:
+            break
 
 
 def load_big_math_rl(split="train"):
-    ds = datasets.load_dataset("SynthLabsAI/Big-Math-RL-Verified", split=split)
-    records = []
+    try:
+        ds = datasets.load_dataset("SynthLabsAI/Big-Math-RL-Verified", split=split, streaming=True)
+    except Exception:
+        ds = datasets.load_dataset("open-r1/Big-Math-RL-Verified-Processed", "all", split=split, streaming=True)
     for i, row in enumerate(ds):
         question = row.get("problem", row.get("question", ""))
-        answer = row.get("solution", row.get("answer", ""))
-        records.append({
+        answer = row.get("answer", row.get("solution", ""))
+        yield {
             "data_source": "big_math_rl",
             "prompt": make_prompt(question),
             "ability": "math",
             "reward_model": {"ground_truth": answer},
             "extra_info": {"split": split, "index": i},
-        })
-    return records
+        }
 
 
 def load_fine_math(split="train"):
-    ds = datasets.load_dataset("HuggingFaceTB/finemath", split=split)
-    records = []
+    """FineMath is a web corpus (no Q&A pairs). Use NuminaMath-1.5 filtered subset instead."""
+    ds = datasets.load_dataset("AI-MO/NuminaMath-1.5", split=split, streaming=True)
+    count = 0
     for i, row in enumerate(ds):
-        records.append({
+        source = row.get("source", "")
+        if source not in ("cn_k12", "orca_math", "synthetic_math"):
+            continue
+        question = row.get("problem", row.get("question", ""))
+        answer = row.get("solution", row.get("answer", ""))
+        yield {
             "data_source": "fine_math",
-            "prompt": make_prompt(row.get("text", "")),
+            "prompt": make_prompt(question),
             "ability": "math",
-            "reward_model": {"ground_truth": ""},
-            "extra_info": {"split": split, "index": i},
-        })
-        if i >= 200_000:
+            "reward_model": {"ground_truth": answer},
+            "extra_info": {"split": split, "index": i, "source": source},
+        }
+        count += 1
+        if count >= 200_000:
             break
-    return records
 
 
 # ---------------------------------------------------------------------------
@@ -166,50 +183,45 @@ def load_fine_math(split="train"):
 # ---------------------------------------------------------------------------
 
 def load_amc_2023():
-    ds = datasets.load_dataset("AI-MO/amc-aime-dataset", split="test")
+    ds = datasets.load_dataset("AI-MO/aimo-validation-amc", split="train")
     records = []
     for i, row in enumerate(ds):
-        year = str(row.get("year", ""))
-        comp = row.get("competition", "").lower()
-        if "2023" in year and "amc" in comp:
-            records.append({
-                "data_source": "amc_2023",
-                "prompt": make_prompt(row["problem"]),
-                "ability": "math",
-                "reward_model": {"ground_truth": str(row["answer"])},
-                "extra_info": {"split": "test", "index": i, "year": year},
-            })
+        records.append({
+            "data_source": "amc_2023",
+            "prompt": make_prompt(row["problem"]),
+            "ability": "math",
+            "reward_model": {"ground_truth": str(row["answer"])},
+            "extra_info": {"split": "test", "index": i},
+        })
     return records
 
 
 def load_aime_2024():
-    ds = datasets.load_dataset("AI-MO/amc-aime-dataset", split="test")
-    records = []
-    for i, row in enumerate(ds):
-        year = str(row.get("year", ""))
-        comp = row.get("competition", "").lower()
-        if "2024" in year and "aime" in comp:
-            records.append({
-                "data_source": "aime_2024",
-                "prompt": make_prompt(row["problem"]),
-                "ability": "math",
-                "reward_model": {"ground_truth": str(row["answer"])},
-                "extra_info": {"split": "test", "index": i},
-            })
-    return records
-
-
-def load_aime_2025():
-    ds = datasets.load_dataset("opencompass/AIME2025", split="test")
+    ds = datasets.load_dataset("AI-MO/aimo-validation-aime", split="train")
     records = []
     for i, row in enumerate(ds):
         records.append({
-            "data_source": "aime_2025",
-            "prompt": make_prompt(row.get("problem", row.get("question", ""))),
+            "data_source": "aime_2024",
+            "prompt": make_prompt(row["problem"]),
             "ability": "math",
             "reward_model": {"ground_truth": str(row.get("answer", row.get("solution", "")))},
             "extra_info": {"split": "test", "index": i},
         })
+    return records
+
+
+def load_aime_2025():
+    records = []
+    for config in ("AIME2025-I", "AIME2025-II"):
+        ds = datasets.load_dataset("opencompass/AIME2025", config, split="test")
+        for i, row in enumerate(ds):
+            records.append({
+                "data_source": "aime_2025",
+                "prompt": make_prompt(row.get("question", row.get("problem", ""))),
+                "ability": "math",
+                "reward_model": {"ground_truth": str(row.get("answer", ""))},
+                "extra_info": {"split": "test", "index": len(records), "config": config},
+            })
     return records
 
 
@@ -221,21 +233,21 @@ def load_olympiad_bench():
             "data_source": "olympiad_bench",
             "prompt": make_prompt(row.get("question", "")),
             "ability": "math",
-            "reward_model": {"ground_truth": row.get("final_answer", [""])[0]},
+            "reward_model": {"ground_truth": (row.get("final_answer") or [""])[0]},
             "extra_info": {"split": "test", "index": i},
         })
     return records
 
 
 def load_minerva_math():
-    ds = datasets.load_dataset("math-ai/minerva_math", split="test")
+    ds = datasets.load_dataset("math-ai/minervamath", split="test")
     records = []
     for i, row in enumerate(ds):
         records.append({
             "data_source": "minerva_math",
-            "prompt": make_prompt(row.get("problem", "")),
+            "prompt": make_prompt(row.get("question", row.get("problem", ""))),
             "ability": "math",
-            "reward_model": {"ground_truth": row.get("solution", "")},
+            "reward_model": {"ground_truth": row.get("answer", row.get("solution", ""))},
             "extra_info": {"split": "test", "index": i},
         })
     return records
@@ -256,7 +268,7 @@ def load_omni_math():
 
 
 def load_hmmt():
-    ds = datasets.load_dataset("keirp/HMMT", split="test")
+    ds = datasets.load_dataset("MathArena/hmmt_feb_2025", split="train")
     records = []
     for i, row in enumerate(ds):
         records.append({
@@ -270,21 +282,21 @@ def load_hmmt():
 
 
 def load_brumo():
-    ds = datasets.load_dataset("Idavidrein/BRUMO", split="test")
+    ds = datasets.load_dataset("MathArena/brumo_2025", split="train")
     records = []
     for i, row in enumerate(ds):
         records.append({
             "data_source": "brumo",
-            "prompt": make_prompt(row.get("question", row.get("problem", ""))),
+            "prompt": make_prompt(row.get("problem", row.get("question", ""))),
             "ability": "math",
-            "reward_model": {"ground_truth": str(row.get("answer", row.get("solution", "")))},
+            "reward_model": {"ground_truth": str(row.get("answer", ""))},
             "extra_info": {"split": "test", "index": i},
         })
     return records
 
 
 def load_cmimc():
-    ds = datasets.load_dataset("I-Manuella/CMIMC_math", split="test")
+    ds = datasets.load_dataset("MathArena/cmimc_2025", split="train")
     records = []
     for i, row in enumerate(ds):
         records.append({
@@ -315,20 +327,53 @@ EVAL_DATASETS = {
 }
 
 
+PARQUET_SCHEMA = pa.schema([
+    ("data_source", pa.string()),
+    ("prompt", pa.string()),
+    ("ability", pa.string()),
+    ("reward_model", pa.string()),
+    ("extra_info", pa.string()),
+])
+
+
+def _serialize_record(r):
+    return {
+        "data_source": r["data_source"],
+        "prompt": json.dumps(r["prompt"], ensure_ascii=False),
+        "ability": r["ability"],
+        "reward_model": json.dumps(r["reward_model"], ensure_ascii=False),
+        "extra_info": json.dumps(r["extra_info"], ensure_ascii=False),
+    }
+
+
 def save_to_parquet(records, output_path):
-    rows = []
-    for r in records:
-        rows.append({
-            "data_source": r["data_source"],
-            "prompt": json.dumps(r["prompt"], ensure_ascii=False),
-            "ability": r["ability"],
-            "reward_model": json.dumps(r["reward_model"], ensure_ascii=False),
-            "extra_info": json.dumps(r["extra_info"], ensure_ascii=False),
-        })
-    df = pd.DataFrame(rows)
+    """Save records to parquet in batches to avoid OOM."""
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    df.to_parquet(output_path, index=False)
-    print(f"Saved {len(df)} examples to {output_path}")
+    writer = None
+    total = 0
+    batch = []
+    try:
+        for r in records:
+            batch.append(_serialize_record(r))
+            if len(batch) >= BATCH_SIZE:
+                table = pa.Table.from_pylist(batch, schema=PARQUET_SCHEMA)
+                if writer is None:
+                    writer = pq.ParquetWriter(output_path, PARQUET_SCHEMA)
+                writer.write_table(table)
+                total += len(batch)
+                batch.clear()
+                gc.collect()
+        if batch:
+            table = pa.Table.from_pylist(batch, schema=PARQUET_SCHEMA)
+            if writer is None:
+                writer = pq.ParquetWriter(output_path, PARQUET_SCHEMA)
+            writer.write_table(table)
+            total += len(batch)
+            batch.clear()
+    finally:
+        if writer is not None:
+            writer.close()
+    print(f"Saved {total} examples to {output_path}")
 
 
 def main():
