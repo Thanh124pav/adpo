@@ -276,40 +276,142 @@ def compute_soft_phase_weights(
 # Phase-Level Advantage Computation
 # ---------------------------------------------------------------------------
 
+def compute_local_advantages(
+    phase_rewards: torch.Tensor,
+    phase_mask: torch.Tensor,
+    eps: float = 1e-8,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute LOCAL advantages: phase k vs other phases within the SAME response.
+
+    A_{i,k}^local = r_{i,k} - mean(r_{i,1}, ..., r_{i,K})
+
+    This tells us: "Is phase k better or worse than the average phase
+    in this response?"
+
+    Returns:
+        local_advantages: (batch, max_K)
+        local_stds: (batch,) std of phase rewards within each response.
+    """
+    batch_size, max_K = phase_rewards.shape
+
+    # Mean reward per response (only over existing phases)
+    phase_count = phase_mask.sum(dim=1).clamp(min=1)  # (batch,)
+    mean_per_response = (phase_rewards * phase_mask).sum(dim=1) / phase_count  # (batch,)
+
+    # Local advantage: r_{i,k} - mean_k(r_{i,k})
+    local_advantages = (phase_rewards - mean_per_response.unsqueeze(1)) * phase_mask
+
+    # Std per response (for adaptive lambda)
+    # sigma_i^local = std of phase rewards within response i
+    sq_diff = ((phase_rewards - mean_per_response.unsqueeze(1)) ** 2) * phase_mask
+    variance = sq_diff.sum(dim=1) / phase_count.clamp(min=1)
+    local_stds = torch.sqrt(variance + eps)  # (batch,)
+
+    return local_advantages, local_stds
+
+
+def compute_global_advantages(
+    phase_rewards: torch.Tensor,
+    phase_mask: torch.Tensor,
+    index: torch.Tensor,
+    eps: float = 1e-8,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute GLOBAL advantages: response i vs other G responses (GRPO-style).
+
+    Uses the MEAN of phase rewards as overall response score:
+        score_i = mean(r_{i,1}, ..., r_{i,K})
+        A_{i,k}^global = score_i - mean_j(score_j)
+
+    This tells us: "Is this response overall better or worse than the
+    group average?" Applied uniformly to all phases.
+
+    NOTE: Does NOT divide by std (Dr.GRPO style) to avoid the
+    small-std amplification problem.
+
+    Returns:
+        global_advantages: (batch, max_K) -- same value per phase within a response.
+        global_stds: (max_K,) std of per-phase rewards across group.
+                     Indexed by phase k for the adaptive lambda formula.
+    """
+    batch_size, max_K = phase_rewards.shape
+    device = phase_rewards.device
+
+    # Response-level score = mean of phase rewards
+    phase_count = phase_mask.sum(dim=1).clamp(min=1)
+    response_scores = (phase_rewards * phase_mask).sum(dim=1) / phase_count  # (batch,)
+
+    global_advantages = torch.zeros_like(phase_rewards)
+    # sigma_k^global: std of phase k rewards across all G responses in group
+    global_stds = torch.zeros(max_K, device=device)
+
+    unique_indices = torch.unique(index)
+
+    for uid in unique_indices:
+        group_mask = (index == uid)
+        group_scores = response_scores[group_mask]
+        group_mean = group_scores.mean()
+
+        # A_global = score_i - mean(scores) (Dr.GRPO: no division by std)
+        adv = group_scores - group_mean
+        # Broadcast same global advantage to all phases
+        global_advantages[group_mask] = adv.unsqueeze(1) * phase_mask[group_mask]
+
+        # Compute sigma_k^global for each phase k across this group
+        for k in range(max_K):
+            k_mask = group_mask & (phase_mask[:, k] > 0)
+            if k_mask.sum() > 1:
+                global_stds[k] = phase_rewards[k_mask, k].std()
+
+    return global_advantages, global_stds
+
+
 def compute_phase_advantages(
     phase_rewards: torch.Tensor,
     phase_mask: torch.Tensor,
     index: torch.Tensor,
-    norm_by_std: bool = True,
     eps: float = 1e-8,
 ) -> torch.Tensor:
-    """Compute GRPO-style advantages at the phase level.
+    """Compute ADPO advantages: adaptive weighted mean of local and global.
 
-    A_i^(k) = r_k^(i) - mean_j(r_k^(j))  [/ std if norm_by_std]
+    A_{i,k} = lambda_k * A_{i,k}^local + (1 - lambda_k) * A_{i,k}^global
 
-    Compares reward of phase k in response i with average across
-    all G generations of the same prompt.
+    where:
+        lambda_k = sigma_k^global / (sigma_k^global + sigma_i^local + eps)
+
+    Intuition:
+    - sigma_k^global HIGH (cross-generation variance large for phase k)
+      → lambda_k HIGH → trust local signal more (global is noisy)
+    - sigma_i^local HIGH (within-response variance large)
+      → lambda_k LOW → trust global signal more (local is noisy)
+    - Both low → balanced mix
+
+    This avoids Dr.GRPO's problem: instead of dividing by std (which
+    amplifies noise when std≈0), we adaptively weight between two
+    complementary signals.
     """
     batch_size, max_K = phase_rewards.shape
-    phase_advantages = torch.zeros_like(phase_rewards)
-    unique_indices = torch.unique(index)
+    device = phase_rewards.device
 
-    for idx in unique_indices:
-        group_mask = (index == idx)
+    # Local: phase k vs other phases in same response
+    local_adv, local_stds = compute_local_advantages(
+        phase_rewards, phase_mask, eps=eps,
+    )
 
-        for k in range(max_K):
-            k_mask = group_mask & (phase_mask[:, k] > 0)
-            if k_mask.sum() <= 1:
-                continue
+    # Global: response i vs other responses (GRPO-style, no std division)
+    global_adv, global_stds = compute_global_advantages(
+        phase_rewards, phase_mask, index, eps=eps,
+    )
 
-            rewards_k = phase_rewards[k_mask, k]
-            mean_k = rewards_k.mean()
-            std_k = rewards_k.std()
+    # Adaptive lambda_k = sigma_k^global / (sigma_k^global + sigma_i^local + eps)
+    # global_stds: (max_K,)  -- per phase across group
+    # local_stds:  (batch,)  -- per response across phases
+    lambda_k = global_stds.unsqueeze(0) / (
+        global_stds.unsqueeze(0) + local_stds.unsqueeze(1) + eps
+    )  # (batch, max_K)
 
-            if norm_by_std and std_k > eps:
-                phase_advantages[k_mask, k] = (rewards_k - mean_k) / (std_k + eps)
-            else:
-                phase_advantages[k_mask, k] = rewards_k - mean_k
+    # Adaptive weighted mean
+    phase_advantages = lambda_k * local_adv + (1 - lambda_k) * global_adv
+    phase_advantages = phase_advantages * phase_mask
 
     return phase_advantages
 
@@ -355,13 +457,19 @@ def compute_adpo_phase_advantages(
     response_mask: torch.Tensor,
     index: torch.Tensor,
     boundaries_batch: List[List[int]],
-    norm_by_std: bool = True,
     sigma: float = 0.0,
     eps: float = 1e-8,
 ) -> torch.Tensor:
     """Full ADPO pipeline: phase rewards -> phase advantages -> token advantages.
 
     Called after LLM-as-Judge has scored each phase.
+
+    Advantages are computed as adaptive weighted mean of:
+    - Local: phase k vs other phases within same response
+    - Global: response i vs other G responses (Dr.GRPO-style, no std division)
+
+    lambda_k = sigma_k^global / (sigma_k^global + sigma_i^local + eps)
+    A_{i,k} = lambda_k * A_local + (1-lambda_k) * A_global
     """
     seq_len = response_mask.shape[1]
 
@@ -369,7 +477,6 @@ def compute_adpo_phase_advantages(
         phase_rewards=phase_rewards,
         phase_mask=phase_mask,
         index=index,
-        norm_by_std=norm_by_std,
         eps=eps,
     )
 

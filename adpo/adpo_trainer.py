@@ -63,7 +63,6 @@ class ADPOTrainer(RayPPOTrainer):
         self.phase_min_len = getattr(algo, "phase_min_len", 10)
         self.phase_max_K = getattr(algo, "phase_max_K", 10)
         self.phase_sigma = getattr(algo, "phase_sigma", 0.0)
-        self.norm_adv_by_std = getattr(algo, "norm_adv_by_std_in_grpo", True)
         self.max_ref_in_prompt = getattr(algo, "max_ref_solutions_in_prompt", 3)
 
         # Judge
@@ -223,7 +222,6 @@ class ADPOTrainer(RayPPOTrainer):
             response_mask=response_mask,
             index=index,
             boundaries_batch=boundaries_batch,
-            norm_by_std=self.norm_adv_by_std,
             sigma=self.phase_sigma,
         )
 
@@ -254,7 +252,6 @@ def patch_verl_grpo_with_adpo(
     phase_min_len: int = 10,
     phase_max_K: int = 10,
     phase_sigma: float = 0.0,
-    norm_by_std: bool = True,
     max_solutions_per_question: int = 8,
     solution_bank_dir: str = "data/solutions",
     max_ref_solutions_in_prompt: int = 3,
@@ -341,7 +338,6 @@ def patch_verl_grpo_with_adpo(
             response_mask=response_mask,
             index=index,
             boundaries_batch=boundaries_batch,
-            norm_by_std=norm_by_std,
             sigma=phase_sigma,
         )
 

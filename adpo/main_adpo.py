@@ -36,7 +36,6 @@ def main(config: DictConfig):
         phase_min_len=algo.get("phase_min_len", 10),
         phase_max_K=algo.get("phase_max_K", 10),
         phase_sigma=algo.get("phase_sigma", 0.0),
-        norm_by_std=algo.get("norm_adv_by_std_in_grpo", True),
         max_solutions_per_question=algo.get("max_solutions_per_question", 8),
         solution_bank_dir=algo.get("solution_bank_dir", "data/solutions"),
         max_ref_solutions_in_prompt=algo.get("max_ref_solutions_in_prompt", 3),

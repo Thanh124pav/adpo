@@ -20,7 +20,7 @@ algorithm:
   solution_bank_save_path: checkpoints/solution_bank.jsonl  # Runtime save path
   solution_bank_save_freq: 50     # Save bank every N training steps
   # --- Advantage normalization ---
-  norm_adv_by_std_in_grpo: true
+  # ADPO uses adaptive lambda (no std division, avoids Dr.GRPO issue)
   use_kl_in_reward: false
   kl_ctrl:
     type: fixed
