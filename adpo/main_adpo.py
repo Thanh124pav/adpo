@@ -27,7 +27,7 @@ def main(config: DictConfig):
 
     algo = config.algorithm
 
-    # Patch verl with ADPO phase decomposition
+    # Patch verl with ADPO phase decomposition + SolutionBank
     patch_verl_grpo_with_adpo(
         judge_type=algo.get("judge_type", "rule"),
         judge_model=algo.get("judge_model", "Qwen/Qwen2.5-7B-Instruct"),
@@ -37,6 +37,9 @@ def main(config: DictConfig):
         phase_max_K=algo.get("phase_max_K", 10),
         phase_sigma=algo.get("phase_sigma", 0.0),
         norm_by_std=algo.get("norm_adv_by_std_in_grpo", True),
+        max_solutions_per_question=algo.get("max_solutions_per_question", 8),
+        solution_bank_dir=algo.get("solution_bank_dir", "data/solutions"),
+        max_ref_solutions_in_prompt=algo.get("max_ref_solutions_in_prompt", 3),
     )
 
     # Launch verl trainer

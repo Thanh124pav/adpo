@@ -13,6 +13,12 @@ algorithm:
   # --- LLM-as-Judge ---
   judge_type: rule             # "rule" (answer-matching), "vllm" (local), "api" (remote)
   judge_model: Qwen/Qwen2.5-7B-Instruct  # Model for vllm/api judge
+  max_ref_solutions_in_prompt: 3  # Number of reference solutions shown to judge
+  # --- SolutionBank ---
+  max_solutions_per_question: 8   # Max solutions stored per question
+  solution_bank_dir: data/solutions  # Directory with pre-generated .jsonl solutions
+  solution_bank_save_path: checkpoints/solution_bank.jsonl  # Runtime save path
+  solution_bank_save_freq: 50     # Save bank every N training steps
   # --- Advantage normalization ---
   norm_adv_by_std_in_grpo: true
   use_kl_in_reward: false
