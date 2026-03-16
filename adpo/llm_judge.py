@@ -44,8 +44,8 @@ PHASE_JUDGE_SYSTEM = (
     "Scoring guide:\n"
     "- 1.0: Step is mathematically correct and clearly advances toward the answer\n"
     "- 0.7-0.9: Step is correct but could be more efficient or clear\n"
-    "- 0.4-0.6: Step has partial correctness but contains errors or goes off track\n"
-    "- 0.1-0.3: Step is mostly incorrect or contradicts reference solutions\n"
+    "- 0.4-0.6: Step is correct but there is an other step that advances toward the answer more efficient"
+    "- 0.1-0.3: Step has partial correctness but contains errors or goes off track\n"
     "- 0.0: Step is completely wrong or leads away from the correct answer"
 )
 
