@@ -11,11 +11,11 @@ from typing import Optional
 
 
 def extract_boxed_answer(text: str) -> Optional[str]:
-    """Extract answer from \boxed{...} in LaTeX-formatted responses."""
-    idx = text.rfind("\boxed{")
+    """Extract answer from \\boxed{...} in LaTeX-formatted responses."""
+    idx = text.rfind(r"\boxed{")
     if idx == -1:
         return None
-    i = idx + len("\boxed{")
+    i = idx + len(r"\boxed{")
     depth = 1
     result = []
     while i < len(text) and depth > 0:
@@ -74,13 +74,13 @@ def normalize_answer(answer: str) -> str:
     if answer is None:
         return ""
     answer = answer.strip()
-    answer = answer.replace("\$", "").replace("$", "")
-    answer = answer.replace("\%", "%")
-    answer = answer.replace("\text{", "").rstrip("}")
-    answer = answer.replace("\mathrm{", "").rstrip("}")
-    answer = answer.replace("\,", "").replace("\!", "")
-    answer = answer.replace("\left", "").replace("\right", "")
-    answer = answer.replace("\cdot", "*")
+    answer = answer.replace(r"\$", "").replace("$", "")
+    answer = answer.replace(r"\%", "%")
+    answer = answer.replace(r"\text{", "").rstrip("}")
+    answer = answer.replace(r"\mathrm{", "").rstrip("}")
+    answer = answer.replace(r"\,", "").replace(r"\!", "")
+    answer = answer.replace(r"\left", "").replace(r"\right", "")
+    answer = answer.replace(r"\cdot", "*")
     return answer.strip()
 
 
