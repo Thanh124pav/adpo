@@ -5,15 +5,14 @@ Registers the ADPO phase-based advantage decomposition, then delegates
 to verl's standard GRPO training pipeline.
 
 Usage:
-    python -m adpo.main_adpo algorithm.judge_type=vllm ...
+    python -m adpo.main_adpo algorithm.judge_type=endpoint ...
 """
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
 import logging
 
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer
-from verl.trainer.ppo import core_algos
+from verl.trainer.main_ppo import run_ppo
 
 from adpo.adpo_trainer import patch_verl_grpo_with_adpo
 
@@ -41,9 +40,8 @@ def main(config: DictConfig):
         max_ref_solutions_in_prompt=algo.get("max_ref_solutions_in_prompt", 3),
     )
 
-    # Launch verl trainer
-    trainer = RayPPOTrainer(config)
-    trainer.fit()
+    # Launch verl trainer (handles tokenizer, workers, resource pool setup)
+    run_ppo(config)
 
 
 if __name__ == "__main__":

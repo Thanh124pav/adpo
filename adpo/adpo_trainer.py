@@ -68,7 +68,13 @@ class ADPOTrainer(RayPPOTrainer):
         # Judge
         judge_type = getattr(algo, "judge_type", "rule")
         judge_model = getattr(algo, "judge_model", "Qwen/Qwen2.5-7B-Instruct")
-        self.judge = create_judge(judge_type=judge_type, judge_model=judge_model)
+        judge_endpoint = getattr(algo, "judge_endpoint", "")
+        judge_kwargs = {}
+        if judge_type == "endpoint" and judge_endpoint:
+            judge_kwargs["endpoint"] = judge_endpoint
+        self.judge = create_judge(
+            judge_type=judge_type, judge_model=judge_model, **judge_kwargs
+        )
 
         # SolutionBank
         max_sols = getattr(algo, "max_solutions_per_question", 8)

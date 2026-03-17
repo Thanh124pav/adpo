@@ -19,6 +19,7 @@ Supports:
 
 import re
 import json
+import asyncio
 import logging
 from typing import List, Optional
 
@@ -327,6 +328,144 @@ class APIPhaseJudge(PhaseJudge):
         return rewards
 
 
+class EndpointPhaseJudge(PhaseJudge):
+    """Judge using a raw HTTP endpoint (aiohttp), no openai dependency.
+
+    Compatible with any OpenAI-compatible server (vLLM, TGI, llama.cpp, etc.).
+    Uses async HTTP with concurrency control, similar to generate_solutions_api.py.
+    """
+
+    def __init__(
+        self,
+        endpoint: str = "http://localhost:8000",
+        model: str = "Qwen/Qwen2.5-7B-Instruct",
+        max_tokens: int = 256,
+        temperature: float = 0.0,
+        max_concurrent: int = 32,
+        max_retries: int = 3,
+        retry_delay: float = 1.0,
+        timeout: float = 60.0,
+        max_ref_solutions_in_prompt: int = 3,
+    ):
+        self.endpoint = endpoint.rstrip("/")
+        self.completions_url = f"{self.endpoint}/v1/chat/completions"
+        self.model = model
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.max_concurrent = max_concurrent
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
+        self.timeout = timeout
+        self.max_ref_solutions_in_prompt = max_ref_solutions_in_prompt
+        logger.info(
+            f"EndpointPhaseJudge initialized: model={model}, "
+            f"endpoint={self.endpoint}, max_concurrent={max_concurrent}"
+        )
+
+    async def _request_single(self, session, semaphore, messages):
+        """Send a single chat completion request with retries."""
+        import aiohttp as _aiohttp
+
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+        }
+
+        for attempt in range(self.max_retries):
+            try:
+                async with semaphore:
+                    async with session.post(
+                        self.completions_url,
+                        json=payload,
+                        timeout=_aiohttp.ClientTimeout(total=self.timeout),
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            text = data["choices"][0]["message"]["content"]
+                            return parse_judge_response(text)
+                        elif resp.status == 429:
+                            await asyncio.sleep(self.retry_delay * (2 ** attempt))
+                        else:
+                            body = await resp.text()
+                            logger.warning(f"Judge endpoint error {resp.status}: {body[:200]}")
+                            await asyncio.sleep(self.retry_delay)
+            except (Exception,) as e:
+                logger.warning(f"Judge request error (attempt {attempt + 1}): {e}")
+                await asyncio.sleep(self.retry_delay * (2 ** attempt))
+
+        logger.warning("Judge request failed after all retries, returning 0.5")
+        return 0.5
+
+    async def _score_batch_async(self, all_messages):
+        """Score all messages concurrently."""
+        import aiohttp as _aiohttp
+
+        semaphore = asyncio.Semaphore(self.max_concurrent)
+        connector = _aiohttp.TCPConnector(
+            limit=self.max_concurrent,
+            limit_per_host=self.max_concurrent,
+        )
+        async with _aiohttp.ClientSession(connector=connector) as session:
+            tasks = [
+                self._request_single(session, semaphore, msgs)
+                for msgs in all_messages
+            ]
+            return await asyncio.gather(*tasks)
+
+    def score_phases(self, questions, phase_texts, golden_answers=None,
+                     reference_solutions=None, **kwargs):
+        import asyncio
+
+        all_messages = []
+        prompt_map = []
+
+        for i, (question, phases) in enumerate(zip(questions, phase_texts)):
+            ga = golden_answers[i] if golden_answers and i < len(golden_answers) else ""
+            refs = None
+            if reference_solutions and i < len(reference_solutions):
+                refs = reference_solutions[i][:self.max_ref_solutions_in_prompt]
+
+            for k in range(len(phases)):
+                messages = build_phase_judge_prompt(
+                    question=question,
+                    context_phases=phases[:k],
+                    current_phase=phases[k],
+                    phase_idx=k,
+                    total_phases=len(phases),
+                    golden_answer=ga,
+                    reference_solutions=refs,
+                )
+                all_messages.append(messages)
+                prompt_map.append((i, k))
+
+        if not all_messages:
+            return [[] for _ in questions]
+
+        # Run async event loop (handle case where loop is already running)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                scores = pool.submit(
+                    asyncio.run, self._score_batch_async(all_messages)
+                ).result()
+        else:
+            scores = asyncio.run(self._score_batch_async(all_messages))
+
+        # Map scores back to [response][phase] structure
+        rewards = [[0.5] * len(phase_texts[i]) for i in range(len(questions))]
+        for score, (i, k) in zip(scores, prompt_map):
+            rewards[i][k] = score
+
+        return rewards
+
+
 class RuleBasedPhaseJudge(PhaseJudge):
     """Fallback: score final phase using answer matching.
 
@@ -367,11 +506,20 @@ def create_judge(
     judge_model: str = "Qwen/Qwen2.5-7B-Instruct",
     **kwargs,
 ) -> PhaseJudge:
-    """Create a phase judge by type."""
+    """Create a phase judge by type.
+
+    Types:
+        rule     - Answer-matching only (no LLM, fast).
+        vllm     - Local vLLM model for batched inference.
+        api      - OpenAI SDK client (requires `openai` package).
+        endpoint - Raw HTTP to any OpenAI-compatible server (uses aiohttp).
+    """
     if judge_type == "vllm":
         return VLLMPhaseJudge(model_path=judge_model, **kwargs)
     elif judge_type == "api":
         return APIPhaseJudge(model=judge_model, **kwargs)
+    elif judge_type == "endpoint":
+        return EndpointPhaseJudge(model=judge_model, **kwargs)
     elif judge_type == "rule":
         return RuleBasedPhaseJudge(**kwargs)
     else:
