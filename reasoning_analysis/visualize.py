@@ -18,6 +18,7 @@ import os
 import html as html_lib
 
 import numpy as np
+import pandas as pd
 
 # ---------------------------------------------------------------------------
 # Data Loading
@@ -273,6 +274,219 @@ def generate_statistics_plots(results: list, output_dir: str):
     with open(os.path.join(output_dir, "summary_stats.json"), "w") as f:
         json.dump(summary, f, indent=2)
     print(f"  Saved summary_stats.json")
+
+
+# ---------------------------------------------------------------------------
+# EDA: Correct vs Incorrect Analysis
+# ---------------------------------------------------------------------------
+
+
+def _build_eda_dataframe(results: list) -> pd.DataFrame:
+    """Build a per-response DataFrame with summary features and correctness."""
+    rows = []
+    for r in results:
+        tokens = r.get("tokens", [])
+        if not tokens:
+            continue
+        neg_lps = [t["neg_log_prob"] for t in tokens]
+        entropies = [t["entropy"] for t in tokens]
+        rows.append({
+            "prompt_idx": r["prompt_idx"],
+            "sample_idx": r.get("sample_idx", 0),
+            "correct": r.get("correct", False),
+            "score": r.get("score", 0.0),
+            "data_source": r.get("data_source", "unknown"),
+            "response_length": len(tokens),
+            "neg_log_prob_mean": float(np.mean(neg_lps)),
+            "neg_log_prob_std": float(np.std(neg_lps)),
+            "entropy_mean": float(np.mean(entropies)),
+            "entropy_std": float(np.std(entropies)),
+        })
+    return pd.DataFrame(rows)
+
+
+def _print_group_stats(df: pd.DataFrame, label: str):
+    """Print mean, std, covariance, correlation for a group."""
+    features = ["neg_log_prob_mean", "entropy_mean", "response_length"]
+    print(f"\n--- {label} (n={len(df)}) ---")
+    for feat in features:
+        vals = df[feat]
+        print(f"  {feat:25s}  mean={vals.mean():.4f}  std={vals.std():.4f}  "
+              f"median={vals.median():.4f}")
+    if len(df) > 1:
+        print(f"\n  Covariance matrix:")
+        print(df[features].cov().to_string(float_format=lambda x: f"{x:.6f}"))
+        print(f"\n  Correlation matrix:")
+        print(df[features].corr().to_string(float_format=lambda x: f"{x:.4f}"))
+
+
+def generate_eda(results: list, output_dir: str):
+    """EDA: compare correct vs incorrect responses with stats and plots.
+
+    Analyses all data, correct subset, and incorrect subset. For each group
+    computes mean, std, covariance matrix of (neg_log_prob_mean, entropy_mean,
+    response_length). Generates comparison plots and runs Welch's t-test.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    eda_dir = os.path.join(output_dir, "eda")
+    os.makedirs(eda_dir, exist_ok=True)
+
+    # Build DataFrame
+    df = _build_eda_dataframe(results)
+    if df.empty:
+        print("  EDA: no data to analyze.")
+        return
+
+    has_correct = "correct" in df.columns and df["correct"].nunique() > 0
+    df_correct = df[df["correct"]] if has_correct else pd.DataFrame()
+    df_incorrect = df[~df["correct"]] if has_correct else pd.DataFrame()
+
+    n_correct = len(df_correct)
+    n_total = len(df)
+    accuracy = n_correct / n_total if n_total > 0 else 0.0
+
+    # --- Print stats ---
+    print(f"\n{'='*60}")
+    print("EDA: CORRECT vs INCORRECT")
+    print(f"{'='*60}")
+    print(f"Accuracy: {n_correct}/{n_total} = {accuracy:.4f} ({accuracy*100:.1f}%)")
+
+    _print_group_stats(df, "ALL")
+    if len(df_correct) > 0:
+        _print_group_stats(df_correct, "CORRECT")
+    if len(df_incorrect) > 0:
+        _print_group_stats(df_incorrect, "INCORRECT")
+
+    # Welch's t-test
+    if len(df_correct) >= 2 and len(df_incorrect) >= 2:
+        try:
+            from scipy import stats as sp_stats
+            features = ["neg_log_prob_mean", "entropy_mean", "response_length"]
+            print(f"\n--- Welch's t-test (correct vs incorrect) ---")
+            for feat in features:
+                t_stat, p_val = sp_stats.ttest_ind(
+                    df_correct[feat], df_incorrect[feat], equal_var=False
+                )
+                sig = "***" if p_val < 0.001 else "**" if p_val < 0.01 else "*" if p_val < 0.05 else ""
+                print(f"  {feat:25s}  t={t_stat:+.4f}  p={p_val:.6f} {sig}")
+        except ImportError:
+            print("  (scipy not installed, skipping t-test)")
+
+    # --- Save CSV ---
+    csv_path = os.path.join(eda_dir, "summary.csv")
+    df.to_csv(csv_path, index=False)
+    print(f"\n  Saved {csv_path}")
+
+    # --- Plots ---
+    features = ["neg_log_prob_mean", "entropy_mean", "response_length"]
+    colors = {True: "#2ecc71", False: "#e74c3c"}
+    labels = {True: "Correct", False: "Incorrect"}
+
+    # Plot 1: Boxplots correct vs incorrect
+    if len(df_correct) > 0 and len(df_incorrect) > 0:
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        for ax, feat in zip(axes, features):
+            data = [df_correct[feat].values, df_incorrect[feat].values]
+            bp = ax.boxplot(data, labels=["Correct", "Incorrect"], patch_artist=True)
+            bp["boxes"][0].set_facecolor(colors[True])
+            bp["boxes"][1].set_facecolor(colors[False])
+            ax.set_title(feat)
+            ax.grid(axis="y", alpha=0.3)
+        fig.suptitle(f"Correct vs Incorrect (accuracy={accuracy:.1%})", fontsize=14)
+        fig.tight_layout()
+        fig.savefig(os.path.join(eda_dir, "boxplots.png"), dpi=150)
+        plt.close(fig)
+
+    # Plot 2: Histograms correct vs incorrect
+    if len(df_correct) > 0 and len(df_incorrect) > 0:
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        for ax, feat in zip(axes, features):
+            ax.hist(df_correct[feat], bins=30, alpha=0.6, color=colors[True],
+                    label="Correct", density=True)
+            ax.hist(df_incorrect[feat], bins=30, alpha=0.6, color=colors[False],
+                    label="Incorrect", density=True)
+            ax.set_title(feat)
+            ax.legend()
+            ax.grid(axis="y", alpha=0.3)
+        fig.suptitle("Feature Distributions: Correct vs Incorrect", fontsize=14)
+        fig.tight_layout()
+        fig.savefig(os.path.join(eda_dir, "histograms.png"), dpi=150)
+        plt.close(fig)
+
+    # Plot 3: Scatter neg_log_prob vs entropy (all data, colored by correctness)
+    fig, ax = plt.subplots(figsize=(8, 6))
+    for correct_val, group in df.groupby("correct"):
+        ax.scatter(group["neg_log_prob_mean"], group["entropy_mean"],
+                   alpha=0.5, s=20, color=colors.get(correct_val, "#999"),
+                   label=labels.get(correct_val, str(correct_val)))
+    ax.set_xlabel("neg_log_prob_mean")
+    ax.set_ylabel("entropy_mean")
+    ax.set_title("neg_log_prob vs Entropy")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(eda_dir, "scatter_nlp_entropy.png"), dpi=150)
+    plt.close(fig)
+
+    # Plot 4: Scatter response_length vs neg_log_prob
+    fig, ax = plt.subplots(figsize=(8, 6))
+    for correct_val, group in df.groupby("correct"):
+        ax.scatter(group["response_length"], group["neg_log_prob_mean"],
+                   alpha=0.5, s=20, color=colors.get(correct_val, "#999"),
+                   label=labels.get(correct_val, str(correct_val)))
+    ax.set_xlabel("response_length (tokens)")
+    ax.set_ylabel("neg_log_prob_mean")
+    ax.set_title("Response Length vs neg_log_prob")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(eda_dir, "scatter_length_nlp.png"), dpi=150)
+    plt.close(fig)
+
+    # Plot 5: Scatter response_length vs entropy
+    fig, ax = plt.subplots(figsize=(8, 6))
+    for correct_val, group in df.groupby("correct"):
+        ax.scatter(group["response_length"], group["entropy_mean"],
+                   alpha=0.5, s=20, color=colors.get(correct_val, "#999"),
+                   label=labels.get(correct_val, str(correct_val)))
+    ax.set_xlabel("response_length (tokens)")
+    ax.set_ylabel("entropy_mean")
+    ax.set_title("Response Length vs Entropy")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(eda_dir, "scatter_length_entropy.png"), dpi=150)
+    plt.close(fig)
+
+    # Save stats to JSON
+    stats_out = {
+        "accuracy": accuracy,
+        "n_correct": n_correct,
+        "n_incorrect": n_total - n_correct,
+        "n_total": n_total,
+    }
+    for label_key, sub_df in [("all", df), ("correct", df_correct), ("incorrect", df_incorrect)]:
+        if len(sub_df) == 0:
+            continue
+        group_stats = {}
+        for feat in features:
+            group_stats[feat] = {
+                "mean": float(sub_df[feat].mean()),
+                "std": float(sub_df[feat].std()),
+                "median": float(sub_df[feat].median()),
+            }
+        if len(sub_df) > 1:
+            group_stats["covariance"] = sub_df[features].cov().to_dict()
+            group_stats["correlation"] = sub_df[features].corr().to_dict()
+        stats_out[label_key] = group_stats
+
+    with open(os.path.join(eda_dir, "eda_stats.json"), "w") as f:
+        json.dump(stats_out, f, indent=2)
+
+    print(f"  Saved EDA plots and stats to {eda_dir}/")
 
 
 # ---------------------------------------------------------------------------
@@ -647,6 +861,17 @@ def main():
         except ImportError:
             print("  WARNING: matplotlib not available. Skipping plots.")
             print("  Install with: pip install matplotlib")
+
+    # EDA: correct vs incorrect analysis
+    has_correct = any("correct" in r for r in results)
+    if has_correct and not args.no_plots:
+        print("Generating EDA (correct vs incorrect) ...")
+        try:
+            generate_eda(results, args.output_dir)
+        except ImportError as e:
+            print(f"  WARNING: EDA skipped ({e})")
+    elif not has_correct:
+        print("Skipping EDA: 'correct' field not found. Re-run evaluate.py to add accuracy.")
 
     # Generate HTML files
     print("Generating -log_prob HTML ...")
