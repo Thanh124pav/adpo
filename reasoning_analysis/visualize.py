@@ -1,0 +1,667 @@
+"""
+Reasoning Analysis: Visualize per-token -log_prob and entropy.
+
+Generates:
+  1. Statistical plots (PNG): distributions, means, stds, per-position trends
+  2. HTML file with -log_prob annotations above each token
+  3. HTML file with entropy annotations above each token
+
+Usage:
+    python reasoning_analysis/visualize.py \
+        --input_path reasoning_analysis/outputs/analysis.jsonl \
+        --output_dir reasoning_analysis/outputs/visualizations
+"""
+
+import argparse
+import json
+import os
+import html as html_lib
+
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# Data Loading
+# ---------------------------------------------------------------------------
+
+
+def load_results(input_path: str) -> list:
+    """Load analysis results from JSON or JSONL."""
+    if input_path.endswith(".json"):
+        with open(input_path, encoding="utf-8") as f:
+            return json.load(f)
+    else:
+        results = []
+        with open(input_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    results.append(json.loads(line))
+        return results
+
+
+# ---------------------------------------------------------------------------
+# Statistical Plots
+# ---------------------------------------------------------------------------
+
+
+def generate_statistics_plots(results: list, output_dir: str):
+    """Generate statistical analysis plots."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Collect all token-level data
+    all_neg_lps = []
+    all_entropies = []
+    per_response_neg_lp_means = []
+    per_response_entropy_means = []
+    per_response_neg_lp_stds = []
+    per_response_entropy_stds = []
+    position_neg_lps = {}  # position -> list of values
+    position_entropies = {}
+
+    for r in results:
+        neg_lps = []
+        ents = []
+        for t in r["tokens"]:
+            nlp = t["neg_log_prob"]
+            ent = t["entropy"]
+            all_neg_lps.append(nlp)
+            all_entropies.append(ent)
+            neg_lps.append(nlp)
+            ents.append(ent)
+            pos = t["position"]
+            position_neg_lps.setdefault(pos, []).append(nlp)
+            position_entropies.setdefault(pos, []).append(ent)
+
+        if neg_lps:
+            per_response_neg_lp_means.append(np.mean(neg_lps))
+            per_response_entropy_means.append(np.mean(ents))
+            per_response_neg_lp_stds.append(np.std(neg_lps))
+            per_response_entropy_stds.append(np.std(ents))
+
+    all_neg_lps = np.array(all_neg_lps)
+    all_entropies = np.array(all_entropies)
+
+    # --- Plot 1: Distribution of -log_prob ---
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    axes[0].hist(all_neg_lps, bins=100, color="steelblue", alpha=0.7, edgecolor="black", linewidth=0.3)
+    axes[0].axvline(np.mean(all_neg_lps), color="red", linestyle="--", label=f"Mean={np.mean(all_neg_lps):.3f}")
+    axes[0].axvline(np.median(all_neg_lps), color="orange", linestyle="--", label=f"Median={np.median(all_neg_lps):.3f}")
+    axes[0].set_xlabel("-log P(token)")
+    axes[0].set_ylabel("Count")
+    axes[0].set_title("Distribution of -log_prob (all tokens)")
+    axes[0].legend()
+
+    axes[1].hist(all_entropies, bins=100, color="coral", alpha=0.7, edgecolor="black", linewidth=0.3)
+    axes[1].axvline(np.mean(all_entropies), color="red", linestyle="--", label=f"Mean={np.mean(all_entropies):.3f}")
+    axes[1].axvline(np.median(all_entropies), color="orange", linestyle="--", label=f"Median={np.median(all_entropies):.3f}")
+    axes[1].set_xlabel("Entropy H(token)")
+    axes[1].set_ylabel("Count")
+    axes[1].set_title("Distribution of Entropy (all tokens)")
+    axes[1].legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "distribution_all_tokens.png"), dpi=150)
+    plt.close()
+
+    # --- Plot 2: Per-response mean & std ---
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    axes[0, 0].hist(per_response_neg_lp_means, bins=50, color="steelblue", alpha=0.7, edgecolor="black", linewidth=0.3)
+    axes[0, 0].set_xlabel("Mean -log_prob per response")
+    axes[0, 0].set_ylabel("Count")
+    axes[0, 0].set_title(f"Per-Response Mean -log_prob\n(overall mean={np.mean(per_response_neg_lp_means):.3f})")
+
+    axes[0, 1].hist(per_response_entropy_means, bins=50, color="coral", alpha=0.7, edgecolor="black", linewidth=0.3)
+    axes[0, 1].set_xlabel("Mean Entropy per response")
+    axes[0, 1].set_ylabel("Count")
+    axes[0, 1].set_title(f"Per-Response Mean Entropy\n(overall mean={np.mean(per_response_entropy_means):.3f})")
+
+    axes[1, 0].hist(per_response_neg_lp_stds, bins=50, color="steelblue", alpha=0.7, edgecolor="black", linewidth=0.3)
+    axes[1, 0].set_xlabel("Std -log_prob per response")
+    axes[1, 0].set_ylabel("Count")
+    axes[1, 0].set_title(f"Per-Response Std -log_prob\n(overall mean={np.mean(per_response_neg_lp_stds):.3f})")
+
+    axes[1, 1].hist(per_response_entropy_stds, bins=50, color="coral", alpha=0.7, edgecolor="black", linewidth=0.3)
+    axes[1, 1].set_xlabel("Std Entropy per response")
+    axes[1, 1].set_ylabel("Count")
+    axes[1, 1].set_title(f"Per-Response Std Entropy\n(overall mean={np.mean(per_response_entropy_stds):.3f})")
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "per_response_stats.png"), dpi=150)
+    plt.close()
+
+    # --- Plot 3: Per-position mean (averaged over responses) ---
+    max_pos = min(max(position_neg_lps.keys()) + 1, 512)  # Cap at 512 for readability
+    positions = list(range(max_pos))
+    pos_nlp_means = [np.mean(position_neg_lps.get(p, [0])) for p in positions]
+    pos_nlp_stds = [np.std(position_neg_lps.get(p, [0])) for p in positions]
+    pos_ent_means = [np.mean(position_entropies.get(p, [0])) for p in positions]
+    pos_ent_stds = [np.std(position_entropies.get(p, [0])) for p in positions]
+
+    fig, axes = plt.subplots(2, 1, figsize=(16, 10))
+
+    axes[0].plot(positions, pos_nlp_means, color="steelblue", linewidth=0.8, label="Mean -log_prob")
+    axes[0].fill_between(positions,
+                         np.array(pos_nlp_means) - np.array(pos_nlp_stds),
+                         np.array(pos_nlp_means) + np.array(pos_nlp_stds),
+                         alpha=0.2, color="steelblue")
+    axes[0].set_xlabel("Token Position")
+    axes[0].set_ylabel("-log_prob")
+    axes[0].set_title("Mean -log_prob by Token Position (across responses)")
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].plot(positions, pos_ent_means, color="coral", linewidth=0.8, label="Mean Entropy")
+    axes[1].fill_between(positions,
+                         np.array(pos_ent_means) - np.array(pos_ent_stds),
+                         np.array(pos_ent_means) + np.array(pos_ent_stds),
+                         alpha=0.2, color="coral")
+    axes[1].set_xlabel("Token Position")
+    axes[1].set_ylabel("Entropy")
+    axes[1].set_title("Mean Entropy by Token Position (across responses)")
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "per_position_trends.png"), dpi=150)
+    plt.close()
+
+    # --- Plot 4: Box plots per-response ---
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    sample_responses = results[:min(20, len(results))]  # Show first 20
+    neg_lp_per_resp = [[t["neg_log_prob"] for t in r["tokens"]] for r in sample_responses if r["tokens"]]
+    ent_per_resp = [[t["entropy"] for t in r["tokens"]] for r in sample_responses if r["tokens"]]
+
+    if neg_lp_per_resp:
+        axes[0].boxplot(neg_lp_per_resp, vert=True)
+        axes[0].set_xlabel("Response Index")
+        axes[0].set_ylabel("-log_prob")
+        axes[0].set_title("Box Plot: -log_prob per Response (first 20)")
+
+        axes[1].boxplot(ent_per_resp, vert=True)
+        axes[1].set_xlabel("Response Index")
+        axes[1].set_ylabel("Entropy")
+        axes[1].set_title("Box Plot: Entropy per Response (first 20)")
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "boxplot_per_response.png"), dpi=150)
+    plt.close()
+
+    # --- Plot 5: Per-token trajectory for individual responses ---
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    for i, ax_row in enumerate(axes):
+        if i >= len(results):
+            break
+        r = results[i]
+        positions_r = [t["position"] for t in r["tokens"]]
+        nlps_r = [t["neg_log_prob"] for t in r["tokens"]]
+        ents_r = [t["entropy"] for t in r["tokens"]]
+
+        ax_row[0].plot(positions_r, nlps_r, color="steelblue", linewidth=0.6)
+        ax_row[0].set_xlabel("Token Position")
+        ax_row[0].set_ylabel("-log_prob")
+        ax_row[0].set_title(f"Response {i}: -log_prob Trajectory")
+        ax_row[0].grid(True, alpha=0.3)
+
+        ax_row[1].plot(positions_r, ents_r, color="coral", linewidth=0.6)
+        ax_row[1].set_xlabel("Token Position")
+        ax_row[1].set_ylabel("Entropy")
+        ax_row[1].set_title(f"Response {i}: Entropy Trajectory")
+        ax_row[1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "individual_trajectories.png"), dpi=150)
+    plt.close()
+
+    # --- Plot 6: Correlation between -log_prob and entropy ---
+    fig, ax = plt.subplots(figsize=(8, 8))
+    # Subsample if too many points
+    max_points = 10000
+    if len(all_neg_lps) > max_points:
+        idx = np.random.choice(len(all_neg_lps), max_points, replace=False)
+        plot_nlp = all_neg_lps[idx]
+        plot_ent = all_entropies[idx]
+    else:
+        plot_nlp = all_neg_lps
+        plot_ent = all_entropies
+
+    ax.scatter(plot_nlp, plot_ent, alpha=0.15, s=3, color="purple")
+    ax.set_xlabel("-log_prob")
+    ax.set_ylabel("Entropy")
+    ax.set_title("Correlation: -log_prob vs Entropy")
+    corr = np.corrcoef(all_neg_lps, all_entropies)[0, 1]
+    ax.text(0.05, 0.95, f"Pearson r = {corr:.3f}", transform=ax.transAxes,
+            fontsize=12, verticalalignment="top",
+            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "correlation_nlp_entropy.png"), dpi=150)
+    plt.close()
+
+    print(f"  Saved 6 statistical plots to {output_dir}/")
+
+    # --- Save summary stats to JSON ---
+    summary = {
+        "num_responses": len(results),
+        "total_tokens": len(all_neg_lps),
+        "neg_log_prob": {
+            "mean": float(np.mean(all_neg_lps)),
+            "std": float(np.std(all_neg_lps)),
+            "median": float(np.median(all_neg_lps)),
+            "min": float(np.min(all_neg_lps)),
+            "max": float(np.max(all_neg_lps)),
+            "p5": float(np.percentile(all_neg_lps, 5)),
+            "p25": float(np.percentile(all_neg_lps, 25)),
+            "p75": float(np.percentile(all_neg_lps, 75)),
+            "p95": float(np.percentile(all_neg_lps, 95)),
+        },
+        "entropy": {
+            "mean": float(np.mean(all_entropies)),
+            "std": float(np.std(all_entropies)),
+            "median": float(np.median(all_entropies)),
+            "min": float(np.min(all_entropies)),
+            "max": float(np.max(all_entropies)),
+            "p5": float(np.percentile(all_entropies, 5)),
+            "p25": float(np.percentile(all_entropies, 25)),
+            "p75": float(np.percentile(all_entropies, 75)),
+            "p95": float(np.percentile(all_entropies, 95)),
+        },
+        "correlation_nlp_entropy": float(corr),
+    }
+    with open(os.path.join(output_dir, "summary_stats.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"  Saved summary_stats.json")
+
+
+# ---------------------------------------------------------------------------
+# HTML Visualization Helpers
+# ---------------------------------------------------------------------------
+
+HTML_HEADER = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{title}</title>
+<style>
+    body {{
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        margin: 20px;
+        background: #fafafa;
+        color: #333;
+    }}
+    h1 {{
+        color: #2c3e50;
+        border-bottom: 2px solid #3498db;
+        padding-bottom: 10px;
+    }}
+    h2 {{
+        color: #34495e;
+        margin-top: 30px;
+    }}
+    .response-container {{
+        background: white;
+        border: 1px solid #ddd;
+        border-radius: 8px;
+        padding: 20px;
+        margin: 20px 0;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+    }}
+    .response-header {{
+        font-weight: bold;
+        color: #2c3e50;
+        margin-bottom: 15px;
+        padding-bottom: 8px;
+        border-bottom: 1px solid #eee;
+    }}
+    .stats {{
+        font-size: 0.85em;
+        color: #7f8c8d;
+        margin-bottom: 10px;
+    }}
+    .token-container {{
+        line-height: 3.2em;
+        word-wrap: break-word;
+    }}
+    .token {{
+        display: inline-block;
+        position: relative;
+        padding: 0 1px;
+        margin: 0;
+        cursor: pointer;
+        border-bottom: 2px solid transparent;
+    }}
+    .token:hover {{
+        background: #f0f0f0;
+        border-radius: 3px;
+    }}
+    .token .annotation {{
+        position: absolute;
+        top: -1.6em;
+        left: 50%;
+        transform: translateX(-50%);
+        font-size: 0.55em;
+        font-weight: bold;
+        white-space: nowrap;
+        pointer-events: none;
+    }}
+    .token .token-text {{
+        white-space: pre;
+    }}
+    .legend {{
+        margin: 20px 0;
+        padding: 15px;
+        background: #f8f9fa;
+        border-radius: 8px;
+        border: 1px solid #e9ecef;
+    }}
+    .legend-bar {{
+        height: 20px;
+        border-radius: 4px;
+        margin: 5px 0;
+    }}
+    .legend-labels {{
+        display: flex;
+        justify-content: space-between;
+        font-size: 0.85em;
+        color: #666;
+    }}
+    .prompt-text {{
+        background: #e8f4f8;
+        padding: 10px 15px;
+        border-radius: 5px;
+        margin-bottom: 15px;
+        font-style: italic;
+        color: #2c3e50;
+        max-height: 150px;
+        overflow-y: auto;
+    }}
+    .nav {{
+        position: sticky;
+        top: 0;
+        background: #fff;
+        padding: 10px 0;
+        border-bottom: 1px solid #ddd;
+        z-index: 100;
+        margin-bottom: 20px;
+    }}
+    .nav a {{
+        margin: 0 5px;
+        text-decoration: none;
+        color: #3498db;
+    }}
+    .summary-table {{
+        width: 100%;
+        border-collapse: collapse;
+        margin: 15px 0;
+    }}
+    .summary-table th, .summary-table td {{
+        padding: 8px 12px;
+        text-align: left;
+        border-bottom: 1px solid #eee;
+    }}
+    .summary-table th {{
+        background: #f8f9fa;
+        font-weight: 600;
+    }}
+</style>
+</head>
+<body>
+"""
+
+HTML_FOOTER = """
+</body>
+</html>
+"""
+
+
+def value_to_color(value: float, vmin: float, vmax: float, metric: str = "neg_log_prob") -> str:
+    """Map a value to a color string. Low=green, High=red."""
+    if vmax <= vmin:
+        norm = 0.5
+    else:
+        norm = (value - vmin) / (vmax - vmin)
+    norm = max(0.0, min(1.0, norm))
+
+    # Green (low) -> Yellow (mid) -> Red (high)
+    if norm < 0.5:
+        r = int(255 * (norm * 2))
+        g = 180
+        b = 50
+    else:
+        r = 255
+        g = int(180 * (1 - (norm - 0.5) * 2))
+        b = 50
+
+    return f"rgb({r},{g},{b})"
+
+
+def render_tokens_html(tokens: list, metric_key: str, vmin: float, vmax: float) -> str:
+    """Render tokens with color-coded annotations above each token."""
+    parts = []
+    for t in tokens:
+        value = t[metric_key]
+        color = value_to_color(value, vmin, vmax, metric_key)
+        token_text = html_lib.escape(t["token"]).replace("\n", "&#10;↵")
+        annotation = f"{value:.2f}"
+        parts.append(
+            f'<span class="token" title="{metric_key}={value:.4f}, pos={t["position"]}">'
+            f'<span class="annotation" style="color:{color}">{annotation}</span>'
+            f'<span class="token-text">{token_text}</span>'
+            f'</span>'
+        )
+    return "".join(parts)
+
+
+def get_prompt_text(prompt) -> str:
+    """Extract text from prompt (chat format or string)."""
+    if isinstance(prompt, list):
+        texts = []
+        for msg in prompt:
+            if isinstance(msg, dict):
+                texts.append(f"[{msg.get('role', '?')}] {msg.get('content', '')}")
+            else:
+                texts.append(str(msg))
+        return "\n".join(texts)
+    return str(prompt)
+
+
+# ---------------------------------------------------------------------------
+# HTML Generation: -log_prob
+# ---------------------------------------------------------------------------
+
+
+def generate_neg_log_prob_html(results: list, output_path: str):
+    """Generate HTML with -log_prob annotation above each token."""
+    # Compute global min/max for color scaling
+    all_vals = [t["neg_log_prob"] for r in results for t in r["tokens"]]
+    if not all_vals:
+        print("  No tokens found, skipping HTML generation.")
+        return
+    vmin = np.percentile(all_vals, 2)
+    vmax = np.percentile(all_vals, 98)
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(HTML_HEADER.format(title="Reasoning Analysis: -log_prob per Token"))
+        f.write("<h1>Reasoning Analysis: -log_prob per Token</h1>\n")
+
+        # Legend
+        f.write('<div class="legend">\n')
+        f.write(f'<p><strong>Color scale:</strong> -log P(token) from {vmin:.2f} (green/low) to {vmax:.2f} (red/high)</p>\n')
+        gradient = "linear-gradient(to right, rgb(0,180,50), rgb(255,180,50), rgb(255,0,50))"
+        f.write(f'<div class="legend-bar" style="background: {gradient}"></div>\n')
+        f.write(f'<div class="legend-labels"><span>Low -log_prob (confident)</span><span>High -log_prob (uncertain)</span></div>\n')
+        f.write('</div>\n')
+
+        # Summary table
+        f.write('<h2>Summary Statistics</h2>\n')
+        f.write('<table class="summary-table">\n')
+        f.write('<tr><th>Metric</th><th>Value</th></tr>\n')
+        f.write(f'<tr><td>Total Responses</td><td>{len(results)}</td></tr>\n')
+        f.write(f'<tr><td>Total Tokens</td><td>{len(all_vals)}</td></tr>\n')
+        f.write(f'<tr><td>Mean -log_prob</td><td>{np.mean(all_vals):.4f}</td></tr>\n')
+        f.write(f'<tr><td>Std -log_prob</td><td>{np.std(all_vals):.4f}</td></tr>\n')
+        f.write(f'<tr><td>Median -log_prob</td><td>{np.median(all_vals):.4f}</td></tr>\n')
+        f.write('</table>\n')
+
+        # Navigation
+        f.write('<div class="nav"><strong>Jump to:</strong> ')
+        for i in range(len(results)):
+            f.write(f'<a href="#resp-{i}">#{i}</a> ')
+        f.write('</div>\n')
+
+        # Each response
+        for i, r in enumerate(results):
+            f.write(f'<div class="response-container" id="resp-{i}">\n')
+            f.write(f'<div class="response-header">Response #{i} '
+                    f'(prompt_idx={r["prompt_idx"]}, sample_idx={r["sample_idx"]}, '
+                    f'{r["num_tokens"]} tokens)</div>\n')
+
+            # Prompt
+            if "prompt" in r:
+                prompt_text = html_lib.escape(get_prompt_text(r["prompt"]))
+                f.write(f'<div class="prompt-text">{prompt_text}</div>\n')
+
+            # Stats
+            if "summary" in r:
+                s = r["summary"]
+                f.write(f'<div class="stats">'
+                        f'mean={s["neg_log_prob_mean"]:.3f}, '
+                        f'std={s["neg_log_prob_std"]:.3f}, '
+                        f'max={s["neg_log_prob_max"]:.3f}, '
+                        f'min={s["neg_log_prob_min"]:.3f}'
+                        f'</div>\n')
+
+            # Tokens
+            f.write('<div class="token-container">\n')
+            f.write(render_tokens_html(r["tokens"], "neg_log_prob", vmin, vmax))
+            f.write('\n</div>\n')
+            f.write('</div>\n')
+
+        f.write(HTML_FOOTER)
+
+    print(f"  Saved -log_prob HTML: {output_path}")
+
+
+# ---------------------------------------------------------------------------
+# HTML Generation: Entropy
+# ---------------------------------------------------------------------------
+
+
+def generate_entropy_html(results: list, output_path: str):
+    """Generate HTML with entropy annotation above each token."""
+    all_vals = [t["entropy"] for r in results for t in r["tokens"]]
+    if not all_vals:
+        print("  No tokens found, skipping HTML generation.")
+        return
+    vmin = np.percentile(all_vals, 2)
+    vmax = np.percentile(all_vals, 98)
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(HTML_HEADER.format(title="Reasoning Analysis: Entropy per Token"))
+        f.write("<h1>Reasoning Analysis: Entropy per Token</h1>\n")
+
+        # Legend
+        f.write('<div class="legend">\n')
+        f.write(f'<p><strong>Color scale:</strong> Entropy H from {vmin:.2f} (green/low) to {vmax:.2f} (red/high)</p>\n')
+        gradient = "linear-gradient(to right, rgb(0,180,50), rgb(255,180,50), rgb(255,0,50))"
+        f.write(f'<div class="legend-bar" style="background: {gradient}"></div>\n')
+        f.write(f'<div class="legend-labels"><span>Low Entropy (certain)</span><span>High Entropy (uncertain)</span></div>\n')
+        f.write('</div>\n')
+
+        # Summary table
+        f.write('<h2>Summary Statistics</h2>\n')
+        f.write('<table class="summary-table">\n')
+        f.write('<tr><th>Metric</th><th>Value</th></tr>\n')
+        f.write(f'<tr><td>Total Responses</td><td>{len(results)}</td></tr>\n')
+        f.write(f'<tr><td>Total Tokens</td><td>{len(all_vals)}</td></tr>\n')
+        f.write(f'<tr><td>Mean Entropy</td><td>{np.mean(all_vals):.4f}</td></tr>\n')
+        f.write(f'<tr><td>Std Entropy</td><td>{np.std(all_vals):.4f}</td></tr>\n')
+        f.write(f'<tr><td>Median Entropy</td><td>{np.median(all_vals):.4f}</td></tr>\n')
+        f.write('</table>\n')
+
+        # Navigation
+        f.write('<div class="nav"><strong>Jump to:</strong> ')
+        for i in range(len(results)):
+            f.write(f'<a href="#resp-{i}">#{i}</a> ')
+        f.write('</div>\n')
+
+        # Each response
+        for i, r in enumerate(results):
+            f.write(f'<div class="response-container" id="resp-{i}">\n')
+            f.write(f'<div class="response-header">Response #{i} '
+                    f'(prompt_idx={r["prompt_idx"]}, sample_idx={r["sample_idx"]}, '
+                    f'{r["num_tokens"]} tokens)</div>\n')
+
+            if "prompt" in r:
+                prompt_text = html_lib.escape(get_prompt_text(r["prompt"]))
+                f.write(f'<div class="prompt-text">{prompt_text}</div>\n')
+
+            if "summary" in r:
+                s = r["summary"]
+                f.write(f'<div class="stats">'
+                        f'mean={s["entropy_mean"]:.3f}, '
+                        f'std={s["entropy_std"]:.3f}, '
+                        f'max={s["entropy_max"]:.3f}, '
+                        f'min={s["entropy_min"]:.3f}'
+                        f'</div>\n')
+
+            f.write('<div class="token-container">\n')
+            f.write(render_tokens_html(r["tokens"], "entropy", vmin, vmax))
+            f.write('\n</div>\n')
+            f.write('</div>\n')
+
+        f.write(HTML_FOOTER)
+
+    print(f"  Saved entropy HTML: {output_path}")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Visualize reasoning analysis results")
+    parser.add_argument("--input_path", type=str, required=True,
+                        help="Path to analysis results (.json or .jsonl)")
+    parser.add_argument("--output_dir", type=str, default="reasoning_analysis/outputs/visualizations",
+                        help="Output directory for plots and HTML files")
+    parser.add_argument("--no_plots", action="store_true",
+                        help="Skip generating statistical plots (useful if matplotlib not available)")
+    args = parser.parse_args()
+
+    print(f"Loading results from {args.input_path} ...")
+    results = load_results(args.input_path)
+    print(f"Loaded {len(results)} responses")
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # Generate statistical plots
+    if not args.no_plots:
+        print("Generating statistical plots ...")
+        try:
+            generate_statistics_plots(results, args.output_dir)
+        except ImportError:
+            print("  WARNING: matplotlib not available. Skipping plots.")
+            print("  Install with: pip install matplotlib")
+
+    # Generate HTML files
+    print("Generating -log_prob HTML ...")
+    generate_neg_log_prob_html(results, os.path.join(args.output_dir, "neg_log_prob.html"))
+
+    print("Generating entropy HTML ...")
+    generate_entropy_html(results, os.path.join(args.output_dir, "entropy.html"))
+
+    print(f"\nAll outputs saved to {args.output_dir}/")
+    print("Files generated:")
+    for fname in sorted(os.listdir(args.output_dir)):
+        fpath = os.path.join(args.output_dir, fname)
+        size_kb = os.path.getsize(fpath) / 1024
+        print(f"  {fname} ({size_kb:.1f} KB)")
+
+
+if __name__ == "__main__":
+    main()
