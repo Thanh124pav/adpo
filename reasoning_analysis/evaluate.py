@@ -92,7 +92,7 @@ def generate_with_logprobs(
     max_tokens: int = 2048,
     top_p: float = 0.95,
     tensor_parallel_size: int = 1,
-    top_logprobs: int = 50,
+    top_logprobs: int = 20,
 ):
     """Generate responses with per-token log probabilities using vLLM.
 
@@ -565,8 +565,8 @@ def main():
     parser.add_argument("--max_tokens", type=int, default=2048)
     parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
-    parser.add_argument("--top_logprobs", type=int, default=50,
-                        help="Number of top logprobs to request from vLLM (for entropy approximation)")
+    parser.add_argument("--top_logprobs", type=int, default=20,
+                        help="Number of top logprobs to request from vLLM (max 20, for entropy approximation)")
     parser.add_argument("--backend", type=str, default="vllm", choices=["vllm", "hf"],
                         help="Inference backend: vllm (fast, approximate entropy) or hf (slow, exact entropy)")
     parser.add_argument("--exact_entropy", action="store_true",
