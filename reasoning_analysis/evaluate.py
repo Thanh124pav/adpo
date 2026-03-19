@@ -29,6 +29,10 @@ import numpy as np
 import pandas as pd
 import torch
 
+# Add project root to path so we can import reward functions
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from adpo.reward_functions import compute_score
+
 
 def load_dataset_from_parquet(parquet_path: str, max_samples: int = -1):
     """Load evaluation data from parquet file."""
@@ -479,13 +483,23 @@ def run_analysis(args):
         elapsed2 = time.time() - start_time2
         print(f"Exact entropy computation done in {elapsed2:.1f}s")
 
-    # Enrich results with prompt info
+    # Enrich results with prompt info and accuracy
     for result in results:
         pidx = result["prompt_idx"]
         record = records[pidx]
         result["prompt"] = record["prompt"]
         result["data_source"] = record.get("data_source", "unknown")
         result["ground_truth"] = record.get("ground_truth", "")
+
+        # Compute accuracy using the reward function
+        score = compute_score(
+            data_source=result["data_source"],
+            solution_str=result["response"],
+            ground_truth=result["ground_truth"],
+            extra_info=record.get("extra_info"),
+        )
+        result["score"] = score
+        result["correct"] = score >= 1.0
 
         # Compute summary statistics for this response
         if result["tokens"]:
@@ -538,6 +552,12 @@ def run_analysis(args):
         for t in r["tokens"]:
             all_neg_lps.append(t["neg_log_prob"])
             all_entropies.append(t["entropy"])
+
+    # Accuracy
+    n_correct = sum(1 for r in results if r.get("correct", False))
+    n_total = len(results)
+    accuracy = n_correct / n_total if n_total > 0 else 0.0
+    print(f"Accuracy: {n_correct}/{n_total} = {accuracy:.4f} ({accuracy*100:.1f}%)")
 
     if all_neg_lps:
         all_neg_lps = np.array(all_neg_lps)
