@@ -184,13 +184,12 @@ def generate_with_logprobs(
 
 
 def compute_entropy_from_logprobs(top_logprobs_list: list) -> float:
-    """Compute entropy from a list of top logprobs.
+    """Compute approximate entropy from a list of top logprobs.
 
     H = -sum_i P(v_i) * log P(v_i)
 
-    Since we only have top-k logprobs, we compute a lower-bound entropy
-    over the observed tokens. For a better approximation, we distribute
-    remaining probability mass uniformly (if sum < 1).
+    Since we only have top-k logprobs, this is an approximation.
+    Remaining probability mass is accounted for with a uniform assumption.
     """
     if not top_logprobs_list:
         return 0.0
@@ -205,11 +204,131 @@ def compute_entropy_from_logprobs(top_logprobs_list: list) -> float:
     # Account for remaining probability mass
     remaining_prob = max(0.0, 1.0 - np.sum(probs))
     if remaining_prob > 1e-10:
-        # Assume remaining mass has at least as high entropy as observed
-        # Use uniform assumption: remaining mass contributes remaining_prob * (-log(remaining_prob))
         entropy += -remaining_prob * np.log(remaining_prob + 1e-30)
 
     return float(entropy)
+
+
+# ---------------------------------------------------------------------------
+# Exact Entropy via Forward Pass
+# ---------------------------------------------------------------------------
+
+
+def compute_exact_entropy_forward_pass(
+    model_path: str,
+    results: list,
+    prompts: list,
+    batch_size: int = 4,
+    device: str = "auto",
+):
+    """Compute exact entropy by running a forward pass over generated sequences.
+
+    After vLLM generation, this function loads the model in HuggingFace,
+    concatenates [prompt + generated_tokens], runs a forward pass to get
+    full logits at each generated token position, and computes:
+      - exact_entropy: H(t) = -sum_v P(v|context_t) * log P(v|context_t)
+      - exact_neg_log_prob: -log P(token_t | context_t) from full distribution
+
+    This replaces the approximate values from top-k logprobs.
+
+    Args:
+        model_path: HuggingFace model path.
+        results: List of result dicts from generate_with_logprobs().
+        prompts: Original prompts (chat format or string).
+        batch_size: Batch size for forward pass.
+        device: Device for HuggingFace model.
+    """
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+
+    print("Loading model for exact entropy forward pass ...")
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+        device_map=device,
+    )
+    model.eval()
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    for i, result in enumerate(results):
+        prompt_idx = result["prompt_idx"]
+        prompt = prompts[prompt_idx]
+
+        # Build the full sequence: prompt + response
+        if isinstance(prompt, list):
+            prompt_text = tokenizer.apply_chat_template(
+                prompt, tokenize=False, add_generation_prompt=True
+            )
+        else:
+            prompt_text = prompt
+
+        # Tokenize prompt to know where response starts
+        prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+        prompt_len = len(prompt_ids)
+
+        # Build full sequence: prompt + generated token ids
+        gen_token_ids = [t["token_id"] for t in result["tokens"]]
+        if not gen_token_ids:
+            continue
+
+        full_ids = prompt_ids + gen_token_ids
+        input_ids = torch.tensor([full_ids], dtype=torch.long).to(model.device)
+
+        # Forward pass to get logits at every position
+        with torch.no_grad():
+            outputs = model(input_ids)
+            logits = outputs.logits  # (1, seq_len, vocab_size)
+
+        # For each generated token at position t in the response,
+        # the logits that predict it are at position (prompt_len + t - 1)
+        # because logits[i] predicts token[i+1]
+        for t_idx, token_data in enumerate(result["tokens"]):
+            logit_pos = prompt_len + t_idx - 1
+            if logit_pos < 0 or logit_pos >= logits.shape[1]:
+                token_data["exact_entropy"] = 0.0
+                token_data["exact_neg_log_prob"] = token_data["neg_log_prob"]
+                token_data["entropy_method"] = "fallback"
+                continue
+
+            token_logits = logits[0, logit_pos, :]  # (vocab_size,)
+
+            # Compute log_softmax for numerical stability
+            log_probs = torch.nn.functional.log_softmax(token_logits.float(), dim=-1)
+            probs = torch.exp(log_probs)
+
+            # Exact entropy: H = -sum_v P(v) * log P(v)
+            # Use nansum to handle 0 * log(0) = 0
+            entropy_terms = probs * log_probs
+            entropy_terms = torch.nan_to_num(entropy_terms, nan=0.0)
+            exact_entropy = -entropy_terms.sum().item()
+
+            # Exact neg_log_prob for the generated token
+            token_id = token_data["token_id"]
+            exact_logprob = log_probs[token_id].item()
+            exact_neg_log_prob = -exact_logprob
+
+            token_data["exact_entropy"] = float(exact_entropy)
+            token_data["exact_neg_log_prob"] = float(exact_neg_log_prob)
+            token_data["approx_entropy"] = token_data["entropy"]
+            token_data["approx_neg_log_prob"] = token_data["neg_log_prob"]
+            # Replace main fields with exact values
+            token_data["entropy"] = float(exact_entropy)
+            token_data["neg_log_prob"] = float(exact_neg_log_prob)
+            token_data["logprob"] = float(exact_logprob)
+            token_data["entropy_method"] = "exact"
+
+        if (i + 1) % 10 == 0 or i == len(results) - 1:
+            print(f"  Forward pass: [{i+1}/{len(results)}] responses processed")
+
+    # Free GPU memory
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    print("Exact entropy computation complete.")
 
 
 def generate_with_logprobs_hf(
@@ -347,6 +466,19 @@ def run_analysis(args):
     elapsed = time.time() - start_time
     print(f"Generation complete in {elapsed:.1f}s")
 
+    # Exact entropy via forward pass (overrides approximate values from vLLM top-k)
+    if args.exact_entropy:
+        print("\nComputing exact entropy via forward pass ...")
+        start_time2 = time.time()
+        compute_exact_entropy_forward_pass(
+            model_path=args.model_path,
+            results=results,
+            prompts=prompts,
+            device=args.device,
+        )
+        elapsed2 = time.time() - start_time2
+        print(f"Exact entropy computation done in {elapsed2:.1f}s")
+
     # Enrich results with prompt info
     for result in results:
         pidx = result["prompt_idx"]
@@ -359,7 +491,7 @@ def run_analysis(args):
         if result["tokens"]:
             neg_lps = [t["neg_log_prob"] for t in result["tokens"]]
             entropies = [t["entropy"] for t in result["tokens"]]
-            result["summary"] = {
+            summary = {
                 "neg_log_prob_mean": float(np.mean(neg_lps)),
                 "neg_log_prob_std": float(np.std(neg_lps)),
                 "neg_log_prob_max": float(np.max(neg_lps)),
@@ -371,6 +503,16 @@ def run_analysis(args):
                 "entropy_min": float(np.min(entropies)),
                 "entropy_median": float(np.median(entropies)),
             }
+            # If exact entropy was computed, also store approximate stats
+            if "approx_entropy" in result["tokens"][0]:
+                approx_ents = [t["approx_entropy"] for t in result["tokens"]]
+                approx_nlps = [t["approx_neg_log_prob"] for t in result["tokens"]]
+                summary["approx_entropy_mean"] = float(np.mean(approx_ents))
+                summary["approx_neg_log_prob_mean"] = float(np.mean(approx_nlps))
+                summary["entropy_method"] = "exact"
+            else:
+                summary["entropy_method"] = "approximate" if args.backend == "vllm" else "exact"
+            result["summary"] = summary
 
     # Save results
     os.makedirs(os.path.dirname(args.output_path) or ".", exist_ok=True)
@@ -427,6 +569,13 @@ def main():
                         help="Number of top logprobs to request from vLLM (for entropy approximation)")
     parser.add_argument("--backend", type=str, default="vllm", choices=["vllm", "hf"],
                         help="Inference backend: vllm (fast, approximate entropy) or hf (slow, exact entropy)")
+    parser.add_argument("--exact_entropy", action="store_true",
+                        help="Compute exact entropy via forward pass after vLLM generation. "
+                             "Loads the model in HF transformers and runs a forward pass over "
+                             "each [prompt + response] to get full logit distribution at every "
+                             "token position. Slower but gives exact entropy values.")
+    parser.add_argument("--device", type=str, default="auto",
+                        help="Device for HF model in exact_entropy mode (default: auto)")
     args = parser.parse_args()
     run_analysis(args)
 
