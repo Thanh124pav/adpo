@@ -34,6 +34,16 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from adpo.reward_functions import compute_score
 
 
+class _NumpyEncoder(json.JSONEncoder):
+    """JSON encoder that handles numpy types (ndarray, int64, float64, etc.)."""
+    def default(self, obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, np.generic):
+            return obj.item()
+        return super().default(obj)
+
+
 def load_dataset_from_parquet(parquet_path: str, max_samples: int = -1):
     """Load evaluation data from parquet file.
 
@@ -550,12 +560,12 @@ def run_analysis(args):
 
     if args.output_path.endswith(".json"):
         with open(args.output_path, "w", encoding="utf-8") as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
+            json.dump(results, f, indent=2, ensure_ascii=False, cls=_NumpyEncoder)
     else:
         # JSONL format
         with open(args.output_path, "w", encoding="utf-8") as f:
             for result in results:
-                f.write(json.dumps(result, ensure_ascii=False) + "\n")
+                f.write(json.dumps(result, ensure_ascii=False, cls=_NumpyEncoder) + "\n")
 
     print(f"Saved {len(results)} results to {args.output_path}")
 
