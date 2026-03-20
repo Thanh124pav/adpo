@@ -371,25 +371,28 @@ def patch_verl_grpo_with_adpo(
             active = response_mask[b].nonzero(as_tuple=True)[0]
             resp_end = active[-1].item() + 1 if len(active) > 0 else 0
 
-            # Question
-            question = ""
-            if hasattr(data.batch, "prompts"):
-                question = data.batch["prompts"][b]
-            elif "prompts" in data.batch:
-                question = data.batch["prompts"][b]
+            # Question — decode from prompt token IDs
+            prompt_ids = data.batch.get("prompts", None)
+            if prompt_ids is not None:
+                question = tokenizer.decode(prompt_ids[b], skip_special_tokens=True)
+            else:
+                question = ""
             questions.append(question)
 
-            # Golden answer & data source
+            # Golden answer & data source — stored in non_tensor_batch
             gt = ""
             ds = "math"
-            if hasattr(data.batch, "ground_truths"):
-                gt = data.batch["ground_truths"][b]
-            elif "ground_truths" in data.batch:
-                gt = data.batch["ground_truths"][b]
-            if hasattr(data.batch, "data_sources"):
-                ds = data.batch["data_sources"][b]
-            elif "data_sources" in data.batch:
-                ds = data.batch["data_sources"][b]
+            if "reward_model" in data.non_tensor_batch:
+                rm_info = data.non_tensor_batch["reward_model"]
+                if isinstance(rm_info, (list, np.ndarray)):
+                    gt = rm_info[b].get("ground_truth", "") if isinstance(rm_info[b], dict) else ""
+                elif isinstance(rm_info, dict):
+                    gt_list = rm_info.get("ground_truth", None)
+                    if gt_list is not None:
+                        gt = gt_list[b] if hasattr(gt_list, '__getitem__') else ""
+            if "data_source" in data.non_tensor_batch:
+                ds_arr = data.non_tensor_batch["data_source"]
+                ds = ds_arr[b] if hasattr(ds_arr, '__getitem__') else str(ds_arr)
             golden_answers.append(gt)
             data_sources.append(ds)
 
