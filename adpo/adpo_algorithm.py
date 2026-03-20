@@ -133,6 +133,109 @@ def detect_phase_boundaries_adaptive(
     return all_boundaries
 
 
+def compute_token_entropy(
+    log_probs: torch.Tensor = None,
+    logits: torch.Tensor = None,
+    response_mask: torch.Tensor = None,
+) -> torch.Tensor:
+    """Compute per-token entropy from logits or approximate from log_probs.
+
+    If logits are provided, computes exact entropy:
+        H(t) = -sum_v p(v|context) * log p(v|context)
+
+    If only log_probs (of the chosen token) are available, uses -log_prob
+    as an approximation (higher -log_prob ≈ higher uncertainty).
+
+    Returns:
+        entropy: (batch, seq_len) tensor of per-token entropy values.
+    """
+    if logits is not None:
+        # Exact entropy from full vocabulary distribution
+        log_p = torch.log_softmax(logits, dim=-1)
+        p = log_p.exp()
+        entropy = -(p * log_p).sum(dim=-1)  # (batch, seq_len)
+    elif log_probs is not None:
+        # Approximation: -log p(chosen token) as proxy for entropy
+        # Higher -log_prob → model less certain → higher entropy
+        entropy = -log_probs
+    else:
+        raise ValueError("Either logits or log_probs must be provided")
+
+    if response_mask is not None:
+        entropy = entropy * response_mask
+
+    return entropy
+
+
+def detect_phase_boundaries_entropy(
+    entropy: torch.Tensor,
+    response_mask: torch.Tensor,
+    percentile: float = 80.0,
+    min_phase_len: int = 10,
+    max_phases: int = 10,
+) -> List[List[int]]:
+    """Detect phase boundaries using per-token entropy (80/20 rule).
+
+    Selects positions where entropy is in the top (100-percentile)% as
+    candidate break points (the start of a new phase). For the default
+    percentile=80, this means the top 20% highest-entropy positions.
+
+    Greedy selection picks the highest entropy candidates first, respecting
+    min_phase_len spacing.
+
+    Args:
+        entropy: (batch, seq_len) per-token entropy values.
+        response_mask: (batch, seq_len) binary mask for response tokens.
+        percentile: Threshold percentile (default 80 → top 20% are candidates).
+        min_phase_len: Minimum tokens between consecutive boundaries.
+        max_phases: Maximum number of phases per response.
+
+    Returns:
+        List of boundary index lists, one per batch element.
+    """
+    batch_size = entropy.shape[0]
+    all_boundaries = []
+
+    for b in range(batch_size):
+        mask = response_mask[b]
+        ent = entropy[b]
+
+        active = mask.nonzero(as_tuple=True)[0]
+        if len(active) == 0:
+            all_boundaries.append([0])
+            continue
+
+        start = active[0].item()
+        end = active[-1].item() + 1
+
+        # Compute threshold from active tokens
+        active_ent = ent[active].cpu().numpy()
+        threshold = np.percentile(active_ent, percentile)
+
+        # Find local maxima above threshold (entropy peaks)
+        candidates = []
+        for t in range(start + 1, end - 1):
+            val = ent[t].item()
+            if (val > threshold
+                    and val >= ent[t - 1].item()
+                    and val >= ent[t + 1].item()):
+                candidates.append((t, val))
+
+        # Greedy selection: highest entropy peaks first, respecting min distance
+        candidates.sort(key=lambda x: -x[1])
+        boundaries = [start]
+        for t, val in candidates:
+            if len(boundaries) >= max_phases:
+                break
+            if all(abs(t - b_) >= min_phase_len for b_ in boundaries):
+                boundaries.append(t)
+
+        boundaries.sort()
+        all_boundaries.append(boundaries)
+
+    return all_boundaries
+
+
 def detect_phase_boundaries(
     neg_log_probs: torch.Tensor,
     response_mask: torch.Tensor,
@@ -141,8 +244,15 @@ def detect_phase_boundaries(
     percentile: float = 85.0,
     min_phase_len: int = 10,
     max_phases: int = 10,
+    entropy: Optional[torch.Tensor] = None,
 ) -> List[List[int]]:
-    """Unified boundary detection dispatcher."""
+    """Unified boundary detection dispatcher.
+
+    Methods:
+        threshold - Fixed -log pi threshold.
+        adaptive  - Per-response percentile on -log pi (default).
+        entropy   - Per-response percentile on token entropy (80/20 rule).
+    """
     if method == "threshold":
         return detect_phase_boundaries_threshold(
             neg_log_probs, response_mask, delta=delta,
@@ -151,6 +261,14 @@ def detect_phase_boundaries(
     elif method == "adaptive":
         return detect_phase_boundaries_adaptive(
             neg_log_probs, response_mask, percentile=percentile,
+            min_phase_len=min_phase_len, max_phases=max_phases,
+        )
+    elif method == "entropy":
+        if entropy is None:
+            # Fallback: use -log_prob as entropy proxy
+            entropy = neg_log_probs
+        return detect_phase_boundaries_entropy(
+            entropy, response_mask, percentile=percentile,
             min_phase_len=min_phase_len, max_phases=max_phases,
         )
     else:

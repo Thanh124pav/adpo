@@ -22,6 +22,7 @@ from verl.trainer.ppo import core_algos
 
 from adpo.adpo_algorithm import (
     compute_neg_log_probs,
+    compute_token_entropy,
     detect_phase_boundaries,
     build_phase_mask,
     segment_response_into_phases,
@@ -108,6 +109,14 @@ class ADPOTrainer(RayPPOTrainer):
         # Step 1: -log pi
         neg_log_probs = compute_neg_log_probs(log_probs, response_mask)
 
+        # Step 1b: Compute entropy if needed for boundary detection
+        entropy = None
+        if self.phase_method == "entropy":
+            logits = data.batch.get("logits", None)
+            entropy = compute_token_entropy(
+                log_probs=log_probs, logits=logits, response_mask=response_mask,
+            )
+
         # Step 2: Detect phase boundaries
         boundaries_batch = detect_phase_boundaries(
             neg_log_probs=neg_log_probs,
@@ -117,6 +126,7 @@ class ADPOTrainer(RayPPOTrainer):
             percentile=self.phase_percentile,
             min_phase_len=self.phase_min_len,
             max_phases=self.phase_max_K,
+            entropy=entropy,
         )
 
         # Step 3: Extract texts, golden answers, reference solutions
@@ -321,6 +331,14 @@ def patch_verl_grpo_with_adpo(
         # Step 1: -log pi
         neg_log_probs = compute_neg_log_probs(log_probs, response_mask)
 
+        # Step 1b: Compute entropy if needed for boundary detection
+        entropy = None
+        if phase_method == "entropy":
+            logits = data.batch.get("logits", None)
+            entropy = compute_token_entropy(
+                log_probs=log_probs, logits=logits, response_mask=response_mask,
+            )
+
         # Step 2: Detect phase boundaries
         boundaries_batch = detect_phase_boundaries(
             neg_log_probs=neg_log_probs,
@@ -329,6 +347,7 @@ def patch_verl_grpo_with_adpo(
             percentile=phase_percentile,
             min_phase_len=phase_min_len,
             max_phases=phase_max_K,
+            entropy=entropy,
         )
 
         # Step 3: Extract texts, golden answers, reference solutions
