@@ -256,9 +256,12 @@ class APIPhaseJudge(PhaseJudge):
         temperature: float = 0.0,
         max_concurrent: int = 32,
         max_ref_solutions_in_prompt: int = 3,
+        timeout: float = 120.0,
     ):
         import openai
-        self.client = openai.OpenAI(base_url=base_url, api_key=api_key)
+        self.client = openai.OpenAI(
+            base_url=base_url, api_key=api_key, timeout=timeout,
+        )
         self.model = model
         self.max_tokens = max_tokens
         self.temperature = temperature

@@ -277,6 +277,8 @@ def patch_verl_grpo_with_adpo(
     max_ref_solutions_in_prompt: int = 3,
     solution_bank_save_path: str = "checkpoints/solution_bank.jsonl",
     solution_bank_save_freq: int = 50,
+    judge_timeout: float = 120.0,
+    judge_max_tokens: int = 256,
 ):
     """Monkey-patch verl's module-level compute_advantage function with ADPO phase
     decomposition + LLM-as-Judge + SolutionBank.
@@ -298,6 +300,11 @@ def patch_verl_grpo_with_adpo(
     judge_kwargs = {}
     if judge_type == "endpoint" and judge_endpoint:
         judge_kwargs["endpoint"] = judge_endpoint
+    if judge_type in ("endpoint", "api"):
+        judge_kwargs["timeout"] = judge_timeout
+        judge_kwargs["max_tokens"] = judge_max_tokens
+    if judge_type in ("endpoint", "api", "vllm"):
+        judge_kwargs["max_ref_solutions_in_prompt"] = max_ref_solutions_in_prompt
     judge = create_judge(judge_type=judge_type, judge_model=judge_model, **judge_kwargs)
     solution_bank = SolutionBank(max_solutions_per_question=max_solutions_per_question)
     solution_bank.load_from_directory(solution_bank_dir)
@@ -558,6 +565,8 @@ class ADPOTaskRunner:
             max_ref_solutions_in_prompt=algo.get("max_ref_solutions_in_prompt", 3),
             solution_bank_save_path=algo.get("solution_bank_save_path", "checkpoints/solution_bank.jsonl"),
             solution_bank_save_freq=algo.get("solution_bank_save_freq", 50),
+            judge_timeout=algo.get("judge_timeout", 120.0),
+            judge_max_tokens=algo.get("judge_max_tokens", 256),
         )
 
         # Delegate to standard TaskRunner
