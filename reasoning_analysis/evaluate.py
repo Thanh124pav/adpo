@@ -34,20 +34,45 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from adpo.reward_functions import compute_score
 
 
+def _to_python(obj):
+    """Convert numpy/pandas types to native Python types recursively."""
+    if isinstance(obj, (np.ndarray,)):
+        return obj.tolist()
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, dict):
+        return {k: _to_python(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_python(v) for v in obj]
+    return obj
+
+
 def load_dataset_from_parquet(parquet_path: str, max_samples: int = -1):
     """Load evaluation data from parquet file."""
     df = pd.read_parquet(parquet_path)
     records = []
     for _, row in df.iterrows():
+        # Parse prompt — may be JSON string or already parsed (numpy array from parquet)
+        raw_prompt = row["prompt"]
+        if isinstance(raw_prompt, str):
+            prompt = json.loads(raw_prompt)
+        else:
+            prompt = _to_python(raw_prompt)
+        # Ensure chat format (list of dicts)
+        if isinstance(prompt, str):
+            prompt = [{"role": "user", "content": prompt}]
+
         record = {
             "data_source": row.get("data_source", "unknown"),
-            "prompt": json.loads(row["prompt"]) if isinstance(row["prompt"], str) else row["prompt"],
+            "prompt": prompt,
         }
         if "reward_model" in row:
-            rm = json.loads(row["reward_model"]) if isinstance(row["reward_model"], str) else row["reward_model"]
-            record["ground_truth"] = rm.get("ground_truth", "")
+            raw_rm = row["reward_model"]
+            rm = json.loads(raw_rm) if isinstance(raw_rm, str) else _to_python(raw_rm)
+            record["ground_truth"] = rm.get("ground_truth", "") if isinstance(rm, dict) else ""
         if "extra_info" in row:
-            record["extra_info"] = json.loads(row["extra_info"]) if isinstance(row["extra_info"], str) else row["extra_info"]
+            raw_ei = row["extra_info"]
+            record["extra_info"] = json.loads(raw_ei) if isinstance(raw_ei, str) else _to_python(raw_ei)
         records.append(record)
 
     if max_samples > 0:
