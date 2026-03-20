@@ -253,6 +253,7 @@ def patch_verl_grpo_with_adpo(
     tokenizer=None,
     judge_type: str = "rule",
     judge_model: str = "Qwen/Qwen2.5-7B-Instruct",
+    judge_endpoint: str = "",
     phase_method: str = "adaptive",
     phase_percentile: float = 85.0,
     phase_min_len: int = 10,
@@ -261,36 +262,66 @@ def patch_verl_grpo_with_adpo(
     max_solutions_per_question: int = 8,
     solution_bank_dir: str = "data/solutions",
     max_ref_solutions_in_prompt: int = 3,
+    solution_bank_save_path: str = "checkpoints/solution_bank.jsonl",
+    solution_bank_save_freq: int = 50,
 ):
-    """Monkey-patch verl's GRPO with ADPO phase decomposition + SolutionBank.
+    """Monkey-patch verl's RayPPOTrainer.compute_advantage with ADPO phase
+    decomposition + LLM-as-Judge + SolutionBank.
+
+    This patches at the compute_advantage level (not compute_grpo_outcome_advantage)
+    so we have access to the full data.batch, which is required for:
+    - Decoding input_ids into phase texts for the LLM judge
+    - Reading prompts, ground_truths, data_sources from the batch
+    - Feeding correct solutions back into the SolutionBank
 
     Usage:
         from adpo.adpo_trainer import patch_verl_grpo_with_adpo
-        patch_verl_grpo_with_adpo(tokenizer=tokenizer, judge_type="vllm")
+        patch_verl_grpo_with_adpo(
+            tokenizer=tokenizer,
+            judge_type="endpoint",
+            judge_endpoint="http://localhost:8000",
+        )
     """
-    judge = create_judge(judge_type=judge_type, judge_model=judge_model)
+    judge_kwargs = {}
+    if judge_type == "endpoint" and judge_endpoint:
+        judge_kwargs["endpoint"] = judge_endpoint
+    judge = create_judge(judge_type=judge_type, judge_model=judge_model, **judge_kwargs)
     solution_bank = SolutionBank(max_solutions_per_question=max_solutions_per_question)
     solution_bank.load_from_directory(solution_bank_dir)
 
-    original_fn = core_algos.compute_grpo_outcome_advantage
+    _step_count = [0]  # mutable counter for closure
 
-    def adpo_phase_wrapper(
-        token_level_scores,
-        response_mask,
-        index,
-        token_log_probs=None,
-        questions=None,
-        golden_answers=None,
-        full_responses=None,
-        data_sources=None,
-        **kwargs,
-    ):
-        if token_log_probs is None:
-            logger.warning("[ADPO] No log probs — falling back to GRPO")
-            return original_fn(token_level_scores, response_mask, index, **kwargs)
+    original_compute_advantage = RayPPOTrainer.compute_advantage
 
-        neg_log_probs = compute_neg_log_probs(token_log_probs, response_mask)
+    def adpo_compute_advantage(self_trainer, data):
+        """ADPO phase-based advantage with LLM-as-Judge scoring."""
+        nonlocal tokenizer
 
+        # Lazy-load tokenizer from trainer if not provided
+        if tokenizer is None:
+            if hasattr(self_trainer, "tokenizer") and self_trainer.tokenizer is not None:
+                tokenizer = self_trainer.tokenizer
+            else:
+                logger.warning(
+                    "[ADPO] No tokenizer available — falling back to original compute_advantage"
+                )
+                return original_compute_advantage(self_trainer, data)
+
+        log_probs = data.batch["old_log_probs"]
+        response_mask = data.batch["response_mask"]
+        index = data.batch["uid"]
+        input_ids = data.batch.get("input_ids", None)
+
+        if input_ids is None:
+            logger.warning("[ADPO] No input_ids in batch — falling back to original compute_advantage")
+            return original_compute_advantage(self_trainer, data)
+
+        batch_size, seq_len = response_mask.shape
+
+        # Step 1: -log pi
+        neg_log_probs = compute_neg_log_probs(log_probs, response_mask)
+
+        # Step 2: Detect phase boundaries
         boundaries_batch = detect_phase_boundaries(
             neg_log_probs=neg_log_probs,
             response_mask=response_mask,
@@ -300,55 +331,143 @@ def patch_verl_grpo_with_adpo(
             max_phases=phase_max_K,
         )
 
-        batch_size = response_mask.shape[0]
+        # Step 3: Extract texts, golden answers, reference solutions
         max_K = max(len(b) for b in boundaries_batch)
-        device = response_mask.device
-
-        # Get reference solutions from bank
+        questions = []
+        phase_texts_batch = []
+        golden_answers = []
         ref_solutions_batch = []
-        ga_list = golden_answers or [""] * batch_size
-        q_list = questions or [""] * batch_size
+        full_responses = []
+        data_sources = []
 
         for b in range(batch_size):
+            active = response_mask[b].nonzero(as_tuple=True)[0]
+            resp_end = active[-1].item() + 1 if len(active) > 0 else 0
+
+            # Question
+            question = ""
+            if hasattr(data.batch, "prompts"):
+                question = data.batch["prompts"][b]
+            elif "prompts" in data.batch:
+                question = data.batch["prompts"][b]
+            questions.append(question)
+
+            # Golden answer & data source
+            gt = ""
+            ds = "math"
+            if hasattr(data.batch, "ground_truths"):
+                gt = data.batch["ground_truths"][b]
+            elif "ground_truths" in data.batch:
+                gt = data.batch["ground_truths"][b]
+            if hasattr(data.batch, "data_sources"):
+                ds = data.batch["data_sources"][b]
+            elif "data_sources" in data.batch:
+                ds = data.batch["data_sources"][b]
+            golden_answers.append(gt)
+            data_sources.append(ds)
+
+            # Reference solutions from SolutionBank
             refs = solution_bank.get_solutions(
-                q_list[b], max_return=max_ref_solutions_in_prompt
+                question, max_return=max_ref_solutions_in_prompt
             )
             ref_solutions_batch.append(refs)
 
-        # Use outcome reward as final-phase reward, neutral for others
-        scores = (token_level_scores * response_mask).sum(dim=-1)
-        phase_rewards = torch.full((batch_size, max_K), 0.5, device=device)
-        phase_mask = torch.zeros(batch_size, max_K, device=device)
+            # Segment into phases
+            phases = segment_response_into_phases(
+                boundaries=boundaries_batch[b],
+                response_length=resp_end,
+                token_ids=input_ids[b],
+                tokenizer=tokenizer,
+            )
+            phase_texts_batch.append([p.text for p in phases])
+
+            # Full response text
+            resp_start = active[0].item() if len(active) > 0 else 0
+            full_text = tokenizer.decode(
+                input_ids[b][resp_start:resp_end], skip_special_tokens=True
+            )
+            full_responses.append(full_text)
+
+        # Step 4: Score phases with LLM judge
+        logger.info(f"[ADPO] Scoring {sum(len(p) for p in phase_texts_batch)} phases with {judge.__class__.__name__}")
+        phase_rewards_list = judge.score_phases(
+            questions=questions,
+            phase_texts=phase_texts_batch,
+            golden_answers=golden_answers,
+            reference_solutions=ref_solutions_batch,
+            data_sources=data_sources,
+        )
+        logger.info("[ADPO] Judge scoring complete")
+
+        # Step 5: Compute outcome rewards and feed correct solutions back
+        outcome_rewards = []
+        for b in range(batch_size):
+            if golden_answers[b]:
+                r = compute_score(
+                    data_source=data_sources[b],
+                    solution_str=full_responses[b],
+                    ground_truth=golden_answers[b],
+                )
+            else:
+                r = 0.0
+            outcome_rewards.append(r)
+
+        added = solution_bank.add_correct_generations(
+            questions=questions,
+            responses=full_responses,
+            rewards=outcome_rewards,
+            ground_truths=golden_answers,
+            reward_threshold=1.0,
+        )
+        if added > 0:
+            logger.info(f"[ADPO] Added {added} correct solutions to bank")
+
+        # Periodic save
+        _step_count[0] += 1
+        if _step_count[0] % solution_bank_save_freq == 0:
+            solution_bank.save_to_jsonl(solution_bank_save_path)
+
+        # Step 6: Build phase reward tensor
+        device = response_mask.device
+        phase_rewards = torch.zeros(batch_size, max_K, device=device)
+        phase_mask_tensor = torch.zeros(batch_size, max_K, device=device)
 
         for b in range(batch_size):
-            n = len(boundaries_batch[b])
-            for k in range(n):
-                phase_mask[b, k] = 1.0
-            phase_rewards[b, n - 1] = scores[b]
+            n_phases = len(phase_rewards_list[b])
+            for k in range(n_phases):
+                phase_rewards[b, k] = phase_rewards_list[b][k]
+                phase_mask_tensor[b, k] = 1.0
 
-        # Feed correct solutions back into bank
-        if full_responses and golden_answers:
-            outcome_rewards = scores.cpu().tolist()
-            solution_bank.add_correct_generations(
-                questions=q_list,
-                responses=full_responses,
-                rewards=outcome_rewards,
-                ground_truths=ga_list,
-                reward_threshold=1.0,
-            )
-
-        return compute_adpo_phase_advantages(
-            log_probs=token_log_probs,
+        # Step 7: Phase advantages -> token advantages
+        token_advantages = compute_adpo_phase_advantages(
+            log_probs=log_probs,
             phase_rewards=phase_rewards,
-            phase_mask=phase_mask,
+            phase_mask=phase_mask_tensor,
             response_mask=response_mask,
             index=index,
             boundaries_batch=boundaries_batch,
             sigma=phase_sigma,
         )
 
-    core_algos.compute_grpo_outcome_advantage = adpo_phase_wrapper
+        data.batch["advantages"] = token_advantages
+
+        # Diagnostics
+        with torch.no_grad():
+            avg_phases = np.mean([len(b) for b in boundaries_batch])
+            avg_reward = phase_rewards[phase_mask_tensor > 0].mean().item() if phase_mask_tensor.sum() > 0 else 0
+            avg_outcome = np.mean(outcome_rewards)
+            bank_stats = solution_bank.get_stats()
+            logger.info(
+                f"[ADPO] phases={avg_phases:.1f}, "
+                f"phase_reward={avg_reward:.3f}, "
+                f"outcome={avg_outcome:.3f}, "
+                f"bank={bank_stats['n_solutions']} sols / {bank_stats['n_questions']} qs"
+            )
+
+        return data
+
+    RayPPOTrainer.compute_advantage = adpo_compute_advantage
     logger.info(
-        f"Patched verl GRPO with ADPO phase decomposition "
-        f"(bank: {solution_bank})"
+        f"Patched RayPPOTrainer.compute_advantage with ADPO "
+        f"(judge={judge_type}, endpoint={judge_endpoint!r}, bank={solution_bank})"
     )
