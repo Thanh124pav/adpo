@@ -325,7 +325,12 @@ def patch_verl_grpo_with_adpo(
         response_mask = data.batch["response_mask"]
         index_raw = data.non_tensor_batch.get("uid", data.batch.get("uid", None))
         if isinstance(index_raw, np.ndarray):
-            index = torch.tensor(index_raw, device=response_mask.device)
+            if index_raw.dtype == object:
+                # String UIDs — map to integer group indices
+                unique_vals, inverse = np.unique(index_raw, return_inverse=True)
+                index = torch.tensor(inverse, dtype=torch.long, device=response_mask.device)
+            else:
+                index = torch.tensor(index_raw, device=response_mask.device)
         elif isinstance(index_raw, torch.Tensor):
             index = index_raw.to(response_mask.device)
         else:
