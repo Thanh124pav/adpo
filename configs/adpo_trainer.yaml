@@ -8,9 +8,9 @@ algorithm:
   lam: 1.0
   norm_adv_by_std_in_grpo: true
   # Phase Decomposition
-  phase_method: adaptive       # "adaptive" (percentile) or "threshold" (fixed delta)
+  phase_method: adaptive       # "adaptive" (percentile on -log pi), "threshold" (fixed delta), "entropy" (percentile on token entropy)
   phase_delta: 2.0             # Fixed threshold for -log pi (if method=threshold)
-  phase_percentile: 85.0       # Percentile threshold (if method=adaptive)
+  phase_percentile: 85.0       # Percentile threshold (adaptive: on -log pi; entropy: 80=top 20% highest entropy are breakpoints)
   phase_min_len: 10            # Minimum tokens per phase
   phase_max_K: 10              # Maximum number of phases per response
   phase_sigma: 0.0             # Soft assignment bandwidth. 0=hard, >0=Gaussian blend
