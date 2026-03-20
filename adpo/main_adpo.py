@@ -15,6 +15,7 @@ import logging
 
 from transformers import AutoTokenizer
 
+from verl.experimental.reward_loop import migrate_legacy_reward_impl
 from verl.trainer.main_ppo import run_ppo
 
 from adpo.adpo_trainer import patch_verl_grpo_with_adpo
@@ -25,6 +26,7 @@ logger = logging.getLogger(__name__)
 @hydra.main(config_path="../configs", config_name="adpo_trainer", version_base=None)
 def main(config: DictConfig):
     """Launch ADPO training."""
+    config = migrate_legacy_reward_impl(config)
     print(OmegaConf.to_yaml(config))
 
     algo = config.algorithm
