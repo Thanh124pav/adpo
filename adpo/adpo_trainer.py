@@ -323,6 +323,8 @@ def patch_verl_grpo_with_adpo(
 
         log_probs = data.batch["old_log_probs"]
         response_mask = data.batch["response_mask"]
+        batch_size, seq_len = response_mask.shape
+
         index_raw = data.non_tensor_batch.get("uid", data.batch.get("uid", None))
         if isinstance(index_raw, np.ndarray):
             if index_raw.dtype == object:
@@ -344,8 +346,6 @@ def patch_verl_grpo_with_adpo(
                                                num_repeat=num_repeat,
                                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                                                config=config)
-
-        batch_size, seq_len = response_mask.shape
 
         # Step 1: -log pi
         neg_log_probs = compute_neg_log_probs(log_probs, response_mask)
