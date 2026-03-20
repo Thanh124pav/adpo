@@ -323,7 +323,13 @@ def patch_verl_grpo_with_adpo(
 
         log_probs = data.batch["old_log_probs"]
         response_mask = data.batch["response_mask"]
-        index = data.non_tensor_batch.get("uid", data.batch.get("uid", None))
+        index_raw = data.non_tensor_batch.get("uid", data.batch.get("uid", None))
+        if isinstance(index_raw, np.ndarray):
+            index = torch.tensor(index_raw, device=response_mask.device)
+        elif isinstance(index_raw, torch.Tensor):
+            index = index_raw.to(response_mask.device)
+        else:
+            index = torch.arange(batch_size, device=response_mask.device)
         input_ids = data.batch.get("input_ids", None)
 
         if input_ids is None:
