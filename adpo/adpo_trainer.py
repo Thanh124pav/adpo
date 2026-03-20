@@ -17,6 +17,7 @@ import numpy as np
 import logging
 from typing import List, Optional
 
+import verl.trainer.ppo.ray_trainer as ray_trainer_module
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo import core_algos
 
@@ -275,10 +276,10 @@ def patch_verl_grpo_with_adpo(
     solution_bank_save_path: str = "checkpoints/solution_bank.jsonl",
     solution_bank_save_freq: int = 50,
 ):
-    """Monkey-patch verl's RayPPOTrainer.compute_advantage with ADPO phase
+    """Monkey-patch verl's module-level compute_advantage function with ADPO phase
     decomposition + LLM-as-Judge + SolutionBank.
 
-    This patches at the compute_advantage level (not compute_grpo_outcome_advantage)
+    This patches the compute_advantage function in verl.trainer.ppo.ray_trainer
     so we have access to the full data.batch, which is required for:
     - Decoding input_ids into phase texts for the LLM judge
     - Reading prompts, ground_truths, data_sources from the batch
@@ -301,30 +302,37 @@ def patch_verl_grpo_with_adpo(
 
     _step_count = [0]  # mutable counter for closure
 
-    original_compute_advantage = RayPPOTrainer.compute_advantage
+    original_compute_advantage = ray_trainer_module.compute_advantage
 
-    def adpo_compute_advantage(self_trainer, data):
+    def adpo_compute_advantage(data, adv_estimator=None, gamma=1.0, lam=1.0,
+                                num_repeat=1, norm_adv_by_std_in_grpo=True,
+                                config=None):
         """ADPO phase-based advantage with LLM-as-Judge scoring."""
         nonlocal tokenizer
 
-        # Lazy-load tokenizer from trainer if not provided
+        # Lazy-load tokenizer — not available via args, skip ADPO if missing
         if tokenizer is None:
-            if hasattr(self_trainer, "tokenizer") and self_trainer.tokenizer is not None:
-                tokenizer = self_trainer.tokenizer
-            else:
-                logger.warning(
-                    "[ADPO] No tokenizer available — falling back to original compute_advantage"
-                )
-                return original_compute_advantage(self_trainer, data)
+            logger.warning(
+                "[ADPO] No tokenizer available — falling back to original compute_advantage"
+            )
+            return original_compute_advantage(data, adv_estimator=adv_estimator,
+                                               gamma=gamma, lam=lam,
+                                               num_repeat=num_repeat,
+                                               norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                               config=config)
 
         log_probs = data.batch["old_log_probs"]
         response_mask = data.batch["response_mask"]
-        index = data.batch["uid"]
+        index = data.non_tensor_batch.get("uid", data.batch.get("uid", None))
         input_ids = data.batch.get("input_ids", None)
 
         if input_ids is None:
             logger.warning("[ADPO] No input_ids in batch — falling back to original compute_advantage")
-            return original_compute_advantage(self_trainer, data)
+            return original_compute_advantage(data, adv_estimator=adv_estimator,
+                                               gamma=gamma, lam=lam,
+                                               num_repeat=num_repeat,
+                                               norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                               config=config)
 
         batch_size, seq_len = response_mask.shape
 
@@ -485,8 +493,8 @@ def patch_verl_grpo_with_adpo(
 
         return data
 
-    RayPPOTrainer.compute_advantage = adpo_compute_advantage
+    ray_trainer_module.compute_advantage = adpo_compute_advantage
     logger.info(
-        f"Patched RayPPOTrainer.compute_advantage with ADPO "
+        f"Patched verl.trainer.ppo.ray_trainer.compute_advantage with ADPO "
         f"(judge={judge_type}, endpoint={judge_endpoint!r}, bank={solution_bank})"
     )
