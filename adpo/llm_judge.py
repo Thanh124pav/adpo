@@ -116,20 +116,25 @@ def build_phase_judge_prompt(
 
 def parse_judge_response(response_text: str) -> float:
     """Extract score from judge response JSON."""
+    # Strip thinking tags (e.g. <think>...</think>) from reasoning models
+    text = re.sub(r'<think>.*?</think>', '', response_text, flags=re.DOTALL).strip()
+    if not text:
+        text = response_text  # fallback if everything was inside think tags
+
     try:
-        data = json.loads(response_text.strip())
+        data = json.loads(text.strip())
         return float(data["score"])
     except (json.JSONDecodeError, KeyError, ValueError):
         pass
 
-    json_match = re.search(r'\{[^}]*"score"\s*:\s*([\d.]+)[^}]*\}', response_text)
+    json_match = re.search(r'\{[^}]*"score"\s*:\s*([\d.]+)[^}]*\}', text)
     if json_match:
         try:
             return float(json_match.group(1))
         except ValueError:
             pass
 
-    float_match = re.search(r'(\d+\.?\d*)', response_text)
+    float_match = re.search(r'(\d+\.?\d*)', text)
     if float_match:
         val = float(float_match.group(1))
         if 0.0 <= val <= 1.0:
