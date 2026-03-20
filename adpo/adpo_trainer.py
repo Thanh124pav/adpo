@@ -243,6 +243,8 @@ class ADPOTrainer(RayPPOTrainer):
         )
 
         data.batch["advantages"] = token_advantages
+        if "returns" not in data.batch.keys():
+            data.batch["returns"] = torch.zeros_like(token_advantages)
 
         # Diagnostics
         with torch.no_grad():
@@ -491,6 +493,8 @@ def patch_verl_grpo_with_adpo(
         )
 
         data.batch["advantages"] = token_advantages
+        if "returns" not in data.batch.keys():
+            data.batch["returns"] = torch.zeros_like(token_advantages)
 
         # Diagnostics
         with torch.no_grad():
