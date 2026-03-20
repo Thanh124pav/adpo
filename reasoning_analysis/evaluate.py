@@ -521,7 +521,7 @@ def run_analysis(args):
         # Compute accuracy using the reward function
         score = compute_score(
             data_source=result["data_source"],
-            solution_str=result["response"],
+            solution_str=result["text"],
             ground_truth=result["ground_truth"],
             extra_info=record.get("extra_info"),
         )
