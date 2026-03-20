@@ -34,33 +34,21 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from adpo.reward_functions import compute_score
 
 
-def _to_python(obj):
-    """Convert numpy/pandas types to native Python types recursively."""
-    if isinstance(obj, (np.ndarray,)):
-        return obj.tolist()
-    if isinstance(obj, np.generic):
-        return obj.item()
-    if isinstance(obj, dict):
-        return {k: _to_python(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_to_python(v) for v in obj]
-    return obj
-
-
 def load_dataset_from_parquet(parquet_path: str, max_samples: int = -1):
-    """Load evaluation data from parquet file."""
+    """Load evaluation data from parquet file.
+
+    Handles both JSON-string columns (from prepare_datasets.py) and native
+    numpy array columns (verl's parquet format).
+    """
     df = pd.read_parquet(parquet_path)
     records = []
     for _, row in df.iterrows():
-        # Parse prompt — may be JSON string or already parsed (numpy array from parquet)
+        # Parse prompt — JSON string or numpy array (verl format)
         raw_prompt = row["prompt"]
         if isinstance(raw_prompt, str):
             prompt = json.loads(raw_prompt)
         else:
-            prompt = _to_python(raw_prompt)
-        # Ensure chat format (list of dicts)
-        if isinstance(prompt, str):
-            prompt = [{"role": "user", "content": prompt}]
+            prompt = raw_prompt  # keep as-is (numpy array is list-like)
 
         record = {
             "data_source": row.get("data_source", "unknown"),
@@ -68,11 +56,11 @@ def load_dataset_from_parquet(parquet_path: str, max_samples: int = -1):
         }
         if "reward_model" in row:
             raw_rm = row["reward_model"]
-            rm = json.loads(raw_rm) if isinstance(raw_rm, str) else _to_python(raw_rm)
-            record["ground_truth"] = rm.get("ground_truth", "") if isinstance(rm, dict) else ""
+            rm = json.loads(raw_rm) if isinstance(raw_rm, str) else raw_rm
+            record["ground_truth"] = rm.get("ground_truth", "") if hasattr(rm, "get") else ""
         if "extra_info" in row:
             raw_ei = row["extra_info"]
-            record["extra_info"] = json.loads(raw_ei) if isinstance(raw_ei, str) else _to_python(raw_ei)
+            record["extra_info"] = json.loads(raw_ei) if isinstance(raw_ei, str) else raw_ei
         records.append(record)
 
     if max_samples > 0:
@@ -139,10 +127,14 @@ def generate_with_logprobs(
 
     formatted_prompts = []
     for p in prompts:
-        if isinstance(p, list):
-            text = tokenizer.apply_chat_template(p, tokenize=False, add_generation_prompt=True)
+        if isinstance(p, (list, np.ndarray)):
+            # numpy array (verl parquet) or list — both are valid chat format
+            text = tokenizer.apply_chat_template(
+                list(p) if isinstance(p, np.ndarray) else p,
+                tokenize=False, add_generation_prompt=True,
+            )
         else:
-            text = p
+            text = str(p)
         formatted_prompts.append(text)
 
     sampling_params = SamplingParams(
