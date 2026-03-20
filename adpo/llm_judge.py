@@ -399,8 +399,14 @@ class EndpointPhaseJudge(PhaseJudge):
                             body = await resp.text()
                             logger.warning(f"Judge endpoint error {resp.status}: {body[:200]}")
                             await asyncio.sleep(self.retry_delay)
-            except (Exception,) as e:
-                logger.warning(f"Judge request error (attempt {attempt + 1}): {e}")
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"Judge request TIMEOUT (attempt {attempt + 1}/{self.max_retries}): "
+                    f"exceeded {self.timeout}s — consider increasing algorithm.judge_timeout"
+                )
+                await asyncio.sleep(self.retry_delay * (2 ** attempt))
+            except Exception as e:
+                logger.warning(f"Judge request error (attempt {attempt + 1}): {type(e).__name__}: {e}")
                 await asyncio.sleep(self.retry_delay * (2 ** attempt))
 
         logger.warning("Judge request failed after all retries, returning 0.5")
