@@ -498,3 +498,49 @@ def patch_verl_grpo_with_adpo(
         f"Patched verl.trainer.ppo.ray_trainer.compute_advantage with ADPO "
         f"(judge={judge_type}, endpoint={judge_endpoint!r}, bank={solution_bank})"
     )
+
+
+class ADPOTaskRunner:
+    """Ray-remote TaskRunner that applies the ADPO monkey-patch inside the worker.
+
+    verl's run_ppo spawns TaskRunner as a Ray remote actor (separate process).
+    Monkey-patching in the driver has no effect — the patch must happen inside
+    the worker process. This subclass does exactly that: in run(), it patches
+    compute_advantage before delegating to the standard TaskRunner.run().
+    """
+
+    def __init__(self):
+        from verl.trainer.main_ppo import TaskRunner
+        self._inner = TaskRunner()
+
+    def run(self, config):
+        from transformers import AutoTokenizer
+        from verl.utils.fs import copy_to_local
+
+        # Download model and load tokenizer inside the worker
+        local_path = copy_to_local(
+            config.actor_rollout_ref.model.path,
+            use_shm=config.actor_rollout_ref.model.get("use_shm", False),
+        )
+        tokenizer = AutoTokenizer.from_pretrained(local_path, trust_remote_code=True)
+
+        algo = config.algorithm
+        patch_verl_grpo_with_adpo(
+            tokenizer=tokenizer,
+            judge_type=algo.get("judge_type", "rule"),
+            judge_model=algo.get("judge_model", "Qwen/Qwen2.5-7B-Instruct"),
+            judge_endpoint=algo.get("judge_endpoint", ""),
+            phase_method=algo.get("phase_method", "adaptive"),
+            phase_percentile=algo.get("phase_percentile", 85.0),
+            phase_min_len=algo.get("phase_min_len", 10),
+            phase_max_K=algo.get("phase_max_K", 10),
+            phase_sigma=algo.get("phase_sigma", 0.0),
+            max_solutions_per_question=algo.get("max_solutions_per_question", 8),
+            solution_bank_dir=algo.get("solution_bank_dir", "data/solutions"),
+            max_ref_solutions_in_prompt=algo.get("max_ref_solutions_in_prompt", 3),
+            solution_bank_save_path=algo.get("solution_bank_save_path", "checkpoints/solution_bank.jsonl"),
+            solution_bank_save_freq=algo.get("solution_bank_save_freq", 50),
+        )
+
+        # Delegate to standard TaskRunner
+        self._inner.run(config)
