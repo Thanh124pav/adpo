@@ -46,6 +46,7 @@ class ADPOTrainer(RayPPOTrainer):
         phase_min_len (int): Min tokens per phase. Default 10.
         phase_max_K (int): Max phases per response. Default 10.
         phase_sigma (float): Soft assignment bandwidth. Default 0.0.
+        incorrect_penalty (float): Score mapping penalty for incorrect responses. Default 0.3.
         judge_type (str): "vllm", "api", or "rule". Default "rule".
         judge_model (str): Judge model. Default "Qwen/Qwen2.5-7B-Instruct".
         max_solutions_per_question (int): SolutionBank capacity. Default 8.
@@ -65,6 +66,7 @@ class ADPOTrainer(RayPPOTrainer):
         self.phase_min_len = getattr(algo, "phase_min_len", 10)
         self.phase_max_K = getattr(algo, "phase_max_K", 10)
         self.phase_sigma = getattr(algo, "phase_sigma", 0.0)
+        self.incorrect_penalty = getattr(algo, "incorrect_penalty", 0.3)
         self.max_ref_in_prompt = getattr(algo, "max_ref_solutions_in_prompt", 3)
 
         # Judge
@@ -231,6 +233,13 @@ class ADPOTrainer(RayPPOTrainer):
                 phase_rewards[b, k] = phase_rewards_list[b][k]
                 phase_mask_tensor[b, k] = 1.0
 
+        # Step 6b: Score mapping — scale down incorrect responses' phase rewards
+        outcome_tensor = torch.tensor(outcome_rewards, device=device)
+        incorrect_mask = (outcome_tensor < 1.0).float()  # (batch,)
+        # correct: scale=1.0, incorrect: scale=incorrect_penalty
+        score_scale = 1.0 - incorrect_mask * (1.0 - self.incorrect_penalty)
+        phase_rewards = phase_rewards * score_scale.unsqueeze(1)
+
         # Step 7: Phase advantages -> token advantages
         token_advantages = compute_adpo_phase_advantages(
             log_probs=log_probs,
@@ -272,12 +281,29 @@ class ADPOTrainer(RayPPOTrainer):
             else:
                 resp_reward_mean = resp_reward_std = 0.0
 
+            # Score mapping diagnostics: avg reward for correct vs incorrect
+            correct_mask_diag = outcome_tensor >= 1.0
+            incorrect_mask_diag = outcome_tensor < 1.0
+            n_correct = correct_mask_diag.sum().item()
+            n_incorrect = incorrect_mask_diag.sum().item()
+            if n_correct > 0:
+                avg_reward_correct = response_mean_rewards[correct_mask_diag].mean().item()
+            else:
+                avg_reward_correct = 0.0
+            if n_incorrect > 0:
+                avg_reward_incorrect = response_mean_rewards[incorrect_mask_diag].mean().item()
+            else:
+                avg_reward_incorrect = 0.0
+
             logger.info(
                 f"[ADPO] phases={avg_phases:.1f}, "
                 f"outcome={avg_outcome:.3f}, "
                 f"phase_reward(mean={reward_mean:.3f}, std={reward_std:.3f}, "
                 f"min={reward_min:.3f}, max={reward_max:.3f}), "
                 f"resp_reward(mean={resp_reward_mean:.3f}, std={resp_reward_std:.3f}), "
+                f"score_map(correct={avg_reward_correct:.3f}[n={n_correct}], "
+                f"incorrect={avg_reward_incorrect:.3f}[n={n_incorrect}], "
+                f"penalty={self.incorrect_penalty:.2f}), "
                 f"bank={bank_stats['n_solutions']} sols / {bank_stats['n_questions']} qs"
             )
 
@@ -301,6 +327,7 @@ def patch_verl_grpo_with_adpo(
     solution_bank_save_freq: int = 50,
     judge_timeout: float = 120.0,
     judge_max_tokens: int = 256,
+    incorrect_penalty: float = 0.3,
 ):
     """Monkey-patch verl's module-level compute_advantage function with ADPO phase
     decomposition + LLM-as-Judge + SolutionBank.
@@ -527,6 +554,12 @@ def patch_verl_grpo_with_adpo(
                 phase_rewards[b, k] = phase_rewards_list[b][k]
                 phase_mask_tensor[b, k] = 1.0
 
+        # Step 6b: Score mapping — scale down incorrect responses' phase rewards
+        outcome_tensor = torch.tensor(outcome_rewards, device=device)
+        incorrect_mask_t = (outcome_tensor < 1.0).float()  # (batch,)
+        score_scale = 1.0 - incorrect_mask_t * (1.0 - incorrect_penalty)
+        phase_rewards = phase_rewards * score_scale.unsqueeze(1)
+
         # Step 7: Phase advantages -> token advantages
         token_advantages = compute_adpo_phase_advantages(
             log_probs=log_probs,
@@ -568,12 +601,29 @@ def patch_verl_grpo_with_adpo(
             else:
                 resp_reward_mean = resp_reward_std = 0.0
 
+            # Score mapping diagnostics: avg reward for correct vs incorrect
+            correct_mask_diag = outcome_tensor >= 1.0
+            incorrect_mask_diag = outcome_tensor < 1.0
+            n_correct = correct_mask_diag.sum().item()
+            n_incorrect = incorrect_mask_diag.sum().item()
+            if n_correct > 0:
+                avg_reward_correct = response_mean_rewards[correct_mask_diag].mean().item()
+            else:
+                avg_reward_correct = 0.0
+            if n_incorrect > 0:
+                avg_reward_incorrect = response_mean_rewards[incorrect_mask_diag].mean().item()
+            else:
+                avg_reward_incorrect = 0.0
+
             diag_msg = (
                 f"[ADPO] phases={avg_phases:.1f}, "
                 f"outcome={avg_outcome:.3f}, "
                 f"phase_reward(mean={reward_mean:.3f}, std={reward_std:.3f}, "
                 f"min={reward_min:.3f}, max={reward_max:.3f}), "
                 f"resp_reward(mean={resp_reward_mean:.3f}, std={resp_reward_std:.3f}), "
+                f"score_map(correct={avg_reward_correct:.3f}[n={n_correct}], "
+                f"incorrect={avg_reward_incorrect:.3f}[n={n_incorrect}], "
+                f"penalty={incorrect_penalty:.2f}), "
                 f"bank={bank_stats['n_solutions']} sols / {bank_stats['n_questions']} qs"
             )
             print(diag_msg, flush=True)
