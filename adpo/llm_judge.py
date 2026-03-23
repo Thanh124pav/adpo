@@ -117,7 +117,9 @@ def build_phase_judge_prompt(
 def parse_judge_response(response_text: str) -> float:
     """Extract score from judge response JSON."""
     # Strip thinking tags (e.g. <think>...</think>) from reasoning models
+    # Also handle unclosed <think> tags (truncated by max_tokens)
     text = re.sub(r'<think>.*?</think>', '', response_text, flags=re.DOTALL).strip()
+    text = re.sub(r'<think>.*', '', text, flags=re.DOTALL).strip()
     if not text:
         text = response_text  # fallback if everything was inside think tags
 
