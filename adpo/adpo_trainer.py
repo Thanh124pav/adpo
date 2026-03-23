@@ -249,13 +249,35 @@ class ADPOTrainer(RayPPOTrainer):
         # Diagnostics
         with torch.no_grad():
             avg_phases = np.mean([len(b) for b in boundaries_batch])
-            avg_reward = phase_rewards[phase_mask_tensor > 0].mean().item() if phase_mask_tensor.sum() > 0 else 0
             avg_outcome = np.mean(outcome_rewards)
             bank_stats = self.solution_bank.get_stats()
+
+            # Phase-level reward statistics from LLM judge
+            valid_rewards = phase_rewards[phase_mask_tensor > 0]
+            if valid_rewards.numel() > 0:
+                reward_mean = valid_rewards.mean().item()
+                reward_std = valid_rewards.std().item() if valid_rewards.numel() > 1 else 0.0
+                reward_min = valid_rewards.min().item()
+                reward_max = valid_rewards.max().item()
+            else:
+                reward_mean = reward_std = reward_min = reward_max = 0.0
+
+            # Per-response mean reward (mean of phase rewards within each response)
+            phase_count = phase_mask_tensor.sum(dim=1).clamp(min=1)
+            response_mean_rewards = (phase_rewards * phase_mask_tensor).sum(dim=1) / phase_count
+            active_responses = (phase_mask_tensor.sum(dim=1) > 0)
+            if active_responses.any():
+                resp_reward_mean = response_mean_rewards[active_responses].mean().item()
+                resp_reward_std = response_mean_rewards[active_responses].std().item() if active_responses.sum() > 1 else 0.0
+            else:
+                resp_reward_mean = resp_reward_std = 0.0
+
             logger.info(
                 f"[ADPO] phases={avg_phases:.1f}, "
-                f"phase_reward={avg_reward:.3f}, "
                 f"outcome={avg_outcome:.3f}, "
+                f"phase_reward(mean={reward_mean:.3f}, std={reward_std:.3f}, "
+                f"min={reward_min:.3f}, max={reward_max:.3f}), "
+                f"resp_reward(mean={resp_reward_mean:.3f}, std={resp_reward_std:.3f}), "
                 f"bank={bank_stats['n_solutions']} sols / {bank_stats['n_questions']} qs"
             )
 
@@ -506,13 +528,35 @@ def patch_verl_grpo_with_adpo(
         # Diagnostics
         with torch.no_grad():
             avg_phases = np.mean([len(b) for b in boundaries_batch])
-            avg_reward = phase_rewards[phase_mask_tensor > 0].mean().item() if phase_mask_tensor.sum() > 0 else 0
             avg_outcome = np.mean(outcome_rewards)
             bank_stats = solution_bank.get_stats()
+
+            # Phase-level reward statistics from LLM judge
+            valid_rewards = phase_rewards[phase_mask_tensor > 0]
+            if valid_rewards.numel() > 0:
+                reward_mean = valid_rewards.mean().item()
+                reward_std = valid_rewards.std().item() if valid_rewards.numel() > 1 else 0.0
+                reward_min = valid_rewards.min().item()
+                reward_max = valid_rewards.max().item()
+            else:
+                reward_mean = reward_std = reward_min = reward_max = 0.0
+
+            # Per-response mean reward (mean of phase rewards within each response)
+            phase_count = phase_mask_tensor.sum(dim=1).clamp(min=1)
+            response_mean_rewards = (phase_rewards * phase_mask_tensor).sum(dim=1) / phase_count
+            active_responses = (phase_mask_tensor.sum(dim=1) > 0)
+            if active_responses.any():
+                resp_reward_mean = response_mean_rewards[active_responses].mean().item()
+                resp_reward_std = response_mean_rewards[active_responses].std().item() if active_responses.sum() > 1 else 0.0
+            else:
+                resp_reward_mean = resp_reward_std = 0.0
+
             logger.info(
                 f"[ADPO] phases={avg_phases:.1f}, "
-                f"phase_reward={avg_reward:.3f}, "
                 f"outcome={avg_outcome:.3f}, "
+                f"phase_reward(mean={reward_mean:.3f}, std={reward_std:.3f}, "
+                f"min={reward_min:.3f}, max={reward_max:.3f}), "
+                f"resp_reward(mean={resp_reward_mean:.3f}, std={resp_reward_std:.3f}), "
                 f"bank={bank_stats['n_solutions']} sols / {bank_stats['n_questions']} qs"
             )
 
