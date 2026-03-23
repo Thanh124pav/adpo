@@ -341,20 +341,37 @@ def patch_verl_grpo_with_adpo(
         """ADPO phase-based advantage with LLM-as-Judge scoring."""
         nonlocal tokenizer
 
+        print("[ADPO] adpo_compute_advantage called", flush=True)
+
         # Lazy-load tokenizer — not available via args, skip ADPO if missing
         if tokenizer is None:
-            logger.warning(
-                "[ADPO] No tokenizer available — falling back to original compute_advantage"
-            )
+            print("[ADPO] WARNING: No tokenizer available — falling back to original compute_advantage", flush=True)
             return original_compute_advantage(data, adv_estimator=adv_estimator,
                                                gamma=gamma, lam=lam,
                                                num_repeat=num_repeat,
                                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                                                config=config)
 
-        log_probs = data.batch["old_log_probs"]
+        try:
+            return _adpo_compute_advantage_inner(data, adv_estimator, gamma, lam,
+                                                  num_repeat, norm_adv_by_std_in_grpo, config)
+        except Exception as e:
+            import traceback
+            print(f"[ADPO] ERROR in adpo_compute_advantage: {e}", flush=True)
+            traceback.print_exc()
+            print("[ADPO] Falling back to original compute_advantage", flush=True)
+            return original_compute_advantage(data, adv_estimator=adv_estimator,
+                                               gamma=gamma, lam=lam,
+                                               num_repeat=num_repeat,
+                                               norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                               config=config)
+
+    def _adpo_compute_advantage_inner(data, adv_estimator, gamma, lam,
+                                       num_repeat, norm_adv_by_std_in_grpo, config):
+        """Inner logic — separated so exceptions are caught and logged."""
         response_mask = data.batch["response_mask"]
         batch_size, seq_len = response_mask.shape
+        log_probs = data.batch["old_log_probs"]
 
         index_raw = data.non_tensor_batch.get("uid", data.batch.get("uid", None))
         if isinstance(index_raw, np.ndarray):
@@ -371,7 +388,7 @@ def patch_verl_grpo_with_adpo(
         input_ids = data.batch.get("input_ids", None)
 
         if input_ids is None:
-            logger.warning("[ADPO] No input_ids in batch — falling back to original compute_advantage")
+            print("[ADPO] WARNING: No input_ids in batch — falling back to original compute_advantage", flush=True)
             return original_compute_advantage(data, adv_estimator=adv_estimator,
                                                gamma=gamma, lam=lam,
                                                num_repeat=num_repeat,
@@ -551,7 +568,7 @@ def patch_verl_grpo_with_adpo(
             else:
                 resp_reward_mean = resp_reward_std = 0.0
 
-            logger.info(
+            diag_msg = (
                 f"[ADPO] phases={avg_phases:.1f}, "
                 f"outcome={avg_outcome:.3f}, "
                 f"phase_reward(mean={reward_mean:.3f}, std={reward_std:.3f}, "
@@ -559,14 +576,18 @@ def patch_verl_grpo_with_adpo(
                 f"resp_reward(mean={resp_reward_mean:.3f}, std={resp_reward_std:.3f}), "
                 f"bank={bank_stats['n_solutions']} sols / {bank_stats['n_questions']} qs"
             )
+            print(diag_msg, flush=True)
+            logger.info(diag_msg)
 
         return data
 
     ray_trainer_module.compute_advantage = adpo_compute_advantage
-    logger.info(
-        f"Patched verl.trainer.ppo.ray_trainer.compute_advantage with ADPO "
+    patch_msg = (
+        f"[ADPO] Patched verl compute_advantage with ADPO "
         f"(judge={judge_type}, endpoint={judge_endpoint!r}, bank={solution_bank})"
     )
+    print(patch_msg, flush=True)
+    logger.info(patch_msg)
 
 
 class ADPOTaskRunner:
