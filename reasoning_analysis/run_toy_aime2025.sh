@@ -53,7 +53,8 @@ python reasoning_analysis/evaluate.py \
     --n_samples 1 \
     --temperature 0.6 \
     --max_tokens 2048 \
-    --backend hf
+    --backend hf \
+    --extract_internals
 
 # Step 3: Visualize results
 echo ""
@@ -66,3 +67,6 @@ echo ""
 echo "=== Done! ==="
 echo "Output files in: $OUTPUT_DIR/"
 ls -lh "$OUTPUT_DIR/"
+echo ""
+echo "Internals (attention & hidden states):"
+ls -lh "$OUTPUT_DIR/internals/" 2>/dev/null || echo "  (no internals extracted)"

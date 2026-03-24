@@ -362,6 +362,221 @@ def compute_exact_entropy_forward_pass(
     print("Exact entropy computation complete.")
 
 
+# ---------------------------------------------------------------------------
+# Attention Matrix & Hidden States Extraction
+# ---------------------------------------------------------------------------
+
+
+def _find_think_boundary(token_ids: list, tokenizer) -> int | None:
+    """Find position after </think> in generated token ids.
+
+    Returns index (relative to token_ids) right after </think>,
+    or None if not found.
+    """
+    # Try single-token match first (Qwen3 treats </think> as special token)
+    think_end_candidates = []
+    for text in ("</think>", "<|/think|>"):
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        if ids:
+            think_end_candidates.append(ids)
+
+    # Also check tokenizer's special tokens
+    if hasattr(tokenizer, "added_tokens_encoder"):
+        for tok_str, tok_id in tokenizer.added_tokens_encoder.items():
+            if "think" in tok_str.lower() and ("/" in tok_str or "end" in tok_str.lower()):
+                think_end_candidates.append([tok_id])
+
+    for end_ids in think_end_candidates:
+        end_len = len(end_ids)
+        for j in range(len(token_ids) - end_len + 1):
+            if token_ids[j:j + end_len] == end_ids:
+                return j + end_len
+
+    return None
+
+
+def extract_attention_hidden_states(
+    model_path: str,
+    results: list,
+    prompts: list,
+    output_dir: str,
+    device: str = "auto",
+    layers: list | None = None,
+):
+    """Extract attention sub-matrices and hidden states via forward pass.
+
+    For attention: extracts only thinking→thinking and output→thinking
+    sub-matrices (averaged across heads), discarding output→output.
+    Boundary is detected by the </think> token.
+
+    For hidden states: saves all layers at response token positions.
+
+    Saves one .npz file per response in output_dir.
+
+    Args:
+        model_path: HuggingFace model path.
+        results: List of result dicts from generate_with_logprobs().
+        prompts: Original prompts (chat format or string).
+        output_dir: Directory to save .npz files.
+        device: Device for model.
+        layers: List of layer indices to save attention for.
+                None = all layers.
+    """
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+
+    print("Loading model for attention & hidden states extraction ...")
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+        device_map=device,
+    )
+    model.eval()
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    for i, result in enumerate(results):
+        prompt_idx = result["prompt_idx"]
+        prompt = prompts[prompt_idx]
+
+        # Build full sequence: prompt + generated tokens
+        if isinstance(prompt, (list, np.ndarray)):
+            prompt_text = tokenizer.apply_chat_template(
+                list(prompt) if isinstance(prompt, np.ndarray) else prompt,
+                tokenize=False, add_generation_prompt=True,
+            )
+        else:
+            prompt_text = str(prompt)
+
+        prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+        prompt_len = len(prompt_ids)
+
+        gen_token_ids = [t["token_id"] for t in result["tokens"]]
+        if not gen_token_ids:
+            continue
+
+        full_ids = prompt_ids + gen_token_ids
+        input_ids = torch.tensor([full_ids], dtype=torch.long).to(model.device)
+
+        # Forward pass with attention + hidden states
+        with torch.no_grad():
+            outputs = model(
+                input_ids,
+                output_attentions=True,
+                output_hidden_states=True,
+            )
+
+        # --- Determine thinking / output boundary ---
+        think_boundary = _find_think_boundary(gen_token_ids, tokenizer)
+
+        gen_start = prompt_len  # absolute position in full sequence
+        gen_end = len(full_ids)
+
+        if think_boundary is not None:
+            think_start_abs = gen_start
+            think_end_abs = gen_start + think_boundary
+            out_start_abs = think_end_abs
+            out_end_abs = gen_end
+        else:
+            # No </think> found — entire response is "output", no thinking phase
+            think_start_abs = gen_start
+            think_end_abs = gen_start
+            out_start_abs = gen_start
+            out_end_abs = gen_end
+
+        think_len = think_end_abs - think_start_abs
+        out_len = out_end_abs - out_start_abs
+
+        # --- Extract attention sub-matrices ---
+        n_layers = len(outputs.attentions)
+        layer_indices = layers if layers is not None else list(range(n_layers))
+
+        attn_think_think_list = []
+        attn_out_think_list = []
+
+        for layer_idx in layer_indices:
+            # Shape: (1, num_heads, seq_len, seq_len)
+            attn = outputs.attentions[layer_idx][0]  # (num_heads, seq, seq)
+            attn_avg = attn.float().mean(dim=0)  # (seq, seq) — average across heads
+
+            if think_len > 0:
+                # thinking tokens attending to thinking tokens
+                tt = attn_avg[think_start_abs:think_end_abs,
+                              think_start_abs:think_end_abs]
+                attn_think_think_list.append(tt.cpu().numpy().astype(np.float16))
+
+            if out_len > 0 and think_len > 0:
+                # output tokens attending to thinking tokens
+                ot = attn_avg[out_start_abs:out_end_abs,
+                              think_start_abs:think_end_abs]
+                attn_out_think_list.append(ot.cpu().numpy().astype(np.float16))
+
+        # --- Extract hidden states ---
+        # outputs.hidden_states: tuple of (1, seq_len, hidden_dim) per layer + embedding
+        hidden_list = []
+        for layer_idx in range(len(outputs.hidden_states)):
+            hs = outputs.hidden_states[layer_idx][0]  # (seq_len, hidden_dim)
+            # Only keep response (thinking + output) token positions
+            hs_response = hs[gen_start:gen_end].cpu().to(torch.float16).numpy()
+            hidden_list.append(hs_response)
+
+        # --- Save to .npz ---
+        npz_data = {}
+
+        if attn_think_think_list:
+            # (selected_layers, think_len, think_len)
+            npz_data["attn_think_think"] = np.stack(attn_think_think_list)
+        if attn_out_think_list:
+            # (selected_layers, out_len, think_len)
+            npz_data["attn_out_think"] = np.stack(attn_out_think_list)
+
+        # (all_layers+1, response_len, hidden_dim) in float16
+        npz_data["hidden_states"] = np.stack(hidden_list)
+
+        # Metadata
+        metadata = {
+            "prompt_idx": int(prompt_idx),
+            "sample_idx": int(result["sample_idx"]),
+            "prompt_len": prompt_len,
+            "gen_len": len(gen_token_ids),
+            "think_boundary": think_boundary,
+            "think_len": think_len,
+            "out_len": out_len,
+            "n_model_layers": n_layers,
+            "attn_layers_saved": layer_indices,
+            "correct": result.get("correct"),
+            "score": result.get("score"),
+        }
+        npz_data["metadata"] = np.array(json.dumps(metadata))
+
+        # Tokens text for reference
+        gen_tokens_str = [t["token"] for t in result["tokens"]]
+        npz_data["tokens"] = np.array(gen_tokens_str)
+
+        npz_path = os.path.join(output_dir, f"response_{i:04d}.npz")
+        np.savez_compressed(npz_path, **npz_data)
+
+        # Free memory
+        del outputs
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        size_kb = os.path.getsize(npz_path) / 1024
+        print(f"  [{i+1}/{len(results)}] {npz_path} ({size_kb:.0f} KB) "
+              f"think={think_len} tokens, out={out_len} tokens"
+              f"{', no </think> found' if think_boundary is None else ''}")
+
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    print(f"Extraction complete. Files saved to {output_dir}/")
+
+
 def generate_with_logprobs_hf(
     model_path: str,
     prompts: list,
@@ -569,6 +784,23 @@ def run_analysis(args):
 
     print(f"Saved {len(results)} results to {args.output_path}")
 
+    # Extract attention matrices & hidden states
+    if args.extract_internals:
+        print("\nExtracting attention matrices & hidden states ...")
+        internals_dir = os.path.join(
+            os.path.dirname(args.output_path) or ".", "internals"
+        )
+        start_time3 = time.time()
+        extract_attention_hidden_states(
+            model_path=args.model_path,
+            results=results,
+            prompts=prompts,
+            output_dir=internals_dir,
+            device=args.device,
+        )
+        elapsed3 = time.time() - start_time3
+        print(f"Extraction done in {elapsed3:.1f}s")
+
     # Print summary statistics
     print(f"\n{'='*60}")
     print("ANALYSIS SUMMARY")
@@ -623,6 +855,10 @@ def main():
                              "token position. Slower but gives exact entropy values.")
     parser.add_argument("--device", type=str, default="auto",
                         help="Device for HF model in exact_entropy mode (default: auto)")
+    parser.add_argument("--extract_internals", action="store_true",
+                        help="Extract attention matrices (thinking→thinking, output→thinking) "
+                             "and hidden states via forward pass. Saves .npz files per response. "
+                             "Boundary between thinking/output detected by </think> token.")
     args = parser.parse_args()
     run_analysis(args)
 
