@@ -406,7 +406,7 @@ def extract_attention_hidden_states(
     """Extract attention sub-matrices and hidden states via forward pass.
 
     For attention: extracts only thinking→thinking and output→thinking
-    sub-matrices (averaged across heads), discarding output→output.
+    sub-matrices per head per layer, discarding output→output.
     Boundary is detected by the </think> token.
 
     For hidden states: saves all layers at response token positions.
@@ -501,19 +501,20 @@ def extract_attention_hidden_states(
         for layer_idx in layer_indices:
             # Shape: (1, num_heads, seq_len, seq_len)
             attn = outputs.attentions[layer_idx][0]  # (num_heads, seq, seq)
-            attn_avg = attn.float().mean(dim=0)  # (seq, seq) — average across heads
 
             if think_len > 0:
                 # thinking tokens attending to thinking tokens
-                tt = attn_avg[think_start_abs:think_end_abs,
-                              think_start_abs:think_end_abs]
-                attn_think_think_list.append(tt.cpu().numpy().astype(np.float16))
+                # (num_heads, think_len, think_len)
+                tt = attn[:, think_start_abs:think_end_abs,
+                          think_start_abs:think_end_abs]
+                attn_think_think_list.append(tt.cpu().to(torch.float16).numpy())
 
             if out_len > 0 and think_len > 0:
                 # output tokens attending to thinking tokens
-                ot = attn_avg[out_start_abs:out_end_abs,
-                              think_start_abs:think_end_abs]
-                attn_out_think_list.append(ot.cpu().numpy().astype(np.float16))
+                # (num_heads, out_len, think_len)
+                ot = attn[:, out_start_abs:out_end_abs,
+                          think_start_abs:think_end_abs]
+                attn_out_think_list.append(ot.cpu().to(torch.float16).numpy())
 
         # --- Extract hidden states ---
         # outputs.hidden_states: tuple of (1, seq_len, hidden_dim) per layer + embedding
@@ -528,10 +529,10 @@ def extract_attention_hidden_states(
         npz_data = {}
 
         if attn_think_think_list:
-            # (selected_layers, think_len, think_len)
+            # (selected_layers, num_heads, think_len, think_len)
             npz_data["attn_think_think"] = np.stack(attn_think_think_list)
         if attn_out_think_list:
-            # (selected_layers, out_len, think_len)
+            # (selected_layers, num_heads, out_len, think_len)
             npz_data["attn_out_think"] = np.stack(attn_out_think_list)
 
         # (all_layers+1, response_len, hidden_dim) in float16
@@ -547,6 +548,7 @@ def extract_attention_hidden_states(
             "think_len": think_len,
             "out_len": out_len,
             "n_model_layers": n_layers,
+            "num_heads": outputs.attentions[0].shape[1],
             "attn_layers_saved": layer_indices,
             "correct": result.get("correct"),
             "score": result.get("score"),
