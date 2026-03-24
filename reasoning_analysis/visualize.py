@@ -536,33 +536,47 @@ HTML_HEADER = """<!DOCTYPE html>
         margin-bottom: 10px;
     }}
     .token-container {{
-        line-height: 3.2em;
-        word-wrap: break-word;
+        display: flex;
+        align-items: flex-end;
+        flex-wrap: wrap;
+        gap: 1px;
+        padding-top: 10px;
+        min-height: 80px;
     }}
     .token {{
-        display: inline-block;
-        position: relative;
-        padding: 0 1px;
-        margin: 0;
+        display: inline-flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: flex-end;
         cursor: pointer;
-        border-bottom: 2px solid transparent;
+        min-width: 6px;
+        position: relative;
     }}
     .token:hover {{
-        background: #f0f0f0;
-        border-radius: 3px;
+        outline: 1px solid #333;
+        border-radius: 2px;
+    }}
+    .token .bar {{
+        width: 100%;
+        min-width: 6px;
+        border-radius: 2px 2px 0 0;
     }}
     .token .annotation {{
-        position: absolute;
-        top: -1.6em;
-        left: 50%;
-        transform: translateX(-50%);
-        font-size: 0.55em;
+        font-size: 0.5em;
         font-weight: bold;
         white-space: nowrap;
         pointer-events: none;
+        margin-bottom: 1px;
     }}
     .token .token-text {{
         white-space: pre;
+        font-size: 0.7em;
+        max-width: 40px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        text-align: center;
+        border-top: 1px solid #ddd;
+        padding-top: 2px;
     }}
     .legend {{
         margin: 20px 0;
@@ -653,16 +667,27 @@ def value_to_color(value: float, vmin: float, vmax: float, metric: str = "neg_lo
 
 
 def render_tokens_html(tokens: list, metric_key: str, vmin: float, vmax: float) -> str:
-    """Render tokens with color-coded annotations above each token."""
+    """Render tokens as colored bars with height proportional to value."""
+    max_bar_height = 80  # px
     parts = []
     for t in tokens:
         value = t[metric_key]
         color = value_to_color(value, vmin, vmax, metric_key)
         token_text = html_lib.escape(t["token"]).replace("\n", "&#10;↵")
         annotation = f"{value:.2f}"
+
+        # Compute bar height proportional to value
+        if vmax <= vmin:
+            norm = 0.5
+        else:
+            norm = (value - vmin) / (vmax - vmin)
+        norm = max(0.05, min(1.0, norm))  # min 5% height so bar is always visible
+        bar_height = int(norm * max_bar_height)
+
         parts.append(
             f'<span class="token" title="{metric_key}={value:.4f}, pos={t["position"]}">'
             f'<span class="annotation" style="color:{color}">{annotation}</span>'
+            f'<span class="bar" style="height:{bar_height}px;background:{color}"></span>'
             f'<span class="token-text">{token_text}</span>'
             f'</span>'
         )
