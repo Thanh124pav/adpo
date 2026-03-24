@@ -11,13 +11,10 @@ Usage:
 
 import argparse
 import gc
-import json
 import os
 
 import datasets
 import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
 
 BATCH_SIZE = 10_000  # write parquet every N records to avoid OOM
 
@@ -327,53 +324,24 @@ EVAL_DATASETS = {
 }
 
 
-PARQUET_SCHEMA = pa.schema([
-    ("data_source", pa.string()),
-    ("prompt", pa.string()),
-    ("ability", pa.string()),
-    ("reward_model", pa.string()),
-    ("extra_info", pa.string()),
-])
-
-
-def _serialize_record(r):
-    return {
-        "data_source": r["data_source"],
-        "prompt": json.dumps(r["prompt"], ensure_ascii=False),
-        "ability": r["ability"],
-        "reward_model": json.dumps(r["reward_model"], ensure_ascii=False),
-        "extra_info": json.dumps(r["extra_info"], ensure_ascii=False),
-    }
-
-
 def save_to_parquet(records, output_path):
-    """Save records to parquet in batches to avoid OOM."""
+    """Save records to parquet with native types (dict/list columns)."""
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    writer = None
-    total = 0
-    batch = []
-    try:
-        for r in records:
-            batch.append(_serialize_record(r))
-            if len(batch) >= BATCH_SIZE:
-                table = pa.Table.from_pylist(batch, schema=PARQUET_SCHEMA)
-                if writer is None:
-                    writer = pq.ParquetWriter(output_path, PARQUET_SCHEMA)
-                writer.write_table(table)
-                total += len(batch)
-                batch.clear()
-                gc.collect()
-        if batch:
-            table = pa.Table.from_pylist(batch, schema=PARQUET_SCHEMA)
-            if writer is None:
-                writer = pq.ParquetWriter(output_path, PARQUET_SCHEMA)
-            writer.write_table(table)
-            total += len(batch)
-            batch.clear()
-    finally:
-        if writer is not None:
-            writer.close()
-    print(f"Saved {total} examples to {output_path}")
+    all_records = []
+    for i, r in enumerate(records):
+        all_records.append({
+            "data_source": r["data_source"],
+            "prompt": r["prompt"],       # list of dicts — keep native
+            "ability": r["ability"],
+            "reward_model": r["reward_model"],  # dict — keep native
+            "extra_info": r["extra_info"],      # dict — keep native
+        })
+        if (i + 1) % BATCH_SIZE == 0:
+            gc.collect()
+
+    df = pd.DataFrame(all_records)
+    df.to_parquet(output_path, index=False)
+    print(f"Saved {len(df)} examples to {output_path}")
 
 
 def main():
