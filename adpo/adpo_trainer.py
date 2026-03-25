@@ -404,6 +404,32 @@ def patch_verl_grpo_with_adpo(
                                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                                                config=config)
 
+    def _find_response_start(input_ids_row, tok):
+        """Find actual response start by searching for assistant/think markers.
+
+        When response_mask=1 for the entire sequence (prompt+response),
+        we need to find where the model's response actually begins.
+        Searches for patterns like '<|im_start|>assistant' or '<think>'.
+        Returns the token index after the marker, or 0 if not found.
+        """
+        # Decode full sequence to find markers
+        full_text_ids = input_ids_row.tolist()
+        # Try common markers — search from the end since there may be
+        # a system + user + assistant structure
+        marker_tokens = []
+        for marker_str in ["<|im_start|>assistant", "<think>"]:
+            ids = tok.encode(marker_str, add_special_tokens=False)
+            if ids:
+                marker_tokens.append((marker_str, ids))
+
+        for marker_str, marker_ids in marker_tokens:
+            marker_len = len(marker_ids)
+            # Search backwards for last occurrence
+            for i in range(len(full_text_ids) - marker_len, -1, -1):
+                if full_text_ids[i:i + marker_len] == marker_ids:
+                    return i + marker_len
+        return 0
+
     def _adpo_compute_advantage_inner(data, adv_estimator, gamma, lam,
                                        num_repeat, norm_adv_by_std_in_grpo, config):
         """Inner logic — separated so exceptions are caught and logged."""
@@ -427,6 +453,23 @@ def patch_verl_grpo_with_adpo(
 
         if input_ids is None:
             print("[ADPO] WARNING: No input_ids in batch — falling back to original compute_advantage", flush=True)
+
+        # Fix response_mask: if it starts at 0 for the entire sequence,
+        # find actual response start and zero-out prompt tokens
+        if input_ids is not None and tokenizer is not None:
+            active0 = response_mask[0].nonzero(as_tuple=True)[0]
+            if len(active0) > 0 and active0[0].item() == 0:
+                # response_mask covers entire sequence — need to fix
+                resp_starts = []
+                for b in range(batch_size):
+                    rs = _find_response_start(input_ids[b], tokenizer)
+                    resp_starts.append(rs)
+                    if rs > 0:
+                        response_mask[b, :rs] = 0
+                print(f"[ADPO] Fixed response_mask: resp_starts[0]={resp_starts[0]}, "
+                      f"avg={np.mean(resp_starts):.0f}", flush=True)
+
+        if input_ids is None:
             return original_compute_advantage(data, adv_estimator=adv_estimator,
                                                gamma=gamma, lam=lam,
                                                num_repeat=num_repeat,
