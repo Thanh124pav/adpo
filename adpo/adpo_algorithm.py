@@ -607,7 +607,7 @@ def assign_phase_advantages_to_tokens(
     Decreasing (decay_gamma > 0): Within each phase, token advantages decay
         geometrically so earlier tokens get more credit:
             c = A_phase / (2 * T)
-            a'_1 = A_phase (initial decay component)
+            a'_1 = A * (1 - gamma) * T / (9 * gamma)
             a_i = c + a'_i
             a'_{i+1} = a'_i * gamma
     """
@@ -641,7 +641,7 @@ def _assign_with_decay(
 
     For each phase with advantage A and T tokens:
         c       = A / (2 * T)       (constant baseline per token)
-        a'_1    = A                  (initial decay value)
+        a'_1    = A * (1 - gamma) * T / (9 * gamma)  (initial decay value)
         a_i     = c + a'_i          (token i gets baseline + decayed part)
         a'_{i+1}= a'_i * gamma      (geometric decay)
     """
@@ -665,7 +665,7 @@ def _assign_with_decay(
 
             A = phase_advantages[b, k].item()
             c = A / (2.0 * T)
-            a_prime = A  # a'_1
+            a_prime = A * (1 - gamma) * T / (9 * gamma)  # a'_1
             for i in range(T):
                 token_advantages[b, start + i] = c + a_prime
                 a_prime *= gamma
