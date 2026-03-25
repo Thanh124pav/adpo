@@ -449,20 +449,36 @@ def patch_verl_grpo_with_adpo(
                                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                                                config=config)
 
-        # Debug info (first call only)
+        # Debug info
         active0 = response_mask[0].nonzero(as_tuple=True)[0]
         resp_start0 = active0[0].item() if len(active0) > 0 else -1
         resp_end0 = active0[-1].item() + 1 if len(active0) > 0 else -1
-        print(f"[ADPO Debug] token_ids.shape={token_ids.shape}, "
-              f"response_mask[0] active={resp_start0}..{resp_end0-1} ({resp_end0 - resp_start0} toks), "
-              f"prompt_ids.shape={prompt_ids.shape if prompt_ids is not None else None}",
+        n_active = int(response_mask[0].sum().item())
+        print(f"[ADPO Debug] SHAPES: response_mask={list(response_mask.shape)}, "
+              f"old_log_probs={list(log_probs.shape)}, "
+              f"input_ids={list(input_ids.shape) if input_ids is not None else None}, "
+              f"responses={list(response_ids.shape) if response_ids is not None else None}, "
+              f"prompts={list(prompt_ids.shape) if prompt_ids is not None else None}, "
+              f"token_ids(selected)={list(token_ids.shape)}",
+              flush=True)
+        print(f"[ADPO Debug] response_mask[0]: first=1@{resp_start0}, last=1@{resp_end0-1}, "
+              f"n_active={n_active}, total={response_mask.shape[1]}",
               flush=True)
         if tokenizer is not None and resp_start0 >= 0:
             sample_text = tokenizer.decode(
                 token_ids[0, resp_start0:min(resp_start0+10, resp_end0)].tolist(),
                 skip_special_tokens=False,
             )
-            print(f"[ADPO Debug] first 10 response tokens: {sample_text!r}", flush=True)
+            print(f"[ADPO Debug] token_ids[0][{resp_start0}:{resp_start0+10}]: {sample_text!r}", flush=True)
+        # Also show what's at start of each tensor
+        if tokenizer is not None:
+            if prompt_ids is not None:
+                # Find first non-padding token in prompt
+                p_decoded = tokenizer.decode(prompt_ids[0].tolist(), skip_special_tokens=True)
+                print(f"[ADPO Debug] prompts[0] decoded (skip_special): \"{p_decoded[:150]}\"", flush=True)
+            if response_ids is not None:
+                r_decoded = tokenizer.decode(response_ids[0, :20].tolist(), skip_special_tokens=False)
+                print(f"[ADPO Debug] responses[0][:20]: {r_decoded!r}", flush=True)
 
         # Step 1: -log pi
         neg_log_probs = compute_neg_log_probs(log_probs, response_mask)
