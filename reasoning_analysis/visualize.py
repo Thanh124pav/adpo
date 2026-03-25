@@ -543,6 +543,14 @@ HTML_HEADER = """<!DOCTYPE html>
         padding-top: 10px;
         min-height: 80px;
     }}
+    .line-break {{
+        flex-basis: 100%;
+        height: 0;
+    }}
+    .paragraph-break {{
+        flex-basis: 100%;
+        height: 12px;
+    }}
     .token {{
         display: inline-flex;
         flex-direction: column;
@@ -694,9 +702,9 @@ def render_tokens_html(tokens: list, metric_key: str, vmin: float, vmax: float) 
         )
         # Insert line/paragraph breaks for newline tokens
         if "\n\n" in raw_token:
-            parts.append('<br><br>')
+            parts.append('<div class="paragraph-break"></div>')
         elif "\n" in raw_token:
-            parts.append('<br>')
+            parts.append('<div class="line-break"></div>')
     return "".join(parts)
 
 
