@@ -577,6 +577,26 @@ def patch_verl_grpo_with_adpo(
             )
             full_responses.append(full_text)
 
+        # Debug: verify question extraction
+        n_empty_q = sum(1 for q in questions if not q.strip())
+        n_empty_gt = sum(1 for g in golden_answers if not g.strip())
+        if questions:
+            preview = questions[0][:100].replace('\n', '\\n')
+            print(f"[ADPO Questions] batch={batch_size}, empty_q={n_empty_q}, "
+                  f"empty_gt={n_empty_gt}, q[0]=\"{preview}...\"", flush=True)
+
+        # Demo: print up to 5 phases from the first response
+        if phase_texts_batch and phase_texts_batch[0]:
+            demo_phases = phase_texts_batch[0][:5]
+            demo_bounds = boundaries_batch[0]
+            n_total = len(phase_texts_batch[0])
+            print(f"[ADPO Phase Demo] response=0, total_phases={n_total}, "
+                  f"showing first {len(demo_phases)}:", flush=True)
+            for k, text in enumerate(demo_phases):
+                preview = text[:120].replace('\n', '\\n')
+                b_start = demo_bounds[k] if k < len(demo_bounds) else "?"
+                print(f"  phase {k} (tok={b_start}): \"{preview}...\"", flush=True)
+
         # Step 4: Score phases with LLM judge
         logger.info(f"[ADPO] Scoring {sum(len(p) for p in phase_texts_batch)} phases with {judge.__class__.__name__}")
         phase_rewards_list = judge.score_phases(
