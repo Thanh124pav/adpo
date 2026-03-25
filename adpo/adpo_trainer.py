@@ -494,6 +494,23 @@ def patch_verl_grpo_with_adpo(
                 v = data.non_tensor_batch[k]
                 sample = v[0] if hasattr(v, '__getitem__') and len(v) > 0 else v
                 print(f"[ADPO Debug] non_tensor_batch[{k!r}][0] = {str(sample)[:150]}", flush=True)
+            # Also check raw_prompt
+            if 'raw_prompt' in data.non_tensor_batch:
+                rp = data.non_tensor_batch['raw_prompt'][0]
+                print(f"[ADPO Debug] raw_prompt[0] type={type(rp).__name__}, val={str(rp)[:200]}", flush=True)
+        # Check batch['prompts'] shape/type
+        if 'prompts' in batch_keys:
+            prompts_val = data.batch['prompts']
+            print(f"[ADPO Debug] batch['prompts'] type={type(prompts_val).__name__}, "
+                  f"shape={prompts_val.shape if hasattr(prompts_val, 'shape') else 'N/A'}", flush=True)
+            if hasattr(prompts_val, 'shape') and len(prompts_val.shape) >= 1:
+                # It's a tensor — try to decode first sample
+                p_text = tokenizer.decode(prompts_val[0].tolist(), skip_special_tokens=False)
+                print(f"[ADPO Debug] batch['prompts'][0] decoded: {p_text[:200]!r}", flush=True)
+        if 'responses' in batch_keys:
+            responses_val = data.batch['responses']
+            print(f"[ADPO Debug] batch['responses'] type={type(responses_val).__name__}, "
+                  f"shape={responses_val.shape if hasattr(responses_val, 'shape') else 'N/A'}", flush=True)
 
         # Step 1: -log pi
         neg_log_probs = compute_neg_log_probs(log_probs, response_mask)
