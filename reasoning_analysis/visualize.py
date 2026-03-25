@@ -718,10 +718,17 @@ def get_prompt_text(prompt) -> str:
 # ---------------------------------------------------------------------------
 
 
-def generate_neg_log_prob_html(results: list, output_path: str):
+def generate_neg_log_prob_html(results: list, output_path: str, max_samples: int = 50):
     """Generate HTML with -log_prob annotation above each token."""
+    # Sample to keep HTML lightweight
+    import random
+    if len(results) > max_samples:
+        sampled = random.sample(results, max_samples)
+    else:
+        sampled = results
+
     # Compute global min/max for color scaling
-    all_vals = [t["neg_log_prob"] for r in results for t in r["tokens"]]
+    all_vals = [t["neg_log_prob"] for r in sampled for t in r["tokens"]]
     if not all_vals:
         print("  No tokens found, skipping HTML generation.")
         return
@@ -745,7 +752,8 @@ def generate_neg_log_prob_html(results: list, output_path: str):
         f.write('<table class="summary-table">\n')
         f.write('<tr><th>Metric</th><th>Value</th></tr>\n')
         f.write(f'<tr><td>Total Responses</td><td>{len(results)}</td></tr>\n')
-        f.write(f'<tr><td>Total Tokens</td><td>{len(all_vals)}</td></tr>\n')
+        f.write(f'<tr><td>Sampled Responses</td><td>{len(sampled)}</td></tr>\n')
+        f.write(f'<tr><td>Total Tokens (sampled)</td><td>{len(all_vals)}</td></tr>\n')
         f.write(f'<tr><td>Mean -log_prob</td><td>{np.mean(all_vals):.4f}</td></tr>\n')
         f.write(f'<tr><td>Std -log_prob</td><td>{np.std(all_vals):.4f}</td></tr>\n')
         f.write(f'<tr><td>Median -log_prob</td><td>{np.median(all_vals):.4f}</td></tr>\n')
@@ -753,12 +761,12 @@ def generate_neg_log_prob_html(results: list, output_path: str):
 
         # Navigation
         f.write('<div class="nav"><strong>Jump to:</strong> ')
-        for i in range(len(results)):
+        for i in range(len(sampled)):
             f.write(f'<a href="#resp-{i}">#{i}</a> ')
         f.write('</div>\n')
 
         # Each response
-        for i, r in enumerate(results):
+        for i, r in enumerate(sampled):
             f.write(f'<div class="response-container" id="resp-{i}">\n')
             f.write(f'<div class="response-header">Response #{i} '
                     f'(prompt_idx={r["prompt_idx"]}, sample_idx={r["sample_idx"]}, '
@@ -787,7 +795,7 @@ def generate_neg_log_prob_html(results: list, output_path: str):
 
         f.write(HTML_FOOTER)
 
-    print(f"  Saved -log_prob HTML: {output_path}")
+    print(f"  Saved -log_prob HTML ({len(sampled)}/{len(results)} samples): {output_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -795,9 +803,16 @@ def generate_neg_log_prob_html(results: list, output_path: str):
 # ---------------------------------------------------------------------------
 
 
-def generate_entropy_html(results: list, output_path: str):
+def generate_entropy_html(results: list, output_path: str, max_samples: int = 50):
     """Generate HTML with entropy annotation above each token."""
-    all_vals = [t["entropy"] for r in results for t in r["tokens"]]
+    # Sample to keep HTML lightweight
+    import random
+    if len(results) > max_samples:
+        sampled = random.sample(results, max_samples)
+    else:
+        sampled = results
+
+    all_vals = [t["entropy"] for r in sampled for t in r["tokens"]]
     if not all_vals:
         print("  No tokens found, skipping HTML generation.")
         return
@@ -821,7 +836,8 @@ def generate_entropy_html(results: list, output_path: str):
         f.write('<table class="summary-table">\n')
         f.write('<tr><th>Metric</th><th>Value</th></tr>\n')
         f.write(f'<tr><td>Total Responses</td><td>{len(results)}</td></tr>\n')
-        f.write(f'<tr><td>Total Tokens</td><td>{len(all_vals)}</td></tr>\n')
+        f.write(f'<tr><td>Sampled Responses</td><td>{len(sampled)}</td></tr>\n')
+        f.write(f'<tr><td>Total Tokens (sampled)</td><td>{len(all_vals)}</td></tr>\n')
         f.write(f'<tr><td>Mean Entropy</td><td>{np.mean(all_vals):.4f}</td></tr>\n')
         f.write(f'<tr><td>Std Entropy</td><td>{np.std(all_vals):.4f}</td></tr>\n')
         f.write(f'<tr><td>Median Entropy</td><td>{np.median(all_vals):.4f}</td></tr>\n')
@@ -829,12 +845,12 @@ def generate_entropy_html(results: list, output_path: str):
 
         # Navigation
         f.write('<div class="nav"><strong>Jump to:</strong> ')
-        for i in range(len(results)):
+        for i in range(len(sampled)):
             f.write(f'<a href="#resp-{i}">#{i}</a> ')
         f.write('</div>\n')
 
         # Each response
-        for i, r in enumerate(results):
+        for i, r in enumerate(sampled):
             f.write(f'<div class="response-container" id="resp-{i}">\n')
             f.write(f'<div class="response-header">Response #{i} '
                     f'(prompt_idx={r["prompt_idx"]}, sample_idx={r["sample_idx"]}, '
@@ -860,7 +876,7 @@ def generate_entropy_html(results: list, output_path: str):
 
         f.write(HTML_FOOTER)
 
-    print(f"  Saved entropy HTML: {output_path}")
+    print(f"  Saved entropy HTML ({len(sampled)}/{len(results)} samples): {output_path}")
 
 
 # ---------------------------------------------------------------------------
