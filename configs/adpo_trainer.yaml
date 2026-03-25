@@ -26,12 +26,6 @@ algorithm:
   judge_type: endpoint
   judge_model: Qwen3-14B
   judge_endpoint: ""
-  max_ref_solutions_in_prompt: 3
-  # SolutionBank
-  max_solutions_per_question: 8
-  solution_bank_dir: data/solutions
-  solution_bank_save_path: checkpoints/solution_bank.jsonl
-  solution_bank_save_freq: 50
 
 # --- Actor / Rollout / Ref overrides ---
 actor_rollout_ref:

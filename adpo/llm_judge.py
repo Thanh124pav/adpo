@@ -7,8 +7,6 @@ evaluates each phase independently and returns a reward vector.
 Judge context includes:
 - The original math problem
 - The correct answer (golden answer) if available
-- Reference solutions from the SolutionBank (correct solutions generated
-  by teacher model or discovered during training)
 - Previous reasoning phases (causal context)
 
 Supports:
@@ -36,8 +34,7 @@ PHASE_JUDGE_SYSTEM = (
     "You are a math reasoning evaluator. You will be given:\n"
     "1. A math problem\n"
     "2. The correct answer (if available)\n"
-    "3. Reference solutions showing correct approaches (if available)\n"
-    "4. A specific reasoning step to evaluate\n\n"
+    "3. A specific reasoning step to evaluate\n\n"
     "Your job: evaluate whether the reasoning step is correct and "
     "moves toward the correct answer.\n\n"
     "Output ONLY a JSON object: {\"score\": <float between 0.0 and 1.0>, "
@@ -58,7 +55,6 @@ def build_phase_judge_prompt(
     phase_idx: int,
     total_phases: int,
     golden_answer: str = "",
-    reference_solutions: Optional[List[str]] = None,
 ) -> List[dict]:
     """Build the judge prompt for evaluating a single phase.
 
@@ -69,7 +65,6 @@ def build_phase_judge_prompt(
         phase_idx: 0-indexed phase number.
         total_phases: Total number of phases.
         golden_answer: The correct answer (if known).
-        reference_solutions: List of correct solution texts (from SolutionBank).
 
     Returns:
         Chat messages for the judge.
@@ -79,16 +74,6 @@ def build_phase_judge_prompt(
     # Golden answer
     if golden_answer:
         parts.append(f"**Correct Answer:** {golden_answer}\n")
-
-    # Reference solutions
-    if reference_solutions:
-        n_refs = len(reference_solutions)
-        parts.append(f"**Reference Solutions ({n_refs} correct approach(es)):**")
-        for i, sol in enumerate(reference_solutions):
-            # Truncate long solutions to keep prompt manageable
-            truncated = sol[:1500] + "..." if len(sol) > 1500 else sol
-            parts.append(f"\n--- Solution {i+1} ---\n{truncated}")
-        parts.append("")
 
     # Previous context
     if context_phases:
@@ -102,7 +87,7 @@ def build_phase_judge_prompt(
         f"**Step {phase_idx + 1} of {total_phases} to evaluate:**\n"
         f"{current_phase}\n\n"
         f"Evaluate this reasoning step. Consider whether it aligns with "
-        f"the correct answer and reference solutions above. "
+        f"the correct answer above. "
         f"Output JSON: {{\"score\": <0.0-1.0>, \"reason\": \"...\"}}"
     )
 
@@ -158,7 +143,6 @@ class PhaseJudge:
         questions: List[str],
         phase_texts: List[List[str]],
         golden_answers: Optional[List[str]] = None,
-        reference_solutions: Optional[List[List[str]]] = None,
         **kwargs,
     ) -> List[List[float]]:
         """Score phases for a batch of responses.
@@ -167,8 +151,6 @@ class PhaseJudge:
             questions: List of math problems, one per response.
             phase_texts: phase_texts[i] = ["phase 0 text", "phase 1 text", ...]
             golden_answers: Golden answers per response (if available).
-            reference_solutions: Reference solutions per response from SolutionBank.
-                reference_solutions[i] = ["correct sol 1", "correct sol 2", ...]
 
         Returns:
             rewards[i] = [r_0, r_1, ...] for response i.
@@ -185,7 +167,6 @@ class VLLMPhaseJudge(PhaseJudge):
         tensor_parallel_size: int = 1,
         max_tokens: int = 256,
         temperature: float = 0.0,
-        max_ref_solutions_in_prompt: int = 3,
     ):
         from vllm import LLM, SamplingParams
         from transformers import AutoTokenizer
@@ -201,19 +182,14 @@ class VLLMPhaseJudge(PhaseJudge):
             temperature=temperature,
             max_tokens=max_tokens,
         )
-        self.max_ref_solutions_in_prompt = max_ref_solutions_in_prompt
         logger.info(f"VLLMPhaseJudge initialized with {model_path}")
 
-    def score_phases(self, questions, phase_texts, golden_answers=None,
-                     reference_solutions=None, **kwargs):
+    def score_phases(self, questions, phase_texts, golden_answers=None, **kwargs):
         all_prompts = []
         prompt_map = []
 
         for i, (question, phases) in enumerate(zip(questions, phase_texts)):
             ga = golden_answers[i] if golden_answers and i < len(golden_answers) else ""
-            refs = None
-            if reference_solutions and i < len(reference_solutions):
-                refs = reference_solutions[i][:self.max_ref_solutions_in_prompt]
 
             for k, phase_text in enumerate(phases):
                 context = phases[:k]
@@ -224,7 +200,6 @@ class VLLMPhaseJudge(PhaseJudge):
                     phase_idx=k,
                     total_phases=len(phases),
                     golden_answer=ga,
-                    reference_solutions=refs,
                 )
                 formatted = self.tokenizer.apply_chat_template(
                     messages, tokenize=False, add_generation_prompt=True,
@@ -257,7 +232,6 @@ class APIPhaseJudge(PhaseJudge):
         max_tokens: int = 256,
         temperature: float = 0.0,
         max_concurrent: int = 32,
-        max_ref_solutions_in_prompt: int = 3,
         timeout: float = 120.0,
     ):
         import openai
@@ -268,10 +242,9 @@ class APIPhaseJudge(PhaseJudge):
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.max_concurrent = max_concurrent
-        self.max_ref_solutions_in_prompt = max_ref_solutions_in_prompt
         logger.info(f"APIPhaseJudge initialized with {model}")
 
-    def _score_single(self, question, phases, k, golden_answer="", refs=None):
+    def _score_single(self, question, phases, k, golden_answer=""):
         context = phases[:k]
         messages = build_phase_judge_prompt(
             question=question,
@@ -280,7 +253,6 @@ class APIPhaseJudge(PhaseJudge):
             phase_idx=k,
             total_phases=len(phases),
             golden_answer=golden_answer,
-            reference_solutions=refs,
         )
         try:
             response = self.client.chat.completions.create(
@@ -294,19 +266,15 @@ class APIPhaseJudge(PhaseJudge):
             logger.warning(f"API judge error: {e}")
             return 0.5
 
-    def score_phases(self, questions, phase_texts, golden_answers=None,
-                     reference_solutions=None, **kwargs):
+    def score_phases(self, questions, phase_texts, golden_answers=None, **kwargs):
         import concurrent.futures
 
         tasks = []
         for i, (question, phases) in enumerate(zip(questions, phase_texts)):
             ga = golden_answers[i] if golden_answers and i < len(golden_answers) else ""
-            refs = None
-            if reference_solutions and i < len(reference_solutions):
-                refs = reference_solutions[i][:self.max_ref_solutions_in_prompt]
 
             for k in range(len(phases)):
-                tasks.append((i, k, question, phases, ga, refs))
+                tasks.append((i, k, question, phases, ga))
 
         rewards = [[None] * len(phase_texts[i]) for i in range(len(questions))]
 
@@ -315,9 +283,9 @@ class APIPhaseJudge(PhaseJudge):
         ) as executor:
             futures = {}
             for task in tasks:
-                i, k, question, phases, ga, refs = task
+                i, k, question, phases, ga = task
                 future = executor.submit(
-                    self._score_single, question, phases, k, ga, refs
+                    self._score_single, question, phases, k, ga
                 )
                 futures[future] = (i, k)
 
@@ -355,7 +323,6 @@ class EndpointPhaseJudge(PhaseJudge):
         max_retries: int = 3,
         retry_delay: float = 1.0,
         timeout: float = 60.0,
-        max_ref_solutions_in_prompt: int = 3,
     ):
         self.endpoint = endpoint.rstrip("/")
         self.completions_url = f"{self.endpoint}/v1/chat/completions"
@@ -366,7 +333,6 @@ class EndpointPhaseJudge(PhaseJudge):
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         self.timeout = timeout
-        self.max_ref_solutions_in_prompt = max_ref_solutions_in_prompt
         logger.info(
             f"EndpointPhaseJudge initialized: model={model}, "
             f"endpoint={self.endpoint}, max_concurrent={max_concurrent}"
@@ -430,8 +396,7 @@ class EndpointPhaseJudge(PhaseJudge):
             ]
             return await asyncio.gather(*tasks)
 
-    def score_phases(self, questions, phase_texts, golden_answers=None,
-                     reference_solutions=None, **kwargs):
+    def score_phases(self, questions, phase_texts, golden_answers=None, **kwargs):
         import asyncio
 
         all_messages = []
@@ -439,9 +404,6 @@ class EndpointPhaseJudge(PhaseJudge):
 
         for i, (question, phases) in enumerate(zip(questions, phase_texts)):
             ga = golden_answers[i] if golden_answers and i < len(golden_answers) else ""
-            refs = None
-            if reference_solutions and i < len(reference_solutions):
-                refs = reference_solutions[i][:self.max_ref_solutions_in_prompt]
 
             for k in range(len(phases)):
                 messages = build_phase_judge_prompt(
@@ -451,7 +413,6 @@ class EndpointPhaseJudge(PhaseJudge):
                     phase_idx=k,
                     total_phases=len(phases),
                     golden_answer=ga,
-                    reference_solutions=refs,
                 )
                 all_messages.append(messages)
                 prompt_map.append((i, k))
@@ -494,7 +455,7 @@ class RuleBasedPhaseJudge(PhaseJudge):
         self.reward_fn = reward_fn or compute_score
 
     def score_phases(self, questions, phase_texts, golden_answers=None,
-                     reference_solutions=None, data_sources=None, **kwargs):
+                     data_sources=None, **kwargs):
         rewards = []
         for i, phases in enumerate(phase_texts):
             n = len(phases)
