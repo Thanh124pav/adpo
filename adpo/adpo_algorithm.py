@@ -539,16 +539,29 @@ def assign_phase_advantages_to_tokens(
     phase_ids: torch.Tensor,
     response_mask: torch.Tensor,
     soft_weights: Optional[torch.Tensor] = None,
+    decay_gamma: float = 0.0,
+    boundaries_batch: Optional[List[List[int]]] = None,
 ) -> torch.Tensor:
     """Map phase-level advantages back to token-level.
 
     Hard: A(t) = A^(k(t))
     Soft: A(t) = sum_k w_{t,k} * A^(k)
+    Decreasing (decay_gamma > 0): Within each phase, token advantages decay
+        geometrically so earlier tokens get more credit:
+            c = A_phase / (2 * T)
+            a'_1 = A_phase (initial decay component)
+            a_i = c + a'_i
+            a'_{i+1} = a'_i * gamma
     """
     batch_size, seq_len = phase_ids.shape
     device = phase_ids.device
 
-    if soft_weights is not None:
+    if decay_gamma > 0 and boundaries_batch is not None:
+        token_advantages = _assign_with_decay(
+            phase_advantages, phase_ids, response_mask,
+            boundaries_batch, decay_gamma,
+        )
+    elif soft_weights is not None:
         # (batch, seq_len, max_K) @ (batch, max_K) -> (batch, seq_len)
         token_advantages = torch.einsum(
             "btk,bk->bt", soft_weights, phase_advantages
@@ -564,6 +577,49 @@ def assign_phase_advantages_to_tokens(
     return token_advantages * response_mask
 
 
+def _assign_with_decay(
+    phase_advantages: torch.Tensor,
+    phase_ids: torch.Tensor,
+    response_mask: torch.Tensor,
+    boundaries_batch: List[List[int]],
+    gamma: float,
+) -> torch.Tensor:
+    """In-phase advantage decreasing: earlier tokens get more credit.
+
+    For each phase with advantage A and T tokens:
+        c       = A / (2 * T)       (constant baseline per token)
+        a'_1    = A                  (initial decay value)
+        a_i     = c + a'_i          (token i gets baseline + decayed part)
+        a'_{i+1}= a'_i * gamma      (geometric decay)
+    """
+    batch_size, seq_len = phase_ids.shape
+    device = phase_ids.device
+    token_advantages = torch.zeros(batch_size, seq_len, device=device)
+
+    for b in range(batch_size):
+        boundaries = boundaries_batch[b]
+        active = response_mask[b].nonzero(as_tuple=True)[0]
+        if len(active) == 0:
+            continue
+        resp_end = active[-1].item() + 1
+
+        for k in range(len(boundaries)):
+            start = boundaries[k]
+            end = boundaries[k + 1] if k + 1 < len(boundaries) else resp_end
+            T = end - start
+            if T <= 0:
+                continue
+
+            A = phase_advantages[b, k].item()
+            c = A / (2.0 * T)
+            a_prime = A  # a'_1
+            for i in range(T):
+                token_advantages[b, start + i] = c + a_prime
+                a_prime *= gamma
+
+    return token_advantages
+
+
 # ---------------------------------------------------------------------------
 # Full Pipeline
 # ---------------------------------------------------------------------------
@@ -576,6 +632,7 @@ def compute_adpo_phase_advantages(
     index: torch.Tensor,
     boundaries_batch: List[List[int]],
     sigma: float = 0.0,
+    decay_gamma: float = 0.0,
     eps: float = 1e-8,
 ) -> torch.Tensor:
     """Full ADPO pipeline: phase rewards -> phase advantages -> token advantages.
@@ -588,6 +645,11 @@ def compute_adpo_phase_advantages(
 
     lambda_k = sigma_k^global / (sigma_k^global + sigma_i^local + eps)
     A_{i,k} = lambda_k * A_local + (1-lambda_k) * A_global
+
+    Token-level mapping modes (mutually exclusive, checked in order):
+    - decay_gamma > 0: In-phase decreasing — earlier tokens get more credit.
+    - sigma > 0: Soft Gaussian blending near phase boundaries.
+    - Otherwise: Hard assignment (all tokens in a phase share the same adv).
     """
     seq_len = response_mask.shape[1]
 
@@ -601,7 +663,7 @@ def compute_adpo_phase_advantages(
     phase_ids = build_phase_mask(boundaries_batch, seq_len, response_mask)
 
     soft_weights = None
-    if sigma > 0:
+    if decay_gamma <= 0 and sigma > 0:
         soft_weights = compute_soft_phase_weights(
             phase_ids, boundaries_batch, response_mask, sigma=sigma,
         )
@@ -611,6 +673,8 @@ def compute_adpo_phase_advantages(
         phase_ids=phase_ids,
         response_mask=response_mask,
         soft_weights=soft_weights,
+        decay_gamma=decay_gamma,
+        boundaries_batch=boundaries_batch,
     )
 
     return token_advantages

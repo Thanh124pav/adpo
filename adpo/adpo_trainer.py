@@ -68,6 +68,7 @@ class ADPOTrainer(RayPPOTrainer):
         self.phase_min_len = getattr(algo, "phase_min_len", 10)
         self.phase_max_K = getattr(algo, "phase_max_K", 10)
         self.phase_sigma = getattr(algo, "phase_sigma", 0.0)
+        self.phase_decay_gamma = getattr(algo, "phase_decay_gamma", 0.0)
         self.incorrect_penalty = getattr(algo, "incorrect_penalty", 0.3)
         self.no_answer_correct_scale = getattr(algo, "no_answer_correct_scale", 0.5)
         self.no_answer_incorrect_scale = getattr(algo, "no_answer_incorrect_scale", 0.1)
@@ -273,6 +274,7 @@ class ADPOTrainer(RayPPOTrainer):
             index=index,
             boundaries_batch=boundaries_batch,
             sigma=self.phase_sigma,
+            decay_gamma=self.phase_decay_gamma,
         )
 
         data.batch["advantages"] = token_advantages
