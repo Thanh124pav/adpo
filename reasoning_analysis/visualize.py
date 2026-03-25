@@ -692,9 +692,11 @@ def render_tokens_html(tokens: list, metric_key: str, vmin: float, vmax: float) 
             f'<span class="token-text">{token_text}</span>'
             f'</span>'
         )
-        # Insert line break when token contains double newline
+        # Insert line/paragraph breaks for newline tokens
         if "\n\n" in raw_token:
-            parts.append('<br class="token-newline">')
+            parts.append('<br><br>')
+        elif "\n" in raw_token:
+            parts.append('<br>')
     return "".join(parts)
 
 
