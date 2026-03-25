@@ -20,6 +20,8 @@ algorithm:
   phase_min_len: 10
   phase_max_K: 10
   phase_decay_gamma: 0.0       # 0 = off, >0 = in-phase decreasing (e.g. 0.9)
+  # Score mapping
+  correct_reward_floor: 0.5    # Min phase reward for correct responses
   # LLM-as-Judge
   judge_type: endpoint
   judge_model: Qwen3-14B

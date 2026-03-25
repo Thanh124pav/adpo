@@ -68,6 +68,7 @@ class ADPOTrainer(RayPPOTrainer):
         self.phase_min_len = getattr(algo, "phase_min_len", 10)
         self.phase_max_K = getattr(algo, "phase_max_K", 10)
         self.phase_decay_gamma = getattr(algo, "phase_decay_gamma", 0.0)
+        self.correct_reward_floor = getattr(algo, "correct_reward_floor", 0.5)
         self.incorrect_penalty = getattr(algo, "incorrect_penalty", 0.3)
         self.no_answer_correct_scale = getattr(algo, "no_answer_correct_scale", 0.5)
         self.no_answer_incorrect_scale = getattr(algo, "no_answer_incorrect_scale", 0.1)
@@ -264,6 +265,17 @@ class ADPOTrainer(RayPPOTrainer):
 
         phase_rewards = phase_rewards * score_scale.unsqueeze(1)
 
+        # Step 6c: Floor phase rewards for correct responses
+        # If a response got the right answer, every phase gets at least correct_reward_floor
+        correct_mask = has_golden & (outcome_tensor >= 1.0)  # (batch,)
+        if correct_mask.any():
+            floor_mask = correct_mask.unsqueeze(1) & (phase_mask_tensor > 0)  # (batch, max_K)
+            phase_rewards = torch.where(
+                floor_mask,
+                torch.clamp(phase_rewards, min=self.correct_reward_floor),
+                phase_rewards,
+            )
+
         # Step 7: Phase advantages -> token advantages
         token_advantages = compute_adpo_phase_advantages(
             log_probs=log_probs,
@@ -351,6 +363,7 @@ def patch_verl_grpo_with_adpo(
     incorrect_penalty: float = 0.3,
     no_answer_correct_scale: float = 0.5,
     no_answer_incorrect_scale: float = 0.1,
+    correct_reward_floor: float = 0.5,
 ):
     """Monkey-patch verl's module-level compute_advantage function with ADPO phase
     decomposition + LLM-as-Judge + SolutionBank.
@@ -600,6 +613,16 @@ def patch_verl_grpo_with_adpo(
 
         phase_rewards = phase_rewards * score_scale.unsqueeze(1)
 
+        # Floor phase rewards for correct responses
+        correct_mask = has_golden & (outcome_tensor >= 1.0)
+        if correct_mask.any():
+            floor_mask = correct_mask.unsqueeze(1) & (phase_mask_tensor > 0)
+            phase_rewards = torch.where(
+                floor_mask,
+                torch.clamp(phase_rewards, min=correct_reward_floor),
+                phase_rewards,
+            )
+
         # Step 7: Phase advantages -> token advantages
         token_advantages = compute_adpo_phase_advantages(
             log_probs=log_probs,
@@ -719,6 +742,10 @@ class ADPOTaskRunner:
             solution_bank_save_freq=algo.get("solution_bank_save_freq", 50),
             judge_timeout=algo.get("judge_timeout", 120.0),
             judge_max_tokens=algo.get("judge_max_tokens", 256),
+            incorrect_penalty=algo.get("incorrect_penalty", 0.3),
+            no_answer_correct_scale=algo.get("no_answer_correct_scale", 0.5),
+            no_answer_incorrect_scale=algo.get("no_answer_incorrect_scale", 0.1),
+            correct_reward_floor=algo.get("correct_reward_floor", 0.5),
         )
 
         # Delegate to standard TaskRunner
