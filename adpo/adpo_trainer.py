@@ -404,32 +404,6 @@ def patch_verl_grpo_with_adpo(
                                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                                                config=config)
 
-    def _find_response_start(input_ids_row, tok):
-        """Find actual response start by searching for assistant/think markers.
-
-        When response_mask=1 for the entire sequence (prompt+response),
-        we need to find where the model's response actually begins.
-        Searches for patterns like '<|im_start|>assistant' or '<think>'.
-        Returns the token index after the marker, or 0 if not found.
-        """
-        # Decode full sequence to find markers
-        full_text_ids = input_ids_row.tolist()
-        # Try common markers — search from the end since there may be
-        # a system + user + assistant structure
-        marker_tokens = []
-        for marker_str in ["<|im_start|>assistant", "<think>"]:
-            ids = tok.encode(marker_str, add_special_tokens=False)
-            if ids:
-                marker_tokens.append((marker_str, ids))
-
-        for marker_str, marker_ids in marker_tokens:
-            marker_len = len(marker_ids)
-            # Search backwards for last occurrence
-            for i in range(len(full_text_ids) - marker_len, -1, -1):
-                if full_text_ids[i:i + marker_len] == marker_ids:
-                    return i + marker_len
-        return 0
-
     def _adpo_compute_advantage_inner(data, adv_estimator, gamma, lam,
                                        num_repeat, norm_adv_by_std_in_grpo, config):
         """Inner logic — separated so exceptions are caught and logged."""
@@ -440,7 +414,6 @@ def patch_verl_grpo_with_adpo(
         index_raw = data.non_tensor_batch.get("uid", data.batch.get("uid", None))
         if isinstance(index_raw, np.ndarray):
             if index_raw.dtype == object:
-                # String UIDs — map to integer group indices
                 unique_vals, inverse = np.unique(index_raw, return_inverse=True)
                 index = torch.tensor(inverse, dtype=torch.long, device=response_mask.device)
             else:
@@ -449,68 +422,47 @@ def patch_verl_grpo_with_adpo(
             index = index_raw.to(response_mask.device)
         else:
             index = torch.arange(batch_size, device=response_mask.device)
+
+        # Determine which tensor to use for token decoding:
+        # response_mask matches batch['responses'] shape, NOT input_ids
+        response_ids = data.batch.get("responses", None)
+        prompt_ids = data.batch.get("prompts", None)
         input_ids = data.batch.get("input_ids", None)
 
-        if input_ids is None:
-            print("[ADPO] WARNING: No input_ids in batch — falling back to original compute_advantage", flush=True)
+        # Pick the token_ids tensor that matches response_mask shape
+        if response_ids is not None and response_ids.shape[1] == seq_len:
+            token_ids = response_ids
+        elif input_ids is not None and input_ids.shape[1] == seq_len:
+            token_ids = input_ids
+        else:
+            token_ids = None
 
-        # Fix response_mask: if it starts at 0 for the entire sequence,
-        # find actual response start and zero-out prompt tokens
-        if input_ids is not None and tokenizer is not None:
-            active0 = response_mask[0].nonzero(as_tuple=True)[0]
-            if len(active0) > 0 and active0[0].item() == 0:
-                # response_mask covers entire sequence — need to fix
-                resp_starts = []
-                for b in range(batch_size):
-                    rs = _find_response_start(input_ids[b], tokenizer)
-                    resp_starts.append(rs)
-                    if rs > 0:
-                        response_mask[b, :rs] = 0
-                print(f"[ADPO] Fixed response_mask: resp_starts[0]={resp_starts[0]}, "
-                      f"avg={np.mean(resp_starts):.0f}", flush=True)
-
-        if input_ids is None:
+        if token_ids is None:
+            print("[ADPO] WARNING: No matching token_ids for response_mask — "
+                  f"response_mask.shape={response_mask.shape}, "
+                  f"responses.shape={response_ids.shape if response_ids is not None else None}, "
+                  f"input_ids.shape={input_ids.shape if input_ids is not None else None}",
+                  flush=True)
             return original_compute_advantage(data, adv_estimator=adv_estimator,
                                                gamma=gamma, lam=lam,
                                                num_repeat=num_repeat,
                                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                                                config=config)
 
-        # Debug: inspect batch structure
+        # Debug info (first call only)
         active0 = response_mask[0].nonzero(as_tuple=True)[0]
         resp_start0 = active0[0].item() if len(active0) > 0 else -1
         resp_end0 = active0[-1].item() + 1 if len(active0) > 0 else -1
-        ntb_keys = list(data.non_tensor_batch.keys()) if hasattr(data, 'non_tensor_batch') else []
-        batch_keys = list(data.batch.keys()) if hasattr(data.batch, 'keys') else []
-        print(f"[ADPO Debug] input_ids.shape={input_ids.shape}, "
-              f"response_mask[0] first=1@{resp_start0} last=1@{resp_end0-1}, "
-              f"batch_keys={batch_keys}, "
-              f"non_tensor_keys={ntb_keys}", flush=True)
-        if input_ids is not None and tokenizer is not None:
-            tok0_text = tokenizer.decode(input_ids[0][:5].tolist(), skip_special_tokens=False)
-            print(f"[ADPO Debug] first 5 tokens of input_ids[0]: {tok0_text!r}", flush=True)
-        if hasattr(data, 'non_tensor_batch'):
-            for k in ntb_keys[:5]:
-                v = data.non_tensor_batch[k]
-                sample = v[0] if hasattr(v, '__getitem__') and len(v) > 0 else v
-                print(f"[ADPO Debug] non_tensor_batch[{k!r}][0] = {str(sample)[:150]}", flush=True)
-            # Also check raw_prompt
-            if 'raw_prompt' in data.non_tensor_batch:
-                rp = data.non_tensor_batch['raw_prompt'][0]
-                print(f"[ADPO Debug] raw_prompt[0] type={type(rp).__name__}, val={str(rp)[:200]}", flush=True)
-        # Check batch['prompts'] shape/type
-        if 'prompts' in batch_keys:
-            prompts_val = data.batch['prompts']
-            print(f"[ADPO Debug] batch['prompts'] type={type(prompts_val).__name__}, "
-                  f"shape={prompts_val.shape if hasattr(prompts_val, 'shape') else 'N/A'}", flush=True)
-            if hasattr(prompts_val, 'shape') and len(prompts_val.shape) >= 1:
-                # It's a tensor — try to decode first sample
-                p_text = tokenizer.decode(prompts_val[0].tolist(), skip_special_tokens=False)
-                print(f"[ADPO Debug] batch['prompts'][0] decoded: {p_text[:200]!r}", flush=True)
-        if 'responses' in batch_keys:
-            responses_val = data.batch['responses']
-            print(f"[ADPO Debug] batch['responses'] type={type(responses_val).__name__}, "
-                  f"shape={responses_val.shape if hasattr(responses_val, 'shape') else 'N/A'}", flush=True)
+        print(f"[ADPO Debug] token_ids.shape={token_ids.shape}, "
+              f"response_mask[0] active={resp_start0}..{resp_end0-1} ({resp_end0 - resp_start0} toks), "
+              f"prompt_ids.shape={prompt_ids.shape if prompt_ids is not None else None}",
+              flush=True)
+        if tokenizer is not None and resp_start0 >= 0:
+            sample_text = tokenizer.decode(
+                token_ids[0, resp_start0:min(resp_start0+10, resp_end0)].tolist(),
+                skip_special_tokens=False,
+            )
+            print(f"[ADPO Debug] first 10 response tokens: {sample_text!r}", flush=True)
 
         # Step 1: -log pi
         neg_log_probs = compute_neg_log_probs(log_probs, response_mask)
@@ -532,7 +484,7 @@ def patch_verl_grpo_with_adpo(
             min_phase_len=phase_min_len,
             max_phases=phase_max_K,
             entropy=entropy,
-            token_ids=input_ids,
+            token_ids=token_ids,
             tokenizer=tokenizer,
         )
 
@@ -548,12 +500,10 @@ def patch_verl_grpo_with_adpo(
             active = response_mask[b].nonzero(as_tuple=True)[0]
             resp_end = active[-1].item() + 1 if len(active) > 0 else 0
 
-            # Question — decode from prompt portion of input_ids
+            # Question — decode from batch['prompts'] (skip endoftext padding)
             question = ""
-            if input_ids is not None and tokenizer is not None:
-                resp_start = active[0].item() if len(active) > 0 else input_ids.shape[1]
-                prompt_token_ids = input_ids[b][:resp_start]
-                question = tokenizer.decode(prompt_token_ids, skip_special_tokens=True)
+            if prompt_ids is not None and tokenizer is not None:
+                question = tokenizer.decode(prompt_ids[b].tolist(), skip_special_tokens=True)
             questions.append(question)
 
             # Golden answer & data source — stored in non_tensor_batch
@@ -573,11 +523,11 @@ def patch_verl_grpo_with_adpo(
             golden_answers.append(gt)
             data_sources.append(ds)
 
-            # Segment into phases
+            # Segment into phases (use token_ids = responses tensor)
             phases = segment_response_into_phases(
                 boundaries=boundaries_batch[b],
                 response_length=resp_end,
-                token_ids=input_ids[b],
+                token_ids=token_ids[b],
                 tokenizer=tokenizer,
             )
             phase_texts_batch.append([p.text for p in phases])
@@ -585,7 +535,7 @@ def patch_verl_grpo_with_adpo(
             # Full response text
             resp_start = active[0].item() if len(active) > 0 else 0
             full_text = tokenizer.decode(
-                input_ids[b][resp_start:resp_end], skip_special_tokens=True
+                token_ids[b][resp_start:resp_end].tolist(), skip_special_tokens=True
             )
             full_responses.append(full_text)
 
