@@ -192,6 +192,18 @@ class ADPOTrainer(RayPPOTrainer):
                 )
             full_responses.append(full_text)
 
+        # Demo: print up to 5 phases from the first response
+        if phase_texts_batch and phase_texts_batch[0]:
+            demo_phases = phase_texts_batch[0][:5]
+            demo_bounds = boundaries_batch[0]
+            n_total = len(phase_texts_batch[0])
+            print(f"[ADPO Phase Demo] response=0, total_phases={n_total}, "
+                  f"showing first {len(demo_phases)}:", flush=True)
+            for k, text in enumerate(demo_phases):
+                preview = text[:120].replace('\n', '\\n')
+                b_start = demo_bounds[k] if k < len(demo_bounds) else "?"
+                print(f"  phase {k} (tok={b_start}): \"{preview}...\"", flush=True)
+
         # Step 4: Score phases with judge (with golden answer + ref solutions)
         phase_rewards_list = self.judge.score_phases(
             questions=questions,

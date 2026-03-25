@@ -652,6 +652,7 @@ def _assign_with_decay(
     device = phase_ids.device
     token_advantages = torch.zeros(batch_size, seq_len, device=device)
 
+    logged = False
     for b in range(batch_size):
         boundaries = boundaries_batch[b]
         active = response_mask[b].nonzero(as_tuple=True)[0]
@@ -672,6 +673,19 @@ def _assign_with_decay(
             for i in range(T):
                 token_advantages[b, start + i] = c + a_prime
                 a_prime *= gamma
+
+            # Log first response's decay info
+            if not logged and T > 1:
+                first_adv = token_advantages[b, start].item()
+                last_adv = token_advantages[b, end - 1].item()
+                print(
+                    f"[ADPO Decay] b={b} phase={k} | T={T} A={A:.4f} "
+                    f"gamma={gamma} | adv_first={first_adv:.4f} "
+                    f"adv_last={last_adv:.4f} diff={first_adv - last_adv:.4f}",
+                    flush=True,
+                )
+        if not logged:
+            logged = True
 
     return token_advantages
 
