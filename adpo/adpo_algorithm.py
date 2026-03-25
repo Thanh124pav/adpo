@@ -84,10 +84,12 @@ def _find_sentence_boundaries(
     token_ids: torch.Tensor,
     response_mask: torch.Tensor,
     tokenizer,
+    min_sentence_len: int = 5,
 ) -> List[List[Tuple[int, int]]]:
     """Split response tokens into sentence spans by decoding and finding delimiters.
 
     Splits on: . ? ! ... \\n \\n\\n and similar punctuation.
+    Sentences shorter than min_sentence_len are merged into the next sentence.
 
     Returns:
         List (per batch) of list of (start_idx, end_idx) token spans.
@@ -121,17 +123,26 @@ def _find_sentence_boundaries(
                 break_positions.append(i)
 
         # Convert break positions to sentence spans
-        sentences = []
+        raw_sentences = []
         sent_start = 0  # relative to `start`
         for bp in break_positions:
             sent_end = bp + 1  # exclusive, include the delimiter token
             if sent_end > sent_start:
-                sentences.append((start + sent_start, start + sent_end))
+                raw_sentences.append((start + sent_start, start + sent_end))
             sent_start = sent_end
 
         # Remaining tokens form the last sentence
         if sent_start < (end - start):
-            sentences.append((start + sent_start, end))
+            raw_sentences.append((start + sent_start, end))
+
+        # Merge short sentences into the next one
+        sentences = []
+        for s_start, s_end in raw_sentences:
+            if sentences and (s_start - sentences[-1][0]) < min_sentence_len:
+                # Previous sentence too short — extend it
+                sentences[-1] = (sentences[-1][0], s_end)
+            else:
+                sentences.append((s_start, s_end))
 
         # Fallback: if no sentences found, whole response = 1 sentence
         if not sentences:
@@ -189,6 +200,21 @@ def detect_phase_boundaries_adaptive(
 
         # Rank all sentences (except first) by score, pick top-K above threshold
         threshold = np.percentile(sent_scores, percentile)
+
+        # Debug: print sentence info for first response
+        if b == 0:
+            print(f"[ADPO Sentences] response=0: {len(sentences)} sentences, "
+                  f"threshold={threshold:.4f} (p{percentile}), "
+                  f"scores={[f'{s:.4f}' for s in sent_scores[:10]]}", flush=True)
+            for i, (s_start, s_end) in enumerate(sentences[:5]):
+                T = s_end - s_start
+                txt = tokenizer.decode(
+                    token_ids[b, s_start:min(s_start+15, s_end)].tolist(),
+                    skip_special_tokens=True,
+                )
+                above = "✓" if i > 0 and sent_scores[i] > threshold else "✗"
+                print(f"  sent {i} (tok={s_start}, T={T}, score={sent_scores[i]:.4f}) "
+                      f"{above}: \"{txt[:80]}...\"", flush=True)
 
         # Build candidates: (sentence_index, score, start_pos) for sentences above threshold
         candidates = []
