@@ -433,6 +433,25 @@ def patch_verl_grpo_with_adpo(
                                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                                                config=config)
 
+        # Debug: inspect batch structure
+        active0 = response_mask[0].nonzero(as_tuple=True)[0]
+        resp_start0 = active0[0].item() if len(active0) > 0 else -1
+        resp_end0 = active0[-1].item() + 1 if len(active0) > 0 else -1
+        ntb_keys = list(data.non_tensor_batch.keys()) if hasattr(data, 'non_tensor_batch') else []
+        batch_keys = list(data.batch.keys()) if hasattr(data.batch, 'keys') else []
+        print(f"[ADPO Debug] input_ids.shape={input_ids.shape}, "
+              f"response_mask[0] first=1@{resp_start0} last=1@{resp_end0-1}, "
+              f"batch_keys={batch_keys}, "
+              f"non_tensor_keys={ntb_keys}", flush=True)
+        if input_ids is not None and tokenizer is not None:
+            tok0_text = tokenizer.decode(input_ids[0][:5].tolist(), skip_special_tokens=False)
+            print(f"[ADPO Debug] first 5 tokens of input_ids[0]: {tok0_text!r}", flush=True)
+        if hasattr(data, 'non_tensor_batch'):
+            for k in ntb_keys[:5]:
+                v = data.non_tensor_batch[k]
+                sample = v[0] if hasattr(v, '__getitem__') and len(v) > 0 else v
+                print(f"[ADPO Debug] non_tensor_batch[{k!r}][0] = {str(sample)[:150]}", flush=True)
+
         # Step 1: -log pi
         neg_log_probs = compute_neg_log_probs(log_probs, response_mask)
 
