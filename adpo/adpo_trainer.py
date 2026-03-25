@@ -152,18 +152,31 @@ class ADPOTrainer(RayPPOTrainer):
             active = response_mask[b].nonzero(as_tuple=True)[0]
             resp_end = active[-1].item() + 1 if len(active) > 0 else 0
 
-            # Question
+            # Question — decode from prompt portion of input_ids
             question = ""
-            if hasattr(data.batch, "prompts"):
-                question = data.batch["prompts"][b]
+            if input_ids is not None and self.tokenizer is not None:
+                resp_start = active[0].item() if len(active) > 0 else seq_len
+                prompt_token_ids = input_ids[b][:resp_start]
+                question = self.tokenizer.decode(prompt_token_ids, skip_special_tokens=True)
             questions.append(question)
 
-            # Golden answer
+            # Golden answer & data source
             gt = ""
             ds = "math"
-            if hasattr(data.batch, "ground_truths"):
+            if hasattr(data, "non_tensor_batch") and "reward_model" in data.non_tensor_batch:
+                rm_info = data.non_tensor_batch["reward_model"]
+                if isinstance(rm_info, (list, np.ndarray)) and isinstance(rm_info[b], dict):
+                    gt = rm_info[b].get("ground_truth", "")
+                elif isinstance(rm_info, dict):
+                    gt_list = rm_info.get("ground_truth", None)
+                    if gt_list is not None and hasattr(gt_list, '__getitem__'):
+                        gt = gt_list[b]
+            elif hasattr(data.batch, "ground_truths"):
                 gt = data.batch["ground_truths"][b]
-            if hasattr(data.batch, "data_sources"):
+            if hasattr(data, "non_tensor_batch") and "data_source" in data.non_tensor_batch:
+                ds_arr = data.non_tensor_batch["data_source"]
+                ds = ds_arr[b] if hasattr(ds_arr, '__getitem__') else str(ds_arr)
+            elif hasattr(data.batch, "data_sources"):
                 ds = data.batch["data_sources"][b]
             golden_answers.append(gt)
             data_sources.append(ds)
@@ -191,6 +204,14 @@ class ADPOTrainer(RayPPOTrainer):
                     input_ids[b][resp_start:resp_end], skip_special_tokens=True
                 )
             full_responses.append(full_text)
+
+        # Debug: verify question extraction
+        n_empty_q = sum(1 for q in questions if not q.strip())
+        n_empty_gt = sum(1 for g in golden_answers if not g.strip())
+        if questions:
+            preview = questions[0][:100].replace('\n', '\\n')
+            print(f"[ADPO Questions] batch={batch_size}, empty_q={n_empty_q}, "
+                  f"empty_gt={n_empty_gt}, q[0]=\"{preview}...\"", flush=True)
 
         # Demo: print up to 5 phases from the first response
         if phase_texts_batch and phase_texts_batch[0]:
@@ -509,12 +530,12 @@ def patch_verl_grpo_with_adpo(
             active = response_mask[b].nonzero(as_tuple=True)[0]
             resp_end = active[-1].item() + 1 if len(active) > 0 else 0
 
-            # Question — decode from prompt token IDs
-            prompt_ids = data.batch.get("prompts", None)
-            if prompt_ids is not None:
-                question = tokenizer.decode(prompt_ids[b], skip_special_tokens=True)
-            else:
-                question = ""
+            # Question — decode from prompt portion of input_ids
+            question = ""
+            if input_ids is not None and tokenizer is not None:
+                resp_start = active[0].item() if len(active) > 0 else input_ids.shape[1]
+                prompt_token_ids = input_ids[b][:resp_start]
+                question = tokenizer.decode(prompt_token_ids, skip_special_tokens=True)
             questions.append(question)
 
             # Golden answer & data source — stored in non_tensor_batch
