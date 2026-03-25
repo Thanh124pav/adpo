@@ -135,6 +135,8 @@ class ADPOTrainer(RayPPOTrainer):
             min_phase_len=self.phase_min_len,
             max_phases=self.phase_max_K,
             entropy=entropy,
+            token_ids=input_ids,
+            tokenizer=self.tokenizer,
         )
 
         # Step 3: Extract texts, golden answers, reference solutions
@@ -478,6 +480,8 @@ def patch_verl_grpo_with_adpo(
             min_phase_len=phase_min_len,
             max_phases=phase_max_K,
             entropy=entropy,
+            token_ids=input_ids,
+            tokenizer=tokenizer,
         )
 
         # Step 3: Extract texts, golden answers, reference solutions

@@ -13,6 +13,7 @@ phase-level credit assignment.
 """
 
 import torch
+import re
 import numpy as np
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
@@ -79,18 +80,141 @@ def detect_phase_boundaries_threshold(
     return all_boundaries
 
 
+def _find_sentence_boundaries(
+    token_ids: torch.Tensor,
+    response_mask: torch.Tensor,
+    tokenizer,
+) -> List[List[Tuple[int, int]]]:
+    """Split response tokens into sentence spans by decoding and finding delimiters.
+
+    Splits on: . ? ! ... \\n \\n\\n and similar punctuation.
+
+    Returns:
+        List (per batch) of list of (start_idx, end_idx) token spans.
+    """
+    _SENT_DELIMITERS = re.compile(r'(?:\.{1,3}|[?!])\s|\n')
+
+    batch_size = response_mask.shape[0]
+    all_sentences = []
+
+    for b in range(batch_size):
+        active = response_mask[b].nonzero(as_tuple=True)[0]
+        if len(active) == 0:
+            all_sentences.append([(0, 0)])
+            continue
+
+        start = active[0].item()
+        end = active[-1].item() + 1
+
+        # Decode each token individually to map char offsets -> token indices
+        token_texts = []
+        for t in range(start, end):
+            token_texts.append(tokenizer.decode(
+                [token_ids[b, t].item()], skip_special_tokens=True,
+            ))
+
+        # Find sentence break positions (token index relative to start)
+        # A sentence ends at token t if the decoded text contains a delimiter
+        break_positions = []
+        for i, txt in enumerate(token_texts):
+            if _SENT_DELIMITERS.search(txt):
+                break_positions.append(i)
+
+        # Convert break positions to sentence spans
+        sentences = []
+        sent_start = 0  # relative to `start`
+        for bp in break_positions:
+            sent_end = bp + 1  # exclusive, include the delimiter token
+            if sent_end > sent_start:
+                sentences.append((start + sent_start, start + sent_end))
+            sent_start = sent_end
+
+        # Remaining tokens form the last sentence
+        if sent_start < (end - start):
+            sentences.append((start + sent_start, end))
+
+        # Fallback: if no sentences found, whole response = 1 sentence
+        if not sentences:
+            sentences = [(start, end)]
+
+        all_sentences.append(sentences)
+
+    return all_sentences
+
+
 def detect_phase_boundaries_adaptive(
     neg_log_probs: torch.Tensor,
     response_mask: torch.Tensor,
     percentile: float = 85.0,
     min_phase_len: int = 10,
     max_phases: int = 10,
+    token_ids: Optional[torch.Tensor] = None,
+    tokenizer=None,
 ) -> List[List[int]]:
-    """Detect phase boundaries using adaptive per-response percentile.
+    """Detect phase boundaries using sentence structure + mean -log pi.
 
-    Uses the p-th percentile of -log pi as threshold, then selects
-    local maxima greedily (highest peaks first, respecting min spacing).
+    1. Split response into sentences by punctuation delimiters (. ? ! \\n ...).
+    2. For each sentence, compute mean -log pi of the first 1/3 tokens.
+    3. If that mean > percentile threshold → sentence starts a new phase.
+    4. Otherwise → sentence merges into the previous phase.
+
+    Falls back to peak-based detection if token_ids/tokenizer not available.
     """
+    if token_ids is None or tokenizer is None:
+        return _detect_phase_boundaries_peak(
+            neg_log_probs, response_mask, percentile, min_phase_len, max_phases,
+        )
+
+    batch_size = neg_log_probs.shape[0]
+    sentences_batch = _find_sentence_boundaries(token_ids, response_mask, tokenizer)
+    all_boundaries = []
+
+    for b in range(batch_size):
+        sentences = sentences_batch[b]
+        nlp = neg_log_probs[b]
+        active = response_mask[b].nonzero(as_tuple=True)[0]
+        if len(active) == 0:
+            all_boundaries.append([0])
+            continue
+
+        start = active[0].item()
+
+        # Compute mean -log pi of first 1/3 tokens for each sentence
+        sent_scores = []
+        for s_start, s_end in sentences:
+            T = s_end - s_start
+            head_len = max(1, T // 3)
+            head_mean = nlp[s_start:s_start + head_len].mean().item()
+            sent_scores.append(head_mean)
+
+        # Threshold from all sentence head scores
+        threshold = np.percentile(sent_scores, percentile)
+
+        # First sentence always starts phase 0
+        boundaries = [start]
+        for i, (s_start, s_end) in enumerate(sentences):
+            if i == 0:
+                continue  # first sentence already in boundaries
+            if len(boundaries) >= max_phases:
+                break
+            if sent_scores[i] > threshold:
+                boundaries.append(s_start)
+            # else: merge into previous phase (no new boundary)
+
+        boundaries.sort()
+        all_boundaries.append(boundaries)
+
+    return all_boundaries
+
+
+def _detect_phase_boundaries_peak(
+    neg_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    percentile: float = 85.0,
+    min_phase_len: int = 10,
+    max_phases: int = 10,
+) -> List[List[int]]:
+    """Legacy fallback: peak-based detection on -log pi."""
     batch_size = neg_log_probs.shape[0]
     all_boundaries = []
 
@@ -109,7 +233,6 @@ def detect_phase_boundaries_adaptive(
         active_nlp = nlp[active].cpu().numpy()
         delta = np.percentile(active_nlp, percentile)
 
-        # Find local maxima above threshold
         candidates = []
         for t in range(start + 1, end - 1):
             val = nlp[t].item()
@@ -118,7 +241,6 @@ def detect_phase_boundaries_adaptive(
                     and val >= nlp[t + 1].item()):
                 candidates.append((t, val))
 
-        # Greedy selection: highest peaks first, respecting min distance
         candidates.sort(key=lambda x: -x[1])
         boundaries = [start]
         for t, val in candidates:
@@ -173,62 +295,56 @@ def detect_phase_boundaries_entropy(
     percentile: float = 80.0,
     min_phase_len: int = 10,
     max_phases: int = 10,
+    token_ids: Optional[torch.Tensor] = None,
+    tokenizer=None,
 ) -> List[List[int]]:
-    """Detect phase boundaries using per-token entropy (80/20 rule).
+    """Detect phase boundaries using sentence structure + mean entropy.
 
-    Selects positions where entropy is in the top (100-percentile)% as
-    candidate break points (the start of a new phase). For the default
-    percentile=80, this means the top 20% highest-entropy positions.
+    1. Split response into sentences by punctuation delimiters (. ? ! \\n ...).
+    2. For each sentence, compute mean entropy of the first 1/3 tokens.
+    3. If that mean > percentile threshold → sentence starts a new phase.
+    4. Otherwise → sentence merges into the previous phase.
 
-    Greedy selection picks the highest entropy candidates first, respecting
-    min_phase_len spacing.
-
-    Args:
-        entropy: (batch, seq_len) per-token entropy values.
-        response_mask: (batch, seq_len) binary mask for response tokens.
-        percentile: Threshold percentile (default 80 → top 20% are candidates).
-        min_phase_len: Minimum tokens between consecutive boundaries.
-        max_phases: Maximum number of phases per response.
-
-    Returns:
-        List of boundary index lists, one per batch element.
+    Falls back to peak-based detection if token_ids/tokenizer not available.
     """
+    if token_ids is None or tokenizer is None:
+        # Fallback: treat entropy as signal for peak-based detection
+        return _detect_phase_boundaries_peak(
+            entropy, response_mask, percentile, min_phase_len, max_phases,
+        )
+
     batch_size = entropy.shape[0]
+    sentences_batch = _find_sentence_boundaries(token_ids, response_mask, tokenizer)
     all_boundaries = []
 
     for b in range(batch_size):
-        mask = response_mask[b]
+        sentences = sentences_batch[b]
         ent = entropy[b]
-
-        active = mask.nonzero(as_tuple=True)[0]
+        active = response_mask[b].nonzero(as_tuple=True)[0]
         if len(active) == 0:
             all_boundaries.append([0])
             continue
 
         start = active[0].item()
-        end = active[-1].item() + 1
 
-        # Compute threshold from active tokens
-        active_ent = ent[active].cpu().numpy()
-        threshold = np.percentile(active_ent, percentile)
+        # Compute mean entropy of first 1/3 tokens for each sentence
+        sent_scores = []
+        for s_start, s_end in sentences:
+            T = s_end - s_start
+            head_len = max(1, T // 3)
+            head_mean = ent[s_start:s_start + head_len].mean().item()
+            sent_scores.append(head_mean)
 
-        # Find local maxima above threshold (entropy peaks)
-        candidates = []
-        for t in range(start + 1, end - 1):
-            val = ent[t].item()
-            if (val > threshold
-                    and val >= ent[t - 1].item()
-                    and val >= ent[t + 1].item()):
-                candidates.append((t, val))
+        threshold = np.percentile(sent_scores, percentile)
 
-        # Greedy selection: highest entropy peaks first, respecting min distance
-        candidates.sort(key=lambda x: -x[1])
         boundaries = [start]
-        for t, val in candidates:
+        for i, (s_start, s_end) in enumerate(sentences):
+            if i == 0:
+                continue
             if len(boundaries) >= max_phases:
                 break
-            if all(abs(t - b_) >= min_phase_len for b_ in boundaries):
-                boundaries.append(t)
+            if sent_scores[i] > threshold:
+                boundaries.append(s_start)
 
         boundaries.sort()
         all_boundaries.append(boundaries)
@@ -245,13 +361,15 @@ def detect_phase_boundaries(
     min_phase_len: int = 10,
     max_phases: int = 10,
     entropy: Optional[torch.Tensor] = None,
+    token_ids: Optional[torch.Tensor] = None,
+    tokenizer=None,
 ) -> List[List[int]]:
     """Unified boundary detection dispatcher.
 
     Methods:
         threshold - Fixed -log pi threshold.
-        adaptive  - Per-response percentile on -log pi (default).
-        entropy   - Per-response percentile on token entropy (80/20 rule).
+        adaptive  - Sentence-based + mean -log pi of first 1/3 tokens.
+        entropy   - Sentence-based + mean entropy of first 1/3 tokens.
     """
     if method == "threshold":
         return detect_phase_boundaries_threshold(
@@ -262,14 +380,15 @@ def detect_phase_boundaries(
         return detect_phase_boundaries_adaptive(
             neg_log_probs, response_mask, percentile=percentile,
             min_phase_len=min_phase_len, max_phases=max_phases,
+            token_ids=token_ids, tokenizer=tokenizer,
         )
     elif method == "entropy":
         if entropy is None:
-            # Fallback: use -log_prob as entropy proxy
             entropy = neg_log_probs
         return detect_phase_boundaries_entropy(
             entropy, response_mask, percentile=percentile,
             min_phase_len=min_phase_len, max_phases=max_phases,
+            token_ids=token_ids, tokenizer=tokenizer,
         )
     else:
         raise ValueError(f"Unknown boundary method: {method}")
