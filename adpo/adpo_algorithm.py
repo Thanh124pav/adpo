@@ -187,19 +187,20 @@ def detect_phase_boundaries_adaptive(
             head_mean = nlp[s_start:s_start + head_len].mean().item()
             sent_scores.append(head_mean)
 
-        # Threshold from all sentence head scores
+        # Rank all sentences (except first) by score, pick top-K above threshold
         threshold = np.percentile(sent_scores, percentile)
 
-        # First sentence always starts phase 0
-        boundaries = [start]
-        for i, (s_start, s_end) in enumerate(sentences):
-            if i == 0:
-                continue  # first sentence already in boundaries
-            if len(boundaries) >= max_phases:
-                break
+        # Build candidates: (sentence_index, score, start_pos) for sentences above threshold
+        candidates = []
+        for i in range(1, len(sentences)):  # skip first sentence
             if sent_scores[i] > threshold:
-                boundaries.append(s_start)
-            # else: merge into previous phase (no new boundary)
+                candidates.append((i, sent_scores[i], sentences[i][0]))
+
+        # Sort by score descending → pick top-(max_phases-1) highest
+        candidates.sort(key=lambda x: -x[1])
+        boundaries = [start]
+        for _, _, s_start in candidates[:max_phases - 1]:
+            boundaries.append(s_start)
 
         boundaries.sort()
         all_boundaries.append(boundaries)
@@ -337,14 +338,16 @@ def detect_phase_boundaries_entropy(
 
         threshold = np.percentile(sent_scores, percentile)
 
-        boundaries = [start]
-        for i, (s_start, s_end) in enumerate(sentences):
-            if i == 0:
-                continue
-            if len(boundaries) >= max_phases:
-                break
+        # Rank all sentences (except first) by score, pick top-K above threshold
+        candidates = []
+        for i in range(1, len(sentences)):
             if sent_scores[i] > threshold:
-                boundaries.append(s_start)
+                candidates.append((i, sent_scores[i], sentences[i][0]))
+
+        candidates.sort(key=lambda x: -x[1])
+        boundaries = [start]
+        for _, _, s_start in candidates[:max_phases - 1]:
+            boundaries.append(s_start)
 
         boundaries.sort()
         all_boundaries.append(boundaries)
