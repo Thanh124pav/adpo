@@ -332,65 +332,6 @@ def build_phase_mask(
 
 
 # ---------------------------------------------------------------------------
-# Soft Phase Assignment (Generalized Form, Section 5 of theory)
-# ---------------------------------------------------------------------------
-
-def compute_soft_phase_weights(
-    phase_ids: torch.Tensor,
-    boundaries_batch: List[List[int]],
-    response_mask: torch.Tensor,
-    sigma: float = 0.0,
-) -> torch.Tensor:
-    """Compute soft phase assignment weights using Gaussian kernel.
-
-    w_{t,k} = exp(-(t - c_k)^2 / 2*sigma^2) / sum_k' exp(...)
-
-    sigma=0: hard assignment (one-hot).
-    sigma>0: blended near boundaries.
-    sigma->inf: uniform (recovers GRPO).
-
-    Returns:
-        weights: (batch, seq_len, max_K) soft assignment weights.
-    """
-    batch_size, seq_len = phase_ids.shape
-    device = phase_ids.device
-    max_K = max(len(b) for b in boundaries_batch) if boundaries_batch else 1
-
-    if sigma <= 0:
-        weights = torch.zeros(batch_size, seq_len, max_K, device=device)
-        for b in range(batch_size):
-            for t in range(seq_len):
-                k = phase_ids[b, t].item()
-                if k >= 0:
-                    weights[b, t, k] = 1.0
-        return weights
-
-    weights = torch.zeros(batch_size, seq_len, max_K, device=device)
-    for b in range(batch_size):
-        boundaries = boundaries_batch[b]
-        active = response_mask[b].nonzero(as_tuple=True)[0]
-        if len(active) == 0:
-            continue
-        resp_end = active[-1].item() + 1
-
-        centroids = []
-        for k in range(len(boundaries)):
-            start = boundaries[k]
-            end = boundaries[k + 1] if k + 1 < len(boundaries) else resp_end
-            centroids.append((start + end) / 2.0)
-
-        for t in active.tolist():
-            log_w = torch.tensor(
-                [-((t - c) ** 2) / (2 * sigma ** 2) for c in centroids],
-                device=device,
-            )
-            w = torch.softmax(log_w, dim=0)
-            weights[b, t, :len(centroids)] = w
-
-    return weights
-
-
-# ---------------------------------------------------------------------------
 # Phase-Level Advantage Computation
 # ---------------------------------------------------------------------------
 
@@ -538,14 +479,12 @@ def assign_phase_advantages_to_tokens(
     phase_advantages: torch.Tensor,
     phase_ids: torch.Tensor,
     response_mask: torch.Tensor,
-    soft_weights: Optional[torch.Tensor] = None,
     decay_gamma: float = 0.0,
     boundaries_batch: Optional[List[List[int]]] = None,
 ) -> torch.Tensor:
     """Map phase-level advantages back to token-level.
 
     Hard: A(t) = A^(k(t))
-    Soft: A(t) = sum_k w_{t,k} * A^(k)
     Decreasing (decay_gamma > 0): Within each phase, token advantages decay
         geometrically so earlier tokens get more credit:
             c = A_phase / (2 * T)
@@ -560,11 +499,6 @@ def assign_phase_advantages_to_tokens(
         token_advantages = _assign_with_decay(
             phase_advantages, phase_ids, response_mask,
             boundaries_batch, decay_gamma,
-        )
-    elif soft_weights is not None:
-        # (batch, seq_len, max_K) @ (batch, max_K) -> (batch, seq_len)
-        token_advantages = torch.einsum(
-            "btk,bk->bt", soft_weights, phase_advantages
         )
     else:
         token_advantages = torch.zeros(batch_size, seq_len, device=device)
@@ -631,7 +565,6 @@ def compute_adpo_phase_advantages(
     response_mask: torch.Tensor,
     index: torch.Tensor,
     boundaries_batch: List[List[int]],
-    sigma: float = 0.0,
     decay_gamma: float = 0.0,
     eps: float = 1e-8,
 ) -> torch.Tensor:
@@ -646,9 +579,8 @@ def compute_adpo_phase_advantages(
     lambda_k = sigma_k^global / (sigma_k^global + sigma_i^local + eps)
     A_{i,k} = lambda_k * A_local + (1-lambda_k) * A_global
 
-    Token-level mapping modes (mutually exclusive, checked in order):
+    Token-level mapping modes:
     - decay_gamma > 0: In-phase decreasing — earlier tokens get more credit.
-    - sigma > 0: Soft Gaussian blending near phase boundaries.
     - Otherwise: Hard assignment (all tokens in a phase share the same adv).
     """
     seq_len = response_mask.shape[1]
@@ -662,17 +594,10 @@ def compute_adpo_phase_advantages(
 
     phase_ids = build_phase_mask(boundaries_batch, seq_len, response_mask)
 
-    soft_weights = None
-    if decay_gamma <= 0 and sigma > 0:
-        soft_weights = compute_soft_phase_weights(
-            phase_ids, boundaries_batch, response_mask, sigma=sigma,
-        )
-
     token_advantages = assign_phase_advantages_to_tokens(
         phase_advantages=phase_advantages,
         phase_ids=phase_ids,
         response_mask=response_mask,
-        soft_weights=soft_weights,
         decay_gamma=decay_gamma,
         boundaries_batch=boundaries_batch,
     )

@@ -19,7 +19,6 @@ algorithm:
   phase_percentile: 85.0
   phase_min_len: 10
   phase_max_K: 10
-  phase_sigma: 0.0
   phase_decay_gamma: 0.0       # 0 = off, >0 = in-phase decreasing (e.g. 0.9)
   # LLM-as-Judge
   judge_type: endpoint

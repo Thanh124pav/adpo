@@ -45,7 +45,7 @@ class ADPOTrainer(RayPPOTrainer):
         phase_percentile (float): Percentile threshold. Default 85.0.
         phase_min_len (int): Min tokens per phase. Default 10.
         phase_max_K (int): Max phases per response. Default 10.
-        phase_sigma (float): Soft assignment bandwidth. Default 0.0.
+        phase_decay_gamma (float): In-phase decay factor. Default 0.0 (off).
         incorrect_penalty (float): Score mapping scale for incorrect responses (with golden answer). Default 0.3.
         no_answer_correct_scale (float): Score scale for no-golden-answer responses judged as good. Default 0.5.
         no_answer_incorrect_scale (float): Score scale for no-golden-answer responses judged as bad. Default 0.1.
@@ -67,7 +67,6 @@ class ADPOTrainer(RayPPOTrainer):
         self.phase_percentile = getattr(algo, "phase_percentile", 85.0)
         self.phase_min_len = getattr(algo, "phase_min_len", 10)
         self.phase_max_K = getattr(algo, "phase_max_K", 10)
-        self.phase_sigma = getattr(algo, "phase_sigma", 0.0)
         self.phase_decay_gamma = getattr(algo, "phase_decay_gamma", 0.0)
         self.incorrect_penalty = getattr(algo, "incorrect_penalty", 0.3)
         self.no_answer_correct_scale = getattr(algo, "no_answer_correct_scale", 0.5)
@@ -273,7 +272,6 @@ class ADPOTrainer(RayPPOTrainer):
             response_mask=response_mask,
             index=index,
             boundaries_batch=boundaries_batch,
-            sigma=self.phase_sigma,
             decay_gamma=self.phase_decay_gamma,
         )
 
@@ -342,7 +340,7 @@ def patch_verl_grpo_with_adpo(
     phase_percentile: float = 85.0,
     phase_min_len: int = 10,
     phase_max_K: int = 10,
-    phase_sigma: float = 0.0,
+    phase_decay_gamma: float = 0.0,
     max_solutions_per_question: int = 8,
     solution_bank_dir: str = "data/solutions",
     max_ref_solutions_in_prompt: int = 3,
@@ -610,7 +608,7 @@ def patch_verl_grpo_with_adpo(
             response_mask=response_mask,
             index=index,
             boundaries_batch=boundaries_batch,
-            sigma=phase_sigma,
+            decay_gamma=phase_decay_gamma,
         )
 
         data.batch["advantages"] = token_advantages
@@ -713,7 +711,7 @@ class ADPOTaskRunner:
             phase_percentile=algo.get("phase_percentile", 85.0),
             phase_min_len=algo.get("phase_min_len", 10),
             phase_max_K=algo.get("phase_max_K", 10),
-            phase_sigma=algo.get("phase_sigma", 0.0),
+            phase_decay_gamma=algo.get("phase_decay_gamma", 0.0),
             max_solutions_per_question=algo.get("max_solutions_per_question", 8),
             solution_bank_dir=algo.get("solution_bank_dir", "data/solutions"),
             max_ref_solutions_in_prompt=algo.get("max_ref_solutions_in_prompt", 3),
