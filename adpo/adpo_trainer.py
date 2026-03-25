@@ -516,9 +516,19 @@ def patch_verl_grpo_with_adpo(
             active = response_mask[b].nonzero(as_tuple=True)[0]
             resp_end = active[-1].item() + 1 if len(active) > 0 else 0
 
-            # Question — decode from batch['prompts'] (skip endoftext padding)
+            # Question — try raw_prompt first, fallback to decoding batch['prompts']
             question = ""
-            if prompt_ids is not None and tokenizer is not None:
+            if hasattr(data, 'non_tensor_batch') and 'raw_prompt' in data.non_tensor_batch:
+                raw_prompt = data.non_tensor_batch['raw_prompt'][b]
+                if isinstance(raw_prompt, list):
+                    # Chat format: [{"role": "user", "content": "..."}]
+                    for msg in raw_prompt:
+                        if isinstance(msg, dict) and msg.get('role') == 'user':
+                            question = msg.get('content', '')
+                            break
+                elif isinstance(raw_prompt, str):
+                    question = raw_prompt
+            if not question.strip() and prompt_ids is not None and tokenizer is not None:
                 question = tokenizer.decode(prompt_ids[b].tolist(), skip_special_tokens=True)
             questions.append(question)
 
