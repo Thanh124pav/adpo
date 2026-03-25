@@ -673,7 +673,8 @@ def render_tokens_html(tokens: list, metric_key: str, vmin: float, vmax: float) 
     for t in tokens:
         value = t[metric_key]
         color = value_to_color(value, vmin, vmax, metric_key)
-        token_text = html_lib.escape(t["token"]).replace("\n", "&#10;↵")
+        raw_token = t["token"]
+        token_text = html_lib.escape(raw_token).replace("\n", "&#10;↵")
         annotation = f"{value:.2f}"
 
         # Compute bar height proportional to value
@@ -691,6 +692,9 @@ def render_tokens_html(tokens: list, metric_key: str, vmin: float, vmax: float) 
             f'<span class="token-text">{token_text}</span>'
             f'</span>'
         )
+        # Insert line break when token contains double newline
+        if "\n\n" in raw_token:
+            parts.append('<br class="token-newline">')
     return "".join(parts)
 
 
