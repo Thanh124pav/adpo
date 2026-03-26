@@ -21,6 +21,18 @@ import pandas as pd
 import torch
 
 
+def _parse_field(val):
+    """Parse a field that may be a JSON string, dict, list, or ndarray."""
+    if isinstance(val, str):
+        return json.loads(val)
+    if isinstance(val, (dict, list)):
+        return val
+    # numpy ndarray or other — convert to list
+    if hasattr(val, 'tolist'):
+        return val.tolist()
+    return val
+
+
 def load_eval_data(dataset_name, data_dir="data/processed/eval"):
     path = os.path.join(data_dir, f"{dataset_name}.parquet")
     if not os.path.exists(path):
@@ -31,11 +43,15 @@ def load_eval_data(dataset_name, data_dir="data/processed/eval"):
     df = pd.read_parquet(path)
     records = []
     for _, row in df.iterrows():
+        prompt = _parse_field(row["prompt"])
+        reward_model = _parse_field(row["reward_model"])
+        extra_info = _parse_field(row.get("extra_info", "{}"))
+        gt = reward_model["ground_truth"] if isinstance(reward_model, dict) else str(reward_model)
         records.append({
             "data_source": row["data_source"],
-            "prompt": json.loads(row["prompt"]),
-            "ground_truth": json.loads(row["reward_model"])["ground_truth"],
-            "extra_info": json.loads(row["extra_info"]),
+            "prompt": prompt,
+            "ground_truth": gt,
+            "extra_info": extra_info if isinstance(extra_info, dict) else {},
         })
     return records
 
