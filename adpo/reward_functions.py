@@ -70,34 +70,71 @@ def normalize_numeric(value: str) -> Optional[float]:
 
 
 def normalize_answer(answer: str) -> str:
-    """Normalize a LaTeX/text answer for comparison."""
+    """Normalize a LaTeX/text answer for comparison.
+
+    Handles common LaTeX variants that are mathematically identical:
+    - \\dfrac, \\tfrac, \\cfrac → \\frac
+    - \\left, \\right, \\big, \\Big, etc. → removed
+    - \\text{...}, \\mathrm{...}, \\textbf{...} → content only
+    - Spacing: \\, \\; \\: \\! \\quad → removed
+    - Whitespace inside tuples/intervals: (2, 12) → (2,12)
+    """
     if answer is None:
         return ""
     answer = answer.strip()
+    # Remove dollar signs
     answer = answer.replace(r"\$", "").replace("$", "")
+    # Normalize fraction commands
+    answer = answer.replace(r"\dfrac", r"\frac")
+    answer = answer.replace(r"\tfrac", r"\frac")
+    answer = answer.replace(r"\cfrac", r"\frac")
+    # Remove sizing delimiters
+    for cmd in [r"\left", r"\right", r"\big", r"\Big", r"\bigg", r"\Bigg",
+                r"\bigl", r"\bigr", r"\Bigl", r"\Bigr"]:
+        answer = answer.replace(cmd, "")
+    # Remove text wrappers: \text{...}, \mathrm{...}, \textbf{...}, \operatorname{...}
+    answer = re.sub(r'\\(?:text|mathrm|textbf|textit|operatorname)\s*\{([^}]*)\}', r'\1', answer)
+    # Normalize \% → %
     answer = answer.replace(r"\%", "%")
-    answer = answer.replace(r"\text{", "").rstrip("}")
-    answer = answer.replace(r"\mathrm{", "").rstrip("}")
-    answer = answer.replace(r"\,", "").replace(r"\!", "")
-    answer = answer.replace(r"\left", "").replace(r"\right", "")
+    # Remove spacing commands
+    for cmd in [r"\,", r"\;", r"\:", r"\!", r"\quad", r"\qquad", r"\ "]:
+        answer = answer.replace(cmd, "")
+    # Remove \cdot → *
     answer = answer.replace(r"\cdot", "*")
-    return answer.strip()
+    # Normalize ×, · to *
+    answer = answer.replace("×", "*").replace("·", "*")
+    # Remove all whitespace (handles "(2, 12)" vs "(2,12)")
+    answer = re.sub(r'\s+', '', answer)
+    return answer
 
 
 def is_equiv(pred: str, target: str, tol: float = 1e-5) -> bool:
-    """Check if two answers are mathematically equivalent."""
+    """Check if two answers are mathematically equivalent.
+
+    Comparison pipeline:
+    1. Exact string match after LaTeX normalization
+    2. Numeric comparison (handles fractions, percentages)
+    3. Structural comparison (strip outer \\boxed, re-normalize)
+    """
     if pred is None or target is None:
         return False
     pred_norm = normalize_answer(pred)
     target_norm = normalize_answer(target)
+    # 1. Exact string match after normalization
     if pred_norm == target_norm:
         return True
+    # 2. Numeric comparison
     pred_num = normalize_numeric(pred_norm)
     target_num = normalize_numeric(target_norm)
     if pred_num is not None and target_num is not None:
         if abs(target_num) < tol:
             return abs(pred_num - target_num) < tol
         return abs(pred_num - target_num) / max(abs(target_num), 1e-10) < tol
+    # 3. Try stripping outer \boxed{} from both and re-compare
+    pred_inner = extract_boxed_answer(pred_norm)
+    target_inner = extract_boxed_answer(target_norm)
+    if pred_inner is not None and target_inner is not None:
+        return normalize_answer(pred_inner) == normalize_answer(target_inner)
     return False
 
 
