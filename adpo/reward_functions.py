@@ -138,6 +138,7 @@ def is_equiv(pred: str, target: str, tol: float = 1e-5) -> bool:
     Comparison pipeline:
     1. Exact string match after LaTeX normalization
     2. Numeric comparison (handles fractions, percentages)
+    2b. Comma-separated set comparison with order-invariance (1,-2 vs -2,1)
     3. Equation RHS extraction (x=5 vs 5)
     4. Structural comparison (strip outer \\boxed, re-normalize)
     """
@@ -155,14 +156,20 @@ def is_equiv(pred: str, target: str, tol: float = 1e-5) -> bool:
         if abs(target_num) < tol:
             return abs(pred_num - target_num) < tol
         return abs(pred_num - target_num) / max(abs(target_num), 1e-10) < tol
+    # 2b. Comma-separated values: sort and compare element-wise
+    # Handles "1,-2" vs "-2,1" and "\frac{1}{2},3" vs "3,\frac{1}{2}"
+    if ',' in pred_norm and ',' in target_norm:
+        pred_parts = sorted(normalize_answer(p) for p in pred_norm.split(','))
+        target_parts = sorted(normalize_answer(p) for p in target_norm.split(','))
+        if len(pred_parts) == len(target_parts) and len(pred_parts) > 1:
+            if all(_elem_equiv(p, t, tol) for p, t in zip(pred_parts, target_parts)):
+                return True
     # 3. Equation RHS: "x=5" vs "5", or "5" vs "x=5"
     pred_rhs = _extract_rhs(pred_norm)
     target_rhs = _extract_rhs(target_norm)
-    # Try: pred is value, target is equation (e.g. pred="5", target="x=5")
     if target_rhs is not None:
         if is_equiv(pred, target_rhs, tol):
             return True
-    # Try: pred is equation, target is value (e.g. pred="x=5", target="5")
     if pred_rhs is not None:
         if is_equiv(pred_rhs, target, tol):
             return True
@@ -171,6 +178,19 @@ def is_equiv(pred: str, target: str, tol: float = 1e-5) -> bool:
     target_inner = extract_boxed_answer(target_norm)
     if pred_inner is not None and target_inner is not None:
         return normalize_answer(pred_inner) == normalize_answer(target_inner)
+    return False
+
+
+def _elem_equiv(a: str, b: str, tol: float = 1e-5) -> bool:
+    """Compare two individual elements (used in set comparison)."""
+    if a == b:
+        return True
+    a_num = normalize_numeric(a)
+    b_num = normalize_numeric(b)
+    if a_num is not None and b_num is not None:
+        if abs(b_num) < tol:
+            return abs(a_num - b_num) < tol
+        return abs(a_num - b_num) / max(abs(b_num), 1e-10) < tol
     return False
 
 
