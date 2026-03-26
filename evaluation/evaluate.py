@@ -43,6 +43,7 @@ def load_eval_data(dataset_name, data_dir="data/processed/eval"):
 def generate_responses_vllm(
     model_path, prompts, n_samples=1, temperature=0.0,
     max_tokens=2048, top_p=0.95, tensor_parallel_size=1,
+    gpu_memory_utilization=0.9,
 ):
     from vllm import LLM, SamplingParams
     from transformers import AutoTokenizer
@@ -52,6 +53,7 @@ def generate_responses_vllm(
         model=model_path,
         tensor_parallel_size=tensor_parallel_size,
         trust_remote_code=True,
+        gpu_memory_utilization=gpu_memory_utilization,
     )
 
     formatted_prompts = []
@@ -77,6 +79,7 @@ def generate_responses_vllm(
 def evaluate_dataset(
     model_path, dataset_name, data_dir="data/processed/eval",
     n_samples=1, temperature=0.0, max_tokens=2048, tensor_parallel_size=1,
+    gpu_memory_utilization=0.9,
 ):
     from adpo.reward_functions import compute_score
 
@@ -92,6 +95,7 @@ def evaluate_dataset(
         model_path=model_path, prompts=prompts, n_samples=n_samples,
         temperature=temperature, max_tokens=max_tokens,
         tensor_parallel_size=tensor_parallel_size,
+        gpu_memory_utilization=gpu_memory_utilization,
     )
 
     results = []
@@ -156,6 +160,7 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max_tokens", type=int, default=2048)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
+    parser.add_argument("--gpu_memory_utilization", type=float, default=0.9)
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -168,6 +173,7 @@ def main():
                 data_dir=args.data_dir, n_samples=args.n_samples,
                 temperature=args.temperature, max_tokens=args.max_tokens,
                 tensor_parallel_size=args.tensor_parallel_size,
+                gpu_memory_utilization=args.gpu_memory_utilization,
             )
             all_metrics.append(metrics)
             result_path = os.path.join(args.output_dir, f"{dataset_name}_results.json")
