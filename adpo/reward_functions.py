@@ -103,6 +103,9 @@ def normalize_answer(answer: str) -> str:
     answer = answer.replace(r"\cdot", "*")
     # Normalize ×, · to *
     answer = answer.replace("×", "*").replace("·", "*")
+    # Normalize \sqrt without braces: \sqrt2 → \sqrt{2}, \sqrtx → \sqrt{x}
+    # But don't touch \sqrt{...} which already has braces
+    answer = re.sub(r'\\sqrt(?!\{)(\w)', r'\\sqrt{\1}', answer)
     # Remove all whitespace (handles "(2, 12)" vs "(2,12)")
     answer = re.sub(r'\s+', '', answer)
     return answer
