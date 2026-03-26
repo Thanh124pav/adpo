@@ -126,11 +126,19 @@ def main():
 
     from adpo.reward_functions import compute_score
 
+    if not args.files:
+        print("No files specified.", file=sys.stderr)
+        sys.exit(1)
+
     for filepath in args.files:
         filename = os.path.basename(filepath)
         print(f"\n{'='*60}")
         print(f"Re-scoring: {filepath}")
         print(f"{'='*60}")
+
+        if not os.path.exists(filepath):
+            print(f"  [ERROR] File not found: {filepath}")
+            continue
 
         with open(filepath) as f:
             old_results = json.load(f)
