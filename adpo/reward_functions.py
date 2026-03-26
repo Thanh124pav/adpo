@@ -108,13 +108,38 @@ def normalize_answer(answer: str) -> str:
     return answer
 
 
+def _extract_rhs(expr: str) -> Optional[str]:
+    """Extract right-hand side from equations like 'x=5', 'n = 42', 'y=\\frac{1}{2}'.
+
+    Returns None if not an equation or has multiple '=' signs (system of equations).
+    """
+    if '=' not in expr:
+        return None
+    # Don't split on \neq, \leq, \geq, ==
+    clean = expr.replace(r'\neq', '≠').replace(r'\leq', '≤').replace(r'\geq', '≥').replace('==', '≡')
+    if '=' not in clean:
+        return None
+    parts = clean.split('=')
+    if len(parts) != 2:
+        return None
+    lhs = parts[0].strip()
+    rhs = parts[1].strip()
+    # LHS should be short (variable name like x, n, y, etc.)
+    # Restore original chars in rhs
+    rhs_original = expr.split('=', 1)[1].strip()
+    if len(lhs) <= 10:
+        return rhs_original
+    return None
+
+
 def is_equiv(pred: str, target: str, tol: float = 1e-5) -> bool:
     """Check if two answers are mathematically equivalent.
 
     Comparison pipeline:
     1. Exact string match after LaTeX normalization
     2. Numeric comparison (handles fractions, percentages)
-    3. Structural comparison (strip outer \\boxed, re-normalize)
+    3. Equation RHS extraction (x=5 vs 5)
+    4. Structural comparison (strip outer \\boxed, re-normalize)
     """
     if pred is None or target is None:
         return False
@@ -130,7 +155,18 @@ def is_equiv(pred: str, target: str, tol: float = 1e-5) -> bool:
         if abs(target_num) < tol:
             return abs(pred_num - target_num) < tol
         return abs(pred_num - target_num) / max(abs(target_num), 1e-10) < tol
-    # 3. Try stripping outer \boxed{} from both and re-compare
+    # 3. Equation RHS: "x=5" vs "5", or "5" vs "x=5"
+    pred_rhs = _extract_rhs(pred_norm)
+    target_rhs = _extract_rhs(target_norm)
+    # Try: pred is value, target is equation (e.g. pred="5", target="x=5")
+    if target_rhs is not None:
+        if is_equiv(pred, target_rhs, tol):
+            return True
+    # Try: pred is equation, target is value (e.g. pred="x=5", target="5")
+    if pred_rhs is not None:
+        if is_equiv(pred_rhs, target, tol):
+            return True
+    # 4. Try stripping outer \boxed{} from both and re-compare
     pred_inner = extract_boxed_answer(pred_norm)
     target_inner = extract_boxed_answer(target_norm)
     if pred_inner is not None and target_inner is not None:
