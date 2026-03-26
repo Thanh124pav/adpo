@@ -64,6 +64,8 @@ class ADPOTrainer(RayPPOTrainer):
         self.incorrect_penalty = getattr(algo, "incorrect_penalty", 0.3)
         self.no_answer_correct_scale = getattr(algo, "no_answer_correct_scale", 0.5)
         self.no_answer_incorrect_scale = getattr(algo, "no_answer_incorrect_scale", 0.1)
+        self.overlong_buffer_len = getattr(algo, "overlong_buffer_len", 0)
+        self.overlong_penalty_factor = getattr(algo, "overlong_penalty_factor", 1.0)
 
         # Judge
         judge_type = getattr(algo, "judge_type", "rule")
@@ -203,7 +205,7 @@ class ADPOTrainer(RayPPOTrainer):
             data_sources=data_sources,
         )
 
-        # Step 5: Compute outcome rewards and feed correct solutions back
+        # Step 5: Compute outcome rewards
         outcome_rewards = []
         for b in range(batch_size):
             if golden_answers[b]:
@@ -215,6 +217,17 @@ class ADPOTrainer(RayPPOTrainer):
             else:
                 r = 0.0
             outcome_rewards.append(r)
+
+        # Step 5b: Overlong reward shaping (DAPO-style soft penalty)
+        overlong_rewards = [0.0] * batch_size
+        if self.overlong_buffer_len > 0:
+            max_resp_len = response_mask.shape[1]
+            expected_len = max_resp_len - self.overlong_buffer_len
+            for b in range(batch_size):
+                resp_len = int(response_mask[b].sum().item())
+                exceed_len = resp_len - expected_len
+                penalty = min(-exceed_len / self.overlong_buffer_len * self.overlong_penalty_factor, 0.0)
+                overlong_rewards[b] = penalty
 
         # Step 6: Build phase reward tensor
         device = response_mask.device
@@ -255,15 +268,19 @@ class ADPOTrainer(RayPPOTrainer):
         phase_rewards = phase_rewards * score_scale.unsqueeze(1)
 
         # Step 6c: Floor phase rewards for correct responses
-        # If a response got the right answer, every phase gets at least correct_reward_floor
-        correct_mask = has_golden & (outcome_tensor >= 1.0)  # (batch,)
+        correct_mask = has_golden & (outcome_tensor >= 1.0)
         if correct_mask.any():
-            floor_mask = correct_mask.unsqueeze(1) & (phase_mask_tensor > 0)  # (batch, max_K)
+            floor_mask = correct_mask.unsqueeze(1) & (phase_mask_tensor > 0)
             phase_rewards = torch.where(
                 floor_mask,
                 torch.clamp(phase_rewards, min=self.correct_reward_floor),
                 phase_rewards,
             )
+
+        # Step 6d: Add overlong penalty to all phase rewards
+        if self.overlong_buffer_len > 0:
+            overlong_tensor = torch.tensor(overlong_rewards, device=device)
+            phase_rewards = phase_rewards + (overlong_tensor.unsqueeze(1) * phase_mask_tensor)
 
         # Step 7: Phase advantages -> token advantages
         token_advantages = compute_adpo_phase_advantages(
@@ -346,6 +363,8 @@ def patch_verl_grpo_with_adpo(
     no_answer_correct_scale: float = 0.5,
     no_answer_incorrect_scale: float = 0.1,
     correct_reward_floor: float = 0.5,
+    overlong_buffer_len: int = 0,
+    overlong_penalty_factor: float = 1.0,
 ):
     """Monkey-patch verl's module-level compute_advantage function with ADPO phase
     decomposition + LLM-as-Judge.
@@ -595,7 +614,7 @@ def patch_verl_grpo_with_adpo(
         )
         logger.info("[ADPO] Judge scoring complete")
 
-        # Step 5: Compute outcome rewards and feed correct solutions back
+        # Step 5: Compute outcome rewards
         outcome_rewards = []
         for b in range(batch_size):
             if golden_answers[b]:
@@ -607,6 +626,21 @@ def patch_verl_grpo_with_adpo(
             else:
                 r = 0.0
             outcome_rewards.append(r)
+
+        # Step 5b: Overlong reward shaping (DAPO-style soft penalty)
+        overlong_rewards = [0.0] * batch_size
+        if overlong_buffer_len > 0:
+            max_resp_len = response_mask.shape[1]
+            expected_len = max_resp_len - overlong_buffer_len
+            for b in range(batch_size):
+                resp_len = int(response_mask[b].sum().item())
+                exceed_len = resp_len - expected_len
+                penalty = min(-exceed_len / overlong_buffer_len * overlong_penalty_factor, 0.0)
+                overlong_rewards[b] = penalty
+            n_penalized = sum(1 for r in overlong_rewards if r < 0)
+            avg_penalty = np.mean([r for r in overlong_rewards if r < 0]) if n_penalized else 0.0
+            print(f"[ADPO Overlong] expected_len={expected_len}, buffer={overlong_buffer_len}, "
+                  f"penalized={n_penalized}/{batch_size}, avg_penalty={avg_penalty:.4f}", flush=True)
 
         # Step 6: Build phase reward tensor
         device = response_mask.device
@@ -651,6 +685,12 @@ def patch_verl_grpo_with_adpo(
                 torch.clamp(phase_rewards, min=correct_reward_floor),
                 phase_rewards,
             )
+
+        # Step 6d: Add overlong penalty to all phase rewards (broadcast per response)
+        if overlong_buffer_len > 0:
+            overlong_tensor = torch.tensor(overlong_rewards, device=device)
+            # Distribute penalty evenly across all phases of each response
+            phase_rewards = phase_rewards + (overlong_tensor.unsqueeze(1) * phase_mask_tensor)
 
         # Step 7: Phase advantages -> token advantages
         token_advantages = compute_adpo_phase_advantages(
@@ -768,6 +808,8 @@ class ADPOTaskRunner:
             no_answer_correct_scale=algo.get("no_answer_correct_scale", 0.5),
             no_answer_incorrect_scale=algo.get("no_answer_incorrect_scale", 0.1),
             correct_reward_floor=algo.get("correct_reward_floor", 0.5),
+            overlong_buffer_len=algo.get("overlong_buffer_len", 0),
+            overlong_penalty_factor=algo.get("overlong_penalty_factor", 1.0),
         )
 
         # Delegate to standard TaskRunner

@@ -22,6 +22,9 @@ algorithm:
   phase_decay_gamma: 0.0       # 0 = off, >0 = in-phase decreasing (e.g. 0.9)
   # Score mapping
   correct_reward_floor: 0.5    # Min phase reward for correct responses
+  # Overlong reward shaping (DAPO-style)
+  overlong_buffer_len: 0       # 0 = off, >0 = soft penalty buffer (e.g. 4096)
+  overlong_penalty_factor: 1.0 # Max penalty when response exceeds buffer
   # LLM-as-Judge
   judge_type: endpoint
   judge_model: Qwen3-14B
