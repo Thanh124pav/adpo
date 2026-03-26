@@ -627,6 +627,9 @@ def patch_verl_grpo_with_adpo(
                 r = 0.0
             outcome_rewards.append(r)
 
+        # Debug: show outcome for first few responses and phase advantages
+        print(f"[ADPO Outcomes] first 8: {['✓' if r >= 1.0 else f'{r:.2f}' for r in outcome_rewards[:8]]}", flush=True)
+
         # Step 5b: Overlong reward shaping (DAPO-style soft penalty)
         overlong_rewards = [0.0] * batch_size
         if overlong_buffer_len > 0:
@@ -691,6 +694,12 @@ def patch_verl_grpo_with_adpo(
             overlong_tensor = torch.tensor(overlong_rewards, device=device)
             # Distribute penalty evenly across all phases of each response
             phase_rewards = phase_rewards + (overlong_tensor.unsqueeze(1) * phase_mask_tensor)
+
+        # Debug: show phase rewards for response 0
+        pr0 = phase_rewards[0][phase_mask_tensor[0] > 0]
+        print(f"[ADPO PhaseRewards] resp=0 outcome={outcome_rewards[0]:.2f} "
+              f"rewards={[f'{v:.4f}' for v in pr0.tolist()[:5]]}... "
+              f"mean={pr0.mean():.4f} std={pr0.std():.4f}", flush=True)
 
         # Step 7: Phase advantages -> token advantages
         token_advantages = compute_adpo_phase_advantages(

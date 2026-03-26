@@ -705,9 +705,9 @@ def _assign_with_decay(
                 first_adv = token_advantages[b, start].item()
                 last_adv = token_advantages[b, end - 1].item()
                 print(
-                    f"[ADPO Decay] b={b} phase={k} | T={T} A={A:.4f} "
-                    f"gamma={gamma} | adv_first={first_adv:.4f} "
-                    f"adv_last={last_adv:.4f} diff={first_adv - last_adv:.4f}",
+                    f"[ADPO Decay] b={b} phase={k} | T={T} A={A:.6e} "
+                    f"gamma={gamma} | adv_first={first_adv:.6e} "
+                    f"adv_last={last_adv:.6e} diff={first_adv - last_adv:.6e}",
                     flush=True,
                 )
         if not logged:
