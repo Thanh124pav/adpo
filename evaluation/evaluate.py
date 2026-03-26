@@ -79,9 +79,14 @@ def generate_responses_vllm(
         text = tokenizer.apply_chat_template(p, tokenize=False, add_generation_prompt=True)
         formatted_prompts.append(text)
 
+    # Greedy only supports n=1; auto-set temperature if n_samples > 1
+    if n_samples > 1 and temperature == 0.0:
+        temperature = 0.7
+        print(f"  [WARN] n_samples={n_samples} requires temperature>0, auto-set to {temperature}")
+
     sampling_params = SamplingParams(
         n=n_samples,
-        temperature=temperature if temperature > 0 else 0.0,
+        temperature=temperature,
         top_p=top_p if temperature > 0 else 1.0,
         max_tokens=max_tokens,
     )
