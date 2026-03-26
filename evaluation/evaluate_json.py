@@ -122,6 +122,7 @@ def main():
     parser.add_argument("files", nargs="+", help="Path(s) to *_results.json files")
     parser.add_argument("--save", action="store_true", help="Overwrite JSON files with re-scored results")
     parser.add_argument("--output_dir", default=None, help="Save re-scored results to this directory instead of overwriting")
+    parser.add_argument("--show-failures", action="store_true", help="Print all score=0 cases for manual review")
     args = parser.parse_args()
 
     from adpo.reward_functions import compute_score
@@ -173,6 +174,24 @@ def main():
         # Diff
         print(f"\n  --- Changes ---")
         print_diff(old_results, new_results)
+
+        # Show failures for manual review
+        if args.show_failures:
+            from adpo.reward_functions import extract_boxed_answer, normalize_answer
+            failures = [r for r in new_results if r["n_correct"] == 0]
+            print(f"\n  --- Failures for manual review ({len(failures)}/{len(new_results)}) ---")
+            for i, r in enumerate(failures):
+                gt = r["ground_truth"]
+                # Extract pred from first response
+                pred = extract_boxed_answer(r["responses"][0]) if r["responses"] else None
+                pred_display = pred if pred else "(no \\boxed)"
+                gt_norm = normalize_answer(gt)
+                pred_norm = normalize_answer(pred) if pred else ""
+                match_hint = ""
+                if pred_norm and gt_norm and pred_norm != gt_norm:
+                    # Show normalized forms to help spot near-misses
+                    match_hint = f"  norm: pred=\"{pred_norm}\" vs gt=\"{gt_norm}\""
+                print(f"  [{i+1}] gt={gt!r}  pred={pred_display!r}{match_hint}")
 
         # Save
         if args.save or args.output_dir:
