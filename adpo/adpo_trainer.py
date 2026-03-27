@@ -187,34 +187,17 @@ class ADPOTrainer(RayPPOTrainer):
             print(f"[ADPO Questions] batch={batch_size}, empty_q={n_empty_q}, "
                   f"empty_gt={n_empty_gt}, q[0]=\"{preview}...\"", flush=True)
 
-        # Demo: print first 4 phases + last phase from response 0
+        # Demo: print full response 0 and phase boundaries
+        if full_responses:
+            print(f"[ADPO Full Response 0] ({len(full_responses[0])} chars):", flush=True)
+            print(full_responses[0], flush=True)
+            print(f"[ADPO Full Response 0 END]", flush=True)
+
         if phase_texts_batch and phase_texts_batch[0]:
-            all_phases = phase_texts_batch[0]
             demo_bounds = boundaries_batch[0]
-            n_total = len(all_phases)
-            n_show = min(4, n_total - 1) if n_total > 1 else n_total
-            print(f"[ADPO Phase Demo] response=0, total_phases={n_total}:", flush=True)
-            for k in range(n_show):
-                preview = all_phases[k][:120].replace('\n', '\\n')
-                b_start = demo_bounds[k] if k < len(demo_bounds) else "?"
-                print(f"  phase {k} (tok={b_start}): \"{preview}...\"", flush=True)
-            if n_total > n_show + 1:
-                print(f"  ... ({n_total - n_show - 1} more phases)", flush=True)
-            # Always show last phase with context before it
-            if n_total > n_show:
-                last_k = n_total - 1
-                last_start = demo_bounds[last_k] if last_k < len(demo_bounds) else 0
-                last_preview = all_phases[last_k][:120].replace('\n', '\\n')
-                ctx = ""
-                if tokenizer is not None and token_ids is not None:
-                    ctx_start = max(0, last_start - 10)
-                    if ctx_start < last_start:
-                        ctx_text = tokenizer.decode(
-                            token_ids[0, ctx_start:last_start].tolist(),
-                            skip_special_tokens=False,
-                        ).replace('\n', '\\n')
-                        ctx = f" [before: {ctx_text}]"
-                print(f"  phase {last_k} (tok={last_start}):{ctx} \"{last_preview}...\"", flush=True)
+            n_total = len(phase_texts_batch[0])
+            print(f"[ADPO Phases] response=0, {n_total} phases, "
+                  f"boundaries={demo_bounds}", flush=True)
 
         # Step 4: Score phases with judge (with golden answer + ref solutions)
         phase_rewards_list = self.judge.score_phases(
@@ -613,34 +596,17 @@ def patch_verl_grpo_with_adpo(
             print(f"[ADPO Questions] batch={batch_size}, empty_q={n_empty_q}, "
                   f"empty_gt={n_empty_gt}, q[0]=\"{preview}...\"", flush=True)
 
-        # Demo: print first 4 phases + last phase from response 0
+        # Demo: print full response 0 and phase boundaries
+        if full_responses:
+            print(f"[ADPO Full Response 0] ({len(full_responses[0])} chars):", flush=True)
+            print(full_responses[0], flush=True)
+            print(f"[ADPO Full Response 0 END]", flush=True)
+
         if phase_texts_batch and phase_texts_batch[0]:
-            all_phases = phase_texts_batch[0]
             demo_bounds = boundaries_batch[0]
-            n_total = len(all_phases)
-            n_show = min(4, n_total - 1) if n_total > 1 else n_total
-            print(f"[ADPO Phase Demo] response=0, total_phases={n_total}:", flush=True)
-            for k in range(n_show):
-                preview = all_phases[k][:120].replace('\n', '\\n')
-                b_start = demo_bounds[k] if k < len(demo_bounds) else "?"
-                print(f"  phase {k} (tok={b_start}): \"{preview}...\"", flush=True)
-            if n_total > n_show + 1:
-                print(f"  ... ({n_total - n_show - 1} more phases)", flush=True)
-            # Always show last phase with context before it
-            if n_total > n_show:
-                last_k = n_total - 1
-                last_start = demo_bounds[last_k] if last_k < len(demo_bounds) else 0
-                last_preview = all_phases[last_k][:120].replace('\n', '\\n')
-                ctx = ""
-                if tokenizer is not None and token_ids is not None:
-                    ctx_start = max(0, last_start - 10)
-                    if ctx_start < last_start:
-                        ctx_text = tokenizer.decode(
-                            token_ids[0, ctx_start:last_start].tolist(),
-                            skip_special_tokens=False,
-                        ).replace('\n', '\\n')
-                        ctx = f" [before: {ctx_text}]"
-                print(f"  phase {last_k} (tok={last_start}):{ctx} \"{last_preview}...\"", flush=True)
+            n_total = len(phase_texts_batch[0])
+            print(f"[ADPO Phases] response=0, {n_total} phases, "
+                  f"boundaries={demo_bounds}", flush=True)
 
         # Step 4: Compute outcome rewards first (needed for output phase reward)
         outcome_rewards = []
