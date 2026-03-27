@@ -264,19 +264,18 @@ def detect_phase_boundaries_adaptive(
     neg_log_probs: torch.Tensor,
     response_mask: torch.Tensor,
     percentile: float = 85.0,
-    min_phase_len: int = 10,
+    min_phase_len: int = 5,
     max_phases: int = 10,
     token_ids: Optional[torch.Tensor] = None,
     tokenizer=None,
 ) -> List[List[int]]:
-    """Detect phase boundaries using sentence structure + mean -log pi.
+    """Detect phase boundaries: find </think>, split thinking into phases, output = 1 phase.
 
-    1. Split response into sentences by punctuation delimiters (. ? ! \\n ...).
-    2. If <think>...</think> present, always create boundary at </think>.
-       Percentile thresholds are computed separately for thinking vs answer.
-    3. For each sentence, compute mean -log pi of the first 1/3 tokens.
-    4. If that mean > percentile threshold → sentence starts a new phase.
-    5. Otherwise → sentence merges into the previous phase.
+    Algorithm:
+    1. Find </think> position → split response into [think_region, output_region]
+    2. Within think_region only: split into sentences, compute mean -log_pi
+       of first 1/3 tokens per sentence, select top-K above percentile threshold
+    3. Output region = 1 single phase (last phase)
 
     Falls back to peak-based detection if token_ids/tokenizer not available.
     """
@@ -286,12 +285,10 @@ def detect_phase_boundaries_adaptive(
         )
 
     batch_size = neg_log_probs.shape[0]
-    sentences_batch = _find_sentence_boundaries(token_ids, response_mask, tokenizer)
-    think_boundaries = _find_think_boundary(token_ids, response_mask, tokenizer)
+    think_ends = _find_think_boundary(token_ids, response_mask, tokenizer)
     all_boundaries = []
 
     for b in range(batch_size):
-        sentences = sentences_batch[b]
         nlp = neg_log_probs[b]
         active = response_mask[b].nonzero(as_tuple=True)[0]
         if len(active) == 0:
@@ -299,9 +296,48 @@ def detect_phase_boundaries_adaptive(
             continue
 
         start = active[0].item()
-        think_end = think_boundaries[b]  # token index after </think>, or None
+        end = active[-1].item() + 1
+        think_end = think_ends[b]
 
-        # Compute mean -log pi of first 1/3 tokens for each sentence
+        # Determine think region
+        if think_end is not None and think_end > start:
+            think_start = start
+            think_end_pos = think_end  # token after </think>
+        else:
+            # No </think> → entire response is "thinking"
+            think_start = start
+            think_end_pos = end
+
+        # Step 1: Find sentences ONLY within think region
+        # Build a temporary mask for just the think region
+        think_len = think_end_pos - think_start
+        think_ids = token_ids[b, think_start:think_end_pos].tolist()
+        delim_ids = _get_delimiter_token_ids(tokenizer)
+        break_positions = [i for i, tid in enumerate(think_ids) if tid in delim_ids]
+
+        # Build sentence spans within think region
+        raw_sentences = []
+        sent_start = 0
+        for bp in break_positions:
+            sent_end = bp + 1
+            if sent_end > sent_start:
+                raw_sentences.append((think_start + sent_start, think_start + sent_end))
+            sent_start = sent_end
+        if sent_start < think_len:
+            raw_sentences.append((think_start + sent_start, think_end_pos))
+
+        # Merge short sentences
+        sentences = []
+        for s_start, s_end in raw_sentences:
+            if sentences and (s_start - sentences[-1][0]) < min_phase_len:
+                sentences[-1] = (sentences[-1][0], s_end)
+            else:
+                sentences.append((s_start, s_end))
+
+        if not sentences:
+            sentences = [(think_start, think_end_pos)]
+
+        # Step 2: Score sentences and select phase boundaries
         sent_scores = []
         for s_start, s_end in sentences:
             T = s_end - s_start
@@ -309,64 +345,36 @@ def detect_phase_boundaries_adaptive(
             head_mean = nlp[s_start:s_start + head_len].mean().item()
             sent_scores.append(head_mean)
 
-        # Split sentences into thinking vs answer sections
-        if think_end is not None:
-            think_sents = [(i, s) for i, s in enumerate(sentences) if s[0] < think_end]
-            answer_sents = [(i, s) for i, s in enumerate(sentences) if s[0] >= think_end]
-        else:
-            think_sents = [(i, s) for i, s in enumerate(sentences)]
-            answer_sents = []
+        # Select candidates above percentile threshold
+        candidates = []
+        if len(sent_scores) > 1:
+            threshold = np.percentile(sent_scores, percentile)
+            for i in range(1, len(sentences)):  # skip first
+                if sent_scores[i] > threshold:
+                    candidates.append((sent_scores[i], sentences[i][0]))
+            candidates.sort(key=lambda x: -x[0])
 
-        # Compute thresholds separately
-        def _get_candidates(sent_list, pct):
-            if len(sent_list) <= 1:
-                return []
-            scores = [sent_scores[i] for i, _ in sent_list]
-            thresh = np.percentile(scores, pct)
-            cands = []
-            for idx_in_list, (sent_idx, (s_start, s_end)) in enumerate(sent_list):
-                if idx_in_list == 0:
-                    continue  # skip first sentence in each section
-                if sent_scores[sent_idx] > thresh:
-                    cands.append((sent_idx, sent_scores[sent_idx], s_start))
-            return cands
-
-        # Only split thinking section into phases; output = 1 phase
-        candidates = _get_candidates(think_sents, percentile)
-
-        # Debug: print for first response
-        if b == 0:
-            n_think = len(think_sents)
-            n_answer = len(answer_sents)
-            think_scores = [sent_scores[i] for i, _ in think_sents] if think_sents else []
-            think_thresh = np.percentile(think_scores, percentile) if len(think_scores) > 1 else 0
-            print(f"[ADPO Sentences] response=0: {len(sentences)} sents "
-                  f"(think={n_think}, output={n_answer}), "
-                  f"think_end={think_end}",
-                  flush=True)
-
-        # Build boundaries: thinking phases + 1 output phase
-        # FIRST: add </think> boundary (mandatory, not counted against max_phases)
+        # Build boundaries: [start] + think candidates + [think_end (output)]
         boundaries = [start]
-        if think_end is not None and think_end > start:
+        max_think_phases = max_phases - 1 if think_end is not None else max_phases
+        for _, s_start in candidates[:max_think_phases - 1]:
+            boundaries.append(s_start)
+
+        # Add output phase boundary (after </think>)
+        if think_end is not None and think_end > start and think_end < end:
             boundaries.append(think_end)
 
-        # Then add thinking phase candidates (up to max_phases - len(boundaries))
-        candidates.sort(key=lambda x: -x[1])
-        remaining_slots = max(0, max_phases - len(boundaries))
-        for _, _, s_start in candidates[:remaining_slots]:
-            if s_start not in boundaries and (think_end is None or s_start < think_end):
-                boundaries.append(s_start)
-
         boundaries.sort()
-
-        # Debug for response 0
-        if b == 0:
-            print(f"[ADPO Boundaries] resp=0: think_end={think_end}, "
-                  f"n_candidates={len(candidates)}, "
-                  f"boundaries={boundaries}", flush=True)
-
         all_boundaries.append(boundaries)
+
+        # Debug for first response
+        if b == 0:
+            n_think_phases = sum(1 for bd in boundaries if think_end is None or bd < think_end)
+            has_output = think_end is not None and think_end in boundaries
+            print(f"[ADPO Boundaries] resp=0: {len(sentences)} think_sents, "
+                  f"think_end={think_end}, "
+                  f"n_think_phases={n_think_phases}, has_output={has_output}, "
+                  f"boundaries={boundaries}", flush=True)
 
     return all_boundaries
 
