@@ -359,6 +359,13 @@ def detect_phase_boundaries_adaptive(
                 boundaries.append(s_start)
 
         boundaries.sort()
+
+        # Debug for response 0
+        if b == 0:
+            print(f"[ADPO Boundaries] resp=0: think_end={think_end}, "
+                  f"n_candidates={len(candidates)}, "
+                  f"boundaries={boundaries}", flush=True)
+
         all_boundaries.append(boundaries)
 
     return all_boundaries
