@@ -61,18 +61,21 @@ def load_eval_data(dataset_name, data_dir="data/processed/eval"):
 def generate_responses_vllm(
     model_path, prompts, n_samples=1, temperature=0.0,
     max_tokens=2048, top_p=0.95, tensor_parallel_size=1,
-    gpu_memory_utilization=0.9,
+    gpu_memory_utilization=0.9, max_model_len=None,
 ):
     from vllm import LLM, SamplingParams
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
-    llm = LLM(
+    llm_kwargs = dict(
         model=model_path,
         tensor_parallel_size=tensor_parallel_size,
         trust_remote_code=True,
         gpu_memory_utilization=gpu_memory_utilization,
     )
+    if max_model_len is not None:
+        llm_kwargs["max_model_len"] = max_model_len
+    llm = LLM(**llm_kwargs)
 
     formatted_prompts = []
     for p in prompts:
@@ -102,7 +105,7 @@ def generate_responses_vllm(
 def evaluate_dataset(
     model_path, dataset_name, data_dir="data/processed/eval",
     n_samples=1, temperature=0.0, max_tokens=2048, tensor_parallel_size=1,
-    gpu_memory_utilization=0.9,
+    gpu_memory_utilization=0.9, max_model_len=None,
 ):
     from adpo.reward_functions import compute_score
 
@@ -119,6 +122,7 @@ def evaluate_dataset(
         temperature=temperature, max_tokens=max_tokens,
         tensor_parallel_size=tensor_parallel_size,
         gpu_memory_utilization=gpu_memory_utilization,
+        max_model_len=max_model_len,
     )
 
     results = []
@@ -214,6 +218,7 @@ def main():
     parser.add_argument("--max_tokens", type=int, default=2048)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.9)
+    parser.add_argument("--max_model_len", type=int, default=None, help="Override model's max sequence length for vLLM")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -227,6 +232,7 @@ def main():
                 temperature=args.temperature, max_tokens=args.max_tokens,
                 tensor_parallel_size=args.tensor_parallel_size,
                 gpu_memory_utilization=args.gpu_memory_utilization,
+                max_model_len=args.max_model_len,
             )
             all_metrics.append(metrics)
             result_path = os.path.join(args.output_dir, f"{dataset_name}_results.json")
