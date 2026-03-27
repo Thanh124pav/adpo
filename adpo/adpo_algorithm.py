@@ -186,26 +186,28 @@ def _find_think_boundary(token_ids, response_mask, tokenizer):
     """Find token index where </think> ends for each response in batch.
 
     Tries multiple strategies:
-    1. Match token IDs from tokenizer.encode("</think>")
-    2. Match single special token ID from vocab
-    3. Decode and search string (fallback)
+    1. Single special token ID lookup
+    2. Multi-token encode match
+    3. Decode full response and find </think> string, then map back to token position
 
     Returns list of int or None (one per batch element).
     """
     batch_size = response_mask.shape[0]
     results = []
 
-    # Strategy 1: encode the marker
-    think_end_ids = tokenizer.encode("</think>", add_special_tokens=False)
-
-    # Strategy 2: check if </think> is a single token in vocab
+    # Strategy 1: check if </think> is a single token in vocab
     think_end_single = None
     if hasattr(tokenizer, 'convert_tokens_to_ids'):
         tid = tokenizer.convert_tokens_to_ids("</think>")
-        if tid != tokenizer.unk_token_id:
+        if tid is not None and tid != getattr(tokenizer, 'unk_token_id', None):
             think_end_single = tid
 
+    # Strategy 2: encode the marker
+    think_end_ids = tokenizer.encode("</think>", add_special_tokens=False)
     marker_len = len(think_end_ids)
+
+    # Debug once
+    _logged = False
 
     for b in range(batch_size):
         active = response_mask[b].nonzero(as_tuple=True)[0]
@@ -218,19 +220,41 @@ def _find_think_boundary(token_ids, response_mask, tokenizer):
 
         found = None
 
-        # Try single special token first (most likely for Qwen3)
+        # Strategy 1: single special token
         if think_end_single is not None:
             for i, tid in enumerate(ids):
                 if tid == think_end_single:
                     found = start + i + 1
                     break
 
-        # Try multi-token match
+        # Strategy 2: multi-token match
         if found is None and marker_len > 0:
             for i in range(len(ids) - marker_len + 1):
                 if ids[i:i + marker_len] == think_end_ids:
                     found = start + i + marker_len
                     break
+
+        # Strategy 3: decode and string search (fallback)
+        if found is None:
+            decoded = tokenizer.decode(token_ids[b, start:end].tolist(), skip_special_tokens=False)
+            think_pos = decoded.find("</think>")
+            if think_pos >= 0:
+                # Map character position back to token position
+                # Decode token by token until we pass the character position
+                char_count = 0
+                for i in range(len(ids)):
+                    tok_text = tokenizer.decode([ids[i]], skip_special_tokens=False)
+                    char_count += len(tok_text)
+                    if char_count > think_pos + len("</think>") - 1:
+                        found = start + i + 1
+                        break
+
+        # Debug for first response
+        if b == 0 and not _logged:
+            _logged = True
+            print(f"[ADPO Think] single_token_id={think_end_single}, "
+                  f"encode_ids={think_end_ids}, "
+                  f"found_at={found}, resp_len={end-start}", flush=True)
 
         results.append(found)
     return results
