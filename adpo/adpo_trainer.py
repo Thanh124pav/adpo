@@ -66,6 +66,8 @@ class ADPOTrainer(RayPPOTrainer):
         self.no_answer_incorrect_scale = getattr(algo, "no_answer_incorrect_scale", 0.1)
         self.overlong_buffer_len = getattr(algo, "overlong_buffer_len", 0)
         self.overlong_penalty_factor = getattr(algo, "overlong_penalty_factor", 1.0)
+        self.output_correct_reward = getattr(algo, "output_correct_reward", 0.5)
+        self.output_incorrect_reward = getattr(algo, "output_incorrect_reward", 0.0)
 
         # Judge
         judge_type = getattr(algo, "judge_type", "rule")
@@ -365,6 +367,8 @@ def patch_verl_grpo_with_adpo(
     correct_reward_floor: float = 0.5,
     overlong_buffer_len: int = 0,
     overlong_penalty_factor: float = 1.0,
+    output_correct_reward: float = 0.5,
+    output_incorrect_reward: float = 0.0,
 ):
     """Monkey-patch verl's module-level compute_advantage function with ADPO phase
     decomposition + LLM-as-Judge.
@@ -604,17 +608,7 @@ def patch_verl_grpo_with_adpo(
                 b_start = demo_bounds[k] if k < len(demo_bounds) else "?"
                 print(f"  phase {k} (tok={b_start}): \"{preview}...\"", flush=True)
 
-        # Step 4: Score phases with LLM judge
-        logger.info(f"[ADPO] Scoring {sum(len(p) for p in phase_texts_batch)} phases with {judge.__class__.__name__}")
-        phase_rewards_list = judge.score_phases(
-            questions=questions,
-            phase_texts=phase_texts_batch,
-            golden_answers=golden_answers,
-            data_sources=data_sources,
-        )
-        logger.info("[ADPO] Judge scoring complete")
-
-        # Step 5: Compute outcome rewards
+        # Step 4: Compute outcome rewards first (needed for output phase reward)
         outcome_rewards = []
         for b in range(batch_size):
             if golden_answers[b]:
@@ -627,8 +621,61 @@ def patch_verl_grpo_with_adpo(
                 r = 0.0
             outcome_rewards.append(r)
 
-        # Debug: show outcome for first few responses and phase advantages
         print(f"[ADPO Outcomes] first 8: {['✓' if r >= 1.0 else f'{r:.2f}' for r in outcome_rewards[:8]]}", flush=True)
+
+        # Step 4b: Detect which phases are thinking vs output
+        # Last phase (after </think>) = output phase → scored by outcome
+        # All other phases = thinking phases → scored by judge
+        think_phase_texts_batch = []
+        output_phase_idx = []  # index of the output phase for each response
+        for b in range(batch_size):
+            n_phases = len(phase_texts_batch[b])
+            think_end_tok = None
+            if b < len(boundaries_batch):
+                bounds = boundaries_batch[b]
+                # Find the </think> boundary — it's the last boundary that starts the output
+                from adpo.adpo_algorithm import _find_think_boundary
+                tb = _find_think_boundary(token_ids[b:b+1], response_mask[b:b+1], tokenizer)
+                think_end_tok = tb[0] if tb else None
+
+            if think_end_tok is not None and n_phases >= 2:
+                # Last phase = output, rest = thinking
+                think_phase_texts_batch.append(phase_texts_batch[b][:-1])
+                output_phase_idx.append(n_phases - 1)
+            else:
+                # No </think> found — treat all as thinking
+                think_phase_texts_batch.append(phase_texts_batch[b])
+                output_phase_idx.append(-1)  # no output phase
+
+        # Step 4c: Score thinking phases with LLM judge
+        total_think_phases = sum(len(p) for p in think_phase_texts_batch)
+        logger.info(f"[ADPO] Scoring {total_think_phases} thinking phases with {judge.__class__.__name__}")
+        think_rewards_list = judge.score_phases(
+            questions=questions,
+            phase_texts=think_phase_texts_batch,
+            golden_answers=golden_answers,
+            data_sources=data_sources,
+        )
+        logger.info("[ADPO] Judge scoring complete")
+
+        # Step 4d: Build full phase_rewards_list: thinking rewards + output reward
+        phase_rewards_list = []
+        for b in range(batch_size):
+            rewards = list(think_rewards_list[b])
+            if output_phase_idx[b] >= 0:
+                # Output phase reward: outcome-based
+                if outcome_rewards[b] >= 1.0:
+                    rewards.append(output_correct_reward)
+                else:
+                    rewards.append(output_incorrect_reward)
+            phase_rewards_list.append(rewards)
+
+        # Debug
+        if phase_rewards_list:
+            r0 = phase_rewards_list[0]
+            oi = output_phase_idx[0]
+            print(f"[ADPO Rewards] resp=0: {len(r0)} phases, output_idx={oi}, "
+                  f"rewards={[f'{v:.3f}' for v in r0[:6]]}{'...' if len(r0)>6 else ''}", flush=True)
 
         # Step 5b: Overlong reward shaping (DAPO-style soft penalty)
         overlong_rewards = [0.0] * batch_size
@@ -819,6 +866,8 @@ class ADPOTaskRunner:
             correct_reward_floor=algo.get("correct_reward_floor", 0.5),
             overlong_buffer_len=algo.get("overlong_buffer_len", 0),
             overlong_penalty_factor=algo.get("overlong_penalty_factor", 1.0),
+            output_correct_reward=algo.get("output_correct_reward", 0.5),
+            output_incorrect_reward=algo.get("output_incorrect_reward", 0.0),
         )
 
         # Delegate to standard TaskRunner

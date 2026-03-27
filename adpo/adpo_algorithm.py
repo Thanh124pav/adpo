@@ -253,25 +253,23 @@ def detect_phase_boundaries_adaptive(
                     cands.append((sent_idx, sent_scores[sent_idx], s_start))
             return cands
 
+        # Only split thinking section into phases; output = 1 phase
         candidates = _get_candidates(think_sents, percentile)
-        candidates += _get_candidates(answer_sents, percentile)
 
         # Debug: print sentence info for first response
         if b == 0:
             n_think = len(think_sents)
             n_answer = len(answer_sents)
             think_scores = [sent_scores[i] for i, _ in think_sents] if think_sents else []
-            answer_scores = [sent_scores[i] for i, _ in answer_sents] if answer_sents else []
             think_thresh = np.percentile(think_scores, percentile) if len(think_scores) > 1 else 0
-            answer_thresh = np.percentile(answer_scores, percentile) if len(answer_scores) > 1 else 0
             print(f"[ADPO Sentences] response=0: {len(sentences)} sentences "
-                  f"(think={n_think}, answer={n_answer}), "
+                  f"(think={n_think}, output={n_answer}), "
                   f"think_end={think_end}, "
-                  f"think_thresh={think_thresh:.4f}, answer_thresh={answer_thresh:.4f} (p{percentile})",
+                  f"think_thresh={think_thresh:.4f} (p{percentile})",
                   flush=True)
             for i, (s_start, s_end) in enumerate(sentences[:8]):
                 T = s_end - s_start
-                section = "T" if think_end and s_start < think_end else "A"
+                section = "T" if think_end and s_start < think_end else "O"
                 txt = tokenizer.decode(
                     token_ids[b, s_start:min(s_start+15, s_end)].tolist(),
                     skip_special_tokens=True,
@@ -281,17 +279,18 @@ def detect_phase_boundaries_adaptive(
                 print(f"  sent {i} [{section}] (tok={s_start}, T={T}, score={sent_scores[i]:.4f}) "
                       f"{mark}: \"{txt[:80]}...\"", flush=True)
 
-        # Sort by score descending → pick top-(max_phases-1) highest
+        # Build boundaries: thinking phases + 1 output phase
         candidates.sort(key=lambda x: -x[1])
         boundaries = [start]
 
-        # Always add </think> boundary
-        if think_end is not None:
-            boundaries.append(think_end)
-
-        for _, _, s_start in candidates[:max_phases - len(boundaries)]:
+        # Add thinking phase boundaries
+        for _, _, s_start in candidates[:max_phases - 2]:  # reserve 1 slot for output phase
             if s_start not in boundaries:
                 boundaries.append(s_start)
+
+        # Always add </think> boundary (start of output phase)
+        if think_end is not None:
+            boundaries.append(think_end)
 
         boundaries.sort()
         all_boundaries.append(boundaries)

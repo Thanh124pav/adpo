@@ -25,6 +25,9 @@ algorithm:
   # Overlong reward shaping (DAPO-style)
   overlong_buffer_len: 0       # 0 = off, >0 = soft penalty buffer (e.g. 4096)
   overlong_penalty_factor: 1.0 # Max penalty when response exceeds buffer
+  # Output phase reward (after </think>)
+  output_correct_reward: 0.5   # Reward for output phase when answer is correct
+  output_incorrect_reward: 0.0 # Reward for output phase when answer is wrong
   # LLM-as-Judge
   judge_type: endpoint
   judge_model: Qwen3-14B
