@@ -198,6 +198,11 @@ class ADPOTrainer(RayPPOTrainer):
             n_total = len(phase_texts_batch[0])
             print(f"[ADPO Phases] response=0, {n_total} phases, "
                   f"boundaries={demo_bounds}", flush=True)
+            for k, text in enumerate(phase_texts_batch[0]):
+                b_start = demo_bounds[k] if k < len(demo_bounds) else "?"
+                b_end = demo_bounds[k+1] if k+1 < len(demo_bounds) else "end"
+                preview = text[:150].replace('\n', '\\n')
+                print(f"  phase {k} (tok {b_start}-{b_end}): \"{preview}\"", flush=True)
 
         # Step 4: Score phases with judge (with golden answer + ref solutions)
         phase_rewards_list = self.judge.score_phases(
@@ -607,6 +612,11 @@ def patch_verl_grpo_with_adpo(
             n_total = len(phase_texts_batch[0])
             print(f"[ADPO Phases] response=0, {n_total} phases, "
                   f"boundaries={demo_bounds}", flush=True)
+            for k, text in enumerate(phase_texts_batch[0]):
+                b_start = demo_bounds[k] if k < len(demo_bounds) else "?"
+                b_end = demo_bounds[k+1] if k+1 < len(demo_bounds) else "end"
+                preview = text[:150].replace('\n', '\\n')
+                print(f"  phase {k} (tok {b_start}-{b_end}): \"{preview}\"", flush=True)
 
         # Step 4: Compute outcome rewards first (needed for output phase reward)
         outcome_rewards = []
