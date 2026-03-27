@@ -168,12 +168,26 @@ def _find_sentence_boundaries(
 def _find_think_boundary(token_ids, response_mask, tokenizer):
     """Find token index where </think> ends for each response in batch.
 
+    Tries multiple strategies:
+    1. Match token IDs from tokenizer.encode("</think>")
+    2. Match single special token ID from vocab
+    3. Decode and search string (fallback)
+
     Returns list of int or None (one per batch element).
     """
     batch_size = response_mask.shape[0]
     results = []
-    # Encode </think> marker
+
+    # Strategy 1: encode the marker
     think_end_ids = tokenizer.encode("</think>", add_special_tokens=False)
+
+    # Strategy 2: check if </think> is a single token in vocab
+    think_end_single = None
+    if hasattr(tokenizer, 'convert_tokens_to_ids'):
+        tid = tokenizer.convert_tokens_to_ids("</think>")
+        if tid != tokenizer.unk_token_id:
+            think_end_single = tid
+
     marker_len = len(think_end_ids)
 
     for b in range(batch_size):
@@ -186,10 +200,31 @@ def _find_think_boundary(token_ids, response_mask, tokenizer):
         ids = token_ids[b, start:end].tolist()
 
         found = None
-        for i in range(len(ids) - marker_len + 1):
-            if ids[i:i + marker_len] == think_end_ids:
-                found = start + i + marker_len
-                break
+
+        # Try single special token first (most likely for Qwen3)
+        if think_end_single is not None:
+            for i, tid in enumerate(ids):
+                if tid == think_end_single:
+                    found = start + i + 1
+                    break
+
+        # Try multi-token match
+        if found is None and marker_len > 0:
+            for i in range(len(ids) - marker_len + 1):
+                if ids[i:i + marker_len] == think_end_ids:
+                    found = start + i + marker_len
+                    break
+
+        # Debug: log for first response
+        if b == 0 and found is None:
+            print(f"[ADPO Debug] </think> NOT FOUND in response 0. "
+                  f"encode('</think>')={think_end_ids}, "
+                  f"single_token_id={think_end_single}, "
+                  f"response_len={end-start}", flush=True)
+        elif b == 0:
+            print(f"[ADPO Debug] </think> found at tok={found} "
+                  f"(single_id={think_end_single})", flush=True)
+
         results.append(found)
     return results
 
