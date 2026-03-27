@@ -465,32 +465,31 @@ def detect_phase_boundaries_entropy(
     entropy: torch.Tensor,
     response_mask: torch.Tensor,
     percentile: float = 80.0,
-    min_phase_len: int = 10,
+    min_phase_len: int = 5,
     max_phases: int = 10,
     token_ids: Optional[torch.Tensor] = None,
     tokenizer=None,
 ) -> List[List[int]]:
-    """Detect phase boundaries using sentence structure + mean entropy.
+    """Detect phase boundaries: find </think>, split thinking into phases using entropy.
 
-    1. Split response into sentences by punctuation delimiters (. ? ! \\n ...).
-    2. For each sentence, compute mean entropy of the first 1/3 tokens.
-    3. If that mean > percentile threshold → sentence starts a new phase.
-    4. Otherwise → sentence merges into the previous phase.
+    Algorithm (same as adaptive, but uses entropy instead of -log_pi):
+    1. Find </think> position → split response into [think_region, output_region]
+    2. Within think_region only: split into sentences, compute mean entropy
+       of first 1/3 tokens per sentence, select top-K above percentile threshold
+    3. Output region = 1 single phase (last phase)
 
     Falls back to peak-based detection if token_ids/tokenizer not available.
     """
     if token_ids is None or tokenizer is None:
-        # Fallback: treat entropy as signal for peak-based detection
         return _detect_phase_boundaries_peak(
             entropy, response_mask, percentile, min_phase_len, max_phases,
         )
 
     batch_size = entropy.shape[0]
-    sentences_batch = _find_sentence_boundaries(token_ids, response_mask, tokenizer)
+    think_ends = _find_think_boundary(token_ids, response_mask, tokenizer)
     all_boundaries = []
 
     for b in range(batch_size):
-        sentences = sentences_batch[b]
         ent = entropy[b]
         active = response_mask[b].nonzero(as_tuple=True)[0]
         if len(active) == 0:
@@ -498,8 +497,43 @@ def detect_phase_boundaries_entropy(
             continue
 
         start = active[0].item()
+        end = active[-1].item() + 1
+        think_end = think_ends[b]
 
-        # Compute mean entropy of first 1/3 tokens for each sentence
+        # Determine think region
+        if think_end is not None and think_end > start:
+            think_end_pos = think_end
+        else:
+            think_end_pos = end
+
+        # Split sentences ONLY within think region
+        think_len = think_end_pos - start
+        think_ids = token_ids[b, start:think_end_pos].tolist()
+        delim_ids = _get_delimiter_token_ids(tokenizer)
+        break_positions = [i for i, tid in enumerate(think_ids) if tid in delim_ids]
+
+        raw_sentences = []
+        sent_start = 0
+        for bp in break_positions:
+            sent_end = bp + 1
+            if sent_end > sent_start:
+                raw_sentences.append((start + sent_start, start + sent_end))
+            sent_start = sent_end
+        if sent_start < think_len:
+            raw_sentences.append((start + sent_start, think_end_pos))
+
+        # Merge short sentences
+        sentences = []
+        for s_start, s_end in raw_sentences:
+            if sentences and (s_start - sentences[-1][0]) < min_phase_len:
+                sentences[-1] = (sentences[-1][0], s_end)
+            else:
+                sentences.append((s_start, s_end))
+
+        if not sentences:
+            sentences = [(start, think_end_pos)]
+
+        # Score sentences by mean entropy of first 1/3 tokens
         sent_scores = []
         for s_start, s_end in sentences:
             T = s_end - s_start
@@ -507,21 +541,36 @@ def detect_phase_boundaries_entropy(
             head_mean = ent[s_start:s_start + head_len].mean().item()
             sent_scores.append(head_mean)
 
-        threshold = np.percentile(sent_scores, percentile)
-
-        # Rank all sentences (except first) by score, pick top-K above threshold
+        # Select candidates above percentile threshold
         candidates = []
-        for i in range(1, len(sentences)):
-            if sent_scores[i] > threshold:
-                candidates.append((i, sent_scores[i], sentences[i][0]))
+        if len(sent_scores) > 1:
+            threshold = np.percentile(sent_scores, percentile)
+            for i in range(1, len(sentences)):
+                if sent_scores[i] > threshold:
+                    candidates.append((sent_scores[i], sentences[i][0]))
+            candidates.sort(key=lambda x: -x[0])
 
-        candidates.sort(key=lambda x: -x[1])
+        # Build boundaries: [start] + [think_end] + think candidates
         boundaries = [start]
-        for _, _, s_start in candidates[:max_phases - 1]:
-            boundaries.append(s_start)
+        if think_end is not None and think_end > start and think_end < end:
+            boundaries.append(think_end)
+
+        max_think_phases = max_phases - len(boundaries)
+        for _, s_start in candidates[:max_think_phases]:
+            if s_start not in boundaries and s_start < (think_end_pos if think_end else end):
+                boundaries.append(s_start)
 
         boundaries.sort()
         all_boundaries.append(boundaries)
+
+        # Debug for first response
+        if b == 0:
+            n_think_phases = sum(1 for bd in boundaries if think_end is None or bd < think_end)
+            has_output = think_end is not None and think_end in boundaries
+            print(f"[ADPO Entropy Boundaries] resp=0: {len(sentences)} think_sents, "
+                  f"think_end={think_end}, "
+                  f"n_think_phases={n_think_phases}, has_output={has_output}, "
+                  f"boundaries={boundaries}", flush=True)
 
     return all_boundaries
 
