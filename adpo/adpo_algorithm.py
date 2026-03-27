@@ -80,21 +80,43 @@ def detect_phase_boundaries_threshold(
     return all_boundaries
 
 
+def _get_delimiter_token_ids(tokenizer) -> set:
+    """Build set of token IDs that represent sentence delimiters.
+
+    Encodes common delimiters (. ? ! \\n etc.) and collects all token IDs
+    that contain them. Cached per tokenizer instance.
+    """
+    if not hasattr(tokenizer, '_adpo_delim_ids'):
+        delimiters = [".\n", ". ", "? ", "! ", "...", ".\n\n", "?\n", "!\n", "\n", "\n\n"]
+        delim_ids = set()
+        for d in delimiters:
+            ids = tokenizer.encode(d, add_special_tokens=False)
+            delim_ids.update(ids)
+        # Also check single-char tokens
+        for char in [".", "?", "!", "\n"]:
+            ids = tokenizer.encode(char, add_special_tokens=False)
+            delim_ids.update(ids)
+        tokenizer._adpo_delim_ids = delim_ids
+    return tokenizer._adpo_delim_ids
+
+
 def _find_sentence_boundaries(
     token_ids: torch.Tensor,
     response_mask: torch.Tensor,
     tokenizer,
     min_sentence_len: int = 5,
 ) -> List[List[Tuple[int, int]]]:
-    """Split response tokens into sentence spans by decoding and finding delimiters.
+    """Split response tokens into sentence spans by finding delimiter tokens.
 
-    Splits on: . ? ! ... \\n \\n\\n and similar punctuation.
+    Compares token IDs directly against pre-computed delimiter token IDs.
+    No per-token decoding needed.
+
     Sentences shorter than min_sentence_len are merged into the next sentence.
 
     Returns:
         List (per batch) of list of (start_idx, end_idx) token spans.
     """
-    _SENT_DELIMITERS = re.compile(r'(?:\.{1,3}|[?!])\s|\n')
+    delim_ids = _get_delimiter_token_ids(tokenizer)
 
     batch_size = response_mask.shape[0]
     all_sentences = []
@@ -108,19 +130,9 @@ def _find_sentence_boundaries(
         start = active[0].item()
         end = active[-1].item() + 1
 
-        # Decode each token individually to map char offsets -> token indices
-        token_texts = []
-        for t in range(start, end):
-            token_texts.append(tokenizer.decode(
-                [token_ids[b, t].item()], skip_special_tokens=True,
-            ))
-
-        # Find sentence break positions (token index relative to start)
-        # A sentence ends at token t if the decoded text contains a delimiter
-        break_positions = []
-        for i, txt in enumerate(token_texts):
-            if _SENT_DELIMITERS.search(txt):
-                break_positions.append(i)
+        # Find delimiter positions by comparing token IDs directly
+        ids = token_ids[b, start:end].tolist()
+        break_positions = [i for i, tid in enumerate(ids) if tid in delim_ids]
 
         # Convert break positions to sentence spans
         raw_sentences = []
