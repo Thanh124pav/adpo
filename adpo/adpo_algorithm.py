@@ -153,6 +153,35 @@ def _find_sentence_boundaries(
     return all_sentences
 
 
+def _find_think_boundary(token_ids, response_mask, tokenizer):
+    """Find token index where </think> ends for each response in batch.
+
+    Returns list of int or None (one per batch element).
+    """
+    batch_size = response_mask.shape[0]
+    results = []
+    # Encode </think> marker
+    think_end_ids = tokenizer.encode("</think>", add_special_tokens=False)
+    marker_len = len(think_end_ids)
+
+    for b in range(batch_size):
+        active = response_mask[b].nonzero(as_tuple=True)[0]
+        if len(active) == 0:
+            results.append(None)
+            continue
+        start = active[0].item()
+        end = active[-1].item() + 1
+        ids = token_ids[b, start:end].tolist()
+
+        found = None
+        for i in range(len(ids) - marker_len + 1):
+            if ids[i:i + marker_len] == think_end_ids:
+                found = start + i + marker_len
+                break
+        results.append(found)
+    return results
+
+
 def detect_phase_boundaries_adaptive(
     neg_log_probs: torch.Tensor,
     response_mask: torch.Tensor,
@@ -165,9 +194,11 @@ def detect_phase_boundaries_adaptive(
     """Detect phase boundaries using sentence structure + mean -log pi.
 
     1. Split response into sentences by punctuation delimiters (. ? ! \\n ...).
-    2. For each sentence, compute mean -log pi of the first 1/3 tokens.
-    3. If that mean > percentile threshold → sentence starts a new phase.
-    4. Otherwise → sentence merges into the previous phase.
+    2. If <think>...</think> present, always create boundary at </think>.
+       Percentile thresholds are computed separately for thinking vs answer.
+    3. For each sentence, compute mean -log pi of the first 1/3 tokens.
+    4. If that mean > percentile threshold → sentence starts a new phase.
+    5. Otherwise → sentence merges into the previous phase.
 
     Falls back to peak-based detection if token_ids/tokenizer not available.
     """
@@ -178,6 +209,7 @@ def detect_phase_boundaries_adaptive(
 
     batch_size = neg_log_probs.shape[0]
     sentences_batch = _find_sentence_boundaries(token_ids, response_mask, tokenizer)
+    think_boundaries = _find_think_boundary(token_ids, response_mask, tokenizer)
     all_boundaries = []
 
     for b in range(batch_size):
@@ -189,6 +221,7 @@ def detect_phase_boundaries_adaptive(
             continue
 
         start = active[0].item()
+        think_end = think_boundaries[b]  # token index after </think>, or None
 
         # Compute mean -log pi of first 1/3 tokens for each sentence
         sent_scores = []
@@ -198,35 +231,67 @@ def detect_phase_boundaries_adaptive(
             head_mean = nlp[s_start:s_start + head_len].mean().item()
             sent_scores.append(head_mean)
 
-        # Rank all sentences (except first) by score, pick top-K above threshold
-        threshold = np.percentile(sent_scores, percentile)
+        # Split sentences into thinking vs answer sections
+        if think_end is not None:
+            think_sents = [(i, s) for i, s in enumerate(sentences) if s[0] < think_end]
+            answer_sents = [(i, s) for i, s in enumerate(sentences) if s[0] >= think_end]
+        else:
+            think_sents = [(i, s) for i, s in enumerate(sentences)]
+            answer_sents = []
+
+        # Compute thresholds separately
+        def _get_candidates(sent_list, pct):
+            if len(sent_list) <= 1:
+                return []
+            scores = [sent_scores[i] for i, _ in sent_list]
+            thresh = np.percentile(scores, pct)
+            cands = []
+            for idx_in_list, (sent_idx, (s_start, s_end)) in enumerate(sent_list):
+                if idx_in_list == 0:
+                    continue  # skip first sentence in each section
+                if sent_scores[sent_idx] > thresh:
+                    cands.append((sent_idx, sent_scores[sent_idx], s_start))
+            return cands
+
+        candidates = _get_candidates(think_sents, percentile)
+        candidates += _get_candidates(answer_sents, percentile)
 
         # Debug: print sentence info for first response
         if b == 0:
-            print(f"[ADPO Sentences] response=0: {len(sentences)} sentences, "
-                  f"threshold={threshold:.4f} (p{percentile}), "
-                  f"scores={[f'{s:.4f}' for s in sent_scores[:10]]}", flush=True)
-            for i, (s_start, s_end) in enumerate(sentences[:5]):
+            n_think = len(think_sents)
+            n_answer = len(answer_sents)
+            think_scores = [sent_scores[i] for i, _ in think_sents] if think_sents else []
+            answer_scores = [sent_scores[i] for i, _ in answer_sents] if answer_sents else []
+            think_thresh = np.percentile(think_scores, percentile) if len(think_scores) > 1 else 0
+            answer_thresh = np.percentile(answer_scores, percentile) if len(answer_scores) > 1 else 0
+            print(f"[ADPO Sentences] response=0: {len(sentences)} sentences "
+                  f"(think={n_think}, answer={n_answer}), "
+                  f"think_end={think_end}, "
+                  f"think_thresh={think_thresh:.4f}, answer_thresh={answer_thresh:.4f} (p{percentile})",
+                  flush=True)
+            for i, (s_start, s_end) in enumerate(sentences[:8]):
                 T = s_end - s_start
+                section = "T" if think_end and s_start < think_end else "A"
                 txt = tokenizer.decode(
                     token_ids[b, s_start:min(s_start+15, s_end)].tolist(),
                     skip_special_tokens=True,
                 )
-                above = "✓" if i > 0 and sent_scores[i] > threshold else "✗"
-                print(f"  sent {i} (tok={s_start}, T={T}, score={sent_scores[i]:.4f}) "
-                      f"{above}: \"{txt[:80]}...\"", flush=True)
-
-        # Build candidates: (sentence_index, score, start_pos) for sentences above threshold
-        candidates = []
-        for i in range(1, len(sentences)):  # skip first sentence
-            if sent_scores[i] > threshold:
-                candidates.append((i, sent_scores[i], sentences[i][0]))
+                is_cand = any(c[0] == i for c in candidates)
+                mark = "✓" if is_cand else "✗"
+                print(f"  sent {i} [{section}] (tok={s_start}, T={T}, score={sent_scores[i]:.4f}) "
+                      f"{mark}: \"{txt[:80]}...\"", flush=True)
 
         # Sort by score descending → pick top-(max_phases-1) highest
         candidates.sort(key=lambda x: -x[1])
         boundaries = [start]
-        for _, _, s_start in candidates[:max_phases - 1]:
-            boundaries.append(s_start)
+
+        # Always add </think> boundary
+        if think_end is not None:
+            boundaries.append(think_end)
+
+        for _, _, s_start in candidates[:max_phases - len(boundaries)]:
+            if s_start not in boundaries:
+                boundaries.append(s_start)
 
         boundaries.sort()
         all_boundaries.append(boundaries)
