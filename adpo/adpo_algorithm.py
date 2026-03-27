@@ -83,20 +83,37 @@ def detect_phase_boundaries_threshold(
 def _get_delimiter_token_ids(tokenizer) -> set:
     """Build set of token IDs that represent sentence delimiters.
 
-    Encodes common delimiters (. ? ! \\n etc.) and collects all token IDs
-    that contain them. Cached per tokenizer instance.
+    Scans the tokenizer vocabulary for tokens that ARE delimiters
+    (contain sentence-ending punctuation followed by whitespace/newline,
+    or are newline tokens themselves).
+
+    Cached per tokenizer instance.
     """
     if not hasattr(tokenizer, '_adpo_delim_ids'):
-        delimiters = [".\n", ". ", "? ", "! ", "...", ".\n\n", "?\n", "!\n", "\n", "\n\n"]
+        _DELIM_PATTERN = re.compile(r'(?:[.?!](?:\s|$))|(?:\.{2,})|(?:\n)')
         delim_ids = set()
-        for d in delimiters:
-            ids = tokenizer.encode(d, add_special_tokens=False)
-            delim_ids.update(ids)
-        # Also check single-char tokens
-        for char in [".", "?", "!", "\n"]:
-            ids = tokenizer.encode(char, add_special_tokens=False)
-            delim_ids.update(ids)
+
+        # Scan entire vocab for tokens matching delimiter pattern
+        vocab = tokenizer.get_vocab()
+        for token_str, token_id in vocab.items():
+            # Decode the token to get its actual text representation
+            # (vocab keys may use special encoding like Ġ for space)
+            decoded = tokenizer.decode([token_id], skip_special_tokens=False)
+            if _DELIM_PATTERN.search(decoded):
+                delim_ids.add(token_id)
+
+        # Remove common false positives (single "." appears in numbers like 3.14)
+        # Only keep "." if it's followed by space/newline in the token
+        dot_only_ids = set()
+        for token_str, token_id in vocab.items():
+            decoded = tokenizer.decode([token_id], skip_special_tokens=False)
+            if decoded.strip() == ".":
+                dot_only_ids.add(token_id)
+        # Keep dot-only tokens since they usually end sentences;
+        # false positives in "3.14" are acceptable (will be merged by min_sentence_len)
+
         tokenizer._adpo_delim_ids = delim_ids
+        print(f"[ADPO] Built delimiter token set: {len(delim_ids)} tokens", flush=True)
     return tokenizer._adpo_delim_ids
 
 
