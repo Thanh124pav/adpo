@@ -631,7 +631,9 @@ def patch_verl_grpo_with_adpo(
                 r = 0.0
             outcome_rewards.append(r)
 
-        print(f"[ADPO Outcomes] first 8: {['✓' if r >= 1.0 else f'{r:.2f}' for r in outcome_rewards[:8]]}", flush=True)
+        n_correct = sum(1 for r in outcome_rewards if r >= 1.0)
+        print(f"[ADPO Outcomes] {n_correct}/{batch_size} correct, "
+              f"first 8 responses: {['✓' if r >= 1.0 else f'{r:.2f}' for r in outcome_rewards[:8]]}", flush=True)
 
         # Step 4b: Determine which phases are thinking vs output
         # Algorithm guarantees: if </think> found, it's a boundary → last phase = output
