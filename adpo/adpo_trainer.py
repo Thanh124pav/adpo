@@ -632,8 +632,16 @@ def patch_verl_grpo_with_adpo(
             outcome_rewards.append(r)
 
         n_correct = sum(1 for r in outcome_rewards if r >= 1.0)
+        # Show group structure for response 0
+        idx0 = index[0].item()
+        group0_mask = (index == idx0)
+        group0_outcomes = [outcome_rewards[i] for i in range(batch_size) if group0_mask[i]]
+        group0_correct = sum(1 for r in group0_outcomes if r >= 1.0)
         print(f"[ADPO Outcomes] {n_correct}/{batch_size} correct, "
               f"first 8 responses: {['✓' if r >= 1.0 else f'{r:.2f}' for r in outcome_rewards[:8]]}", flush=True)
+        print(f"[ADPO Group0] uid={idx0}, size={len(group0_outcomes)}, "
+              f"correct={group0_correct}/{len(group0_outcomes)}, "
+              f"outcomes={['✓' if r >= 1.0 else f'{r:.2f}' for r in group0_outcomes]}", flush=True)
 
         # Step 4b: Determine which phases are thinking vs output
         # Algorithm guarantees: if </think> found, it's a boundary → last phase = output
