@@ -660,17 +660,20 @@ def patch_verl_grpo_with_adpo(
         # Step 4b: Detect which phases are thinking vs output
         # Last phase (after </think>) = output phase → scored by outcome
         # All other phases = thinking phases → scored by judge
+        from adpo.adpo_algorithm import _find_think_boundary
+        think_boundaries = _find_think_boundary(token_ids, response_mask, tokenizer)
+
+        n_has_think = sum(1 for t in think_boundaries if t is not None)
+        n_no_think = batch_size - n_has_think
+        print(f"[ADPO Think] has_</think>={n_has_think}/{batch_size}, "
+              f"missing={n_no_think}, "
+              f"resp0_think_end={think_boundaries[0]}", flush=True)
+
         think_phase_texts_batch = []
-        output_phase_idx = []  # index of the output phase for each response
+        output_phase_idx = []
         for b in range(batch_size):
             n_phases = len(phase_texts_batch[b])
-            think_end_tok = None
-            if b < len(boundaries_batch):
-                bounds = boundaries_batch[b]
-                # Find the </think> boundary — it's the last boundary that starts the output
-                from adpo.adpo_algorithm import _find_think_boundary
-                tb = _find_think_boundary(token_ids[b:b+1], response_mask[b:b+1], tokenizer)
-                think_end_tok = tb[0] if tb else None
+            think_end_tok = think_boundaries[b]
 
             if think_end_tok is not None and n_phases >= 2:
                 # Last phase = output, rest = thinking
@@ -679,7 +682,7 @@ def patch_verl_grpo_with_adpo(
             else:
                 # No </think> found — treat all as thinking
                 think_phase_texts_batch.append(phase_texts_batch[b])
-                output_phase_idx.append(-1)  # no output phase
+                output_phase_idx.append(-1)
 
         # Step 4c: Score thinking phases with LLM judge
         total_think_phases = sum(len(p) for p in think_phase_texts_batch)

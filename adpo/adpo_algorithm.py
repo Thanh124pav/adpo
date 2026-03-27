@@ -232,16 +232,6 @@ def _find_think_boundary(token_ids, response_mask, tokenizer):
                     found = start + i + marker_len
                     break
 
-        # Debug: log for first response
-        if b == 0 and found is None:
-            print(f"[ADPO Debug] </think> NOT FOUND in response 0. "
-                  f"encode('</think>')={think_end_ids}, "
-                  f"single_token_id={think_end_single}, "
-                  f"response_len={end-start}", flush=True)
-        elif b == 0:
-            print(f"[ADPO Debug] </think> found at tok={found} "
-                  f"(single_id={think_end_single})", flush=True)
-
         results.append(found)
     return results
 
