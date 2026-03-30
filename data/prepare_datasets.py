@@ -16,7 +16,10 @@ import gc
 import os
 
 import datasets
+import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 BATCH_SIZE = 10_000  # write parquet every N records to avoid OOM
 
@@ -382,23 +385,52 @@ EVAL_DATASETS = {
 
 
 def save_to_parquet(records, output_path):
-    """Save records to parquet with native types (dict/list columns)."""
+    """Save records to parquet with proper types for verl compatibility.
+
+    - prompt: stored as ndarray (list of message dicts per row)
+    - reward_model: stored as dict (struct column)
+    - extra_info: stored as dict (struct column)
+    """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    all_records = []
+
+    data_sources = []
+    prompts = []
+    abilities = []
+    reward_models = []
+    extra_infos = []
+
     for i, r in enumerate(records):
-        all_records.append({
-            "data_source": r["data_source"],
-            "prompt": r["prompt"],       # list of dicts — keep native
-            "ability": r["ability"],
-            "reward_model": r["reward_model"],  # dict — keep native
-            "extra_info": r["extra_info"],      # dict — keep native
-        })
+        data_sources.append(r["data_source"])
+        # prompt: list[dict] → numpy ndarray of dicts
+        prompts.append(np.array(r["prompt"], dtype=object))
+        abilities.append(r["ability"])
+        reward_models.append(r["reward_model"])   # dict
+        extra_infos.append(r["extra_info"])        # dict
         if (i + 1) % BATCH_SIZE == 0:
             gc.collect()
 
-    df = pd.DataFrame(all_records)
+    n = len(data_sources)
+    if n == 0:
+        print(f"  No records to save for {output_path}")
+        return
+
+    # Build DataFrame — prompt as ndarray column, reward_model/extra_info as dicts
+    df = pd.DataFrame({
+        "data_source": data_sources,
+        "prompt": pd.Series(prompts, dtype=object),   # ndarray per row
+        "ability": abilities,
+        "reward_model": pd.Series(reward_models, dtype=object),  # dict per row
+        "extra_info": pd.Series(extra_infos, dtype=object),      # dict per row
+    })
     df.to_parquet(output_path, index=False)
-    print(f"Saved {len(df)} examples to {output_path}")
+    print(f"Saved {n} examples to {output_path}")
+
+    # Verify types
+    df_check = pd.read_parquet(output_path)
+    row0 = df_check.iloc[0]
+    print(f"  Types check: prompt={type(row0['prompt']).__name__}, "
+          f"reward_model={type(row0['reward_model']).__name__}, "
+          f"extra_info={type(row0['extra_info']).__name__}")
 
 
 def _call_loader(loader, split="train", levels=None):
