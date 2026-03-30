@@ -31,6 +31,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 
@@ -89,6 +90,12 @@ def preview_parquet(path, num_samples=5, level_filter=None, stats_only=False, se
     print(f"\n  Columns: {list(df.columns)}")
     print(f"  Rows:    {len(df)}")
 
+    # --- Column types (check first row) ---
+    if len(df) > 0:
+        row0 = df.iloc[0]
+        types = {col: type(row0[col]).__name__ for col in df.columns}
+        print(f"  Types:   {types}")
+
     # --- data_source distribution ---
     if "data_source" in df.columns:
         print_distribution(Counter(df["data_source"]), "data_source distribution")
@@ -144,10 +151,12 @@ def preview_parquet(path, num_samples=5, level_filter=None, stats_only=False, se
 
     for idx, (_, row) in enumerate(sample.iterrows()):
         print(f"\n  [{idx + 1}/{k}]")
-        # prompt: show user message only
+        # prompt: ndarray / list / str — extract user message
         prompt = row.get("prompt")
+        if isinstance(prompt, np.ndarray):
+            prompt = prompt.tolist()
         if isinstance(prompt, list):
-            user_msg = next((m["content"] for m in prompt if m.get("role") == "user"), str(prompt))
+            user_msg = next((m["content"] for m in prompt if isinstance(m, dict) and m.get("role") == "user"), str(prompt))
         elif isinstance(prompt, str):
             try:
                 msgs = json.loads(prompt)
