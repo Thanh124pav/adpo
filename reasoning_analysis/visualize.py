@@ -888,6 +888,283 @@ def generate_entropy_html(results: list, output_path: str, max_samples: int = 50
 
 
 # ---------------------------------------------------------------------------
+# Attention Heatmap Visualization
+# ---------------------------------------------------------------------------
+
+
+def _load_npz_samples(internals_dir: str, max_samples: int = 50) -> list:
+    """Load .npz attention files, randomly sampling up to max_samples."""
+    import glob as glob_mod
+    import random
+
+    npz_files = sorted(glob_mod.glob(os.path.join(internals_dir, "response_*.npz")))
+    if not npz_files:
+        print(f"  No .npz files found in {internals_dir}")
+        return []
+
+    if len(npz_files) > max_samples:
+        npz_files = random.sample(npz_files, max_samples)
+        npz_files.sort()
+
+    samples = []
+    for path in npz_files:
+        data = np.load(path, allow_pickle=True)
+        meta = json.loads(str(data["metadata"]))
+        tokens = list(data["tokens"])
+
+        attn_tt = data["attn_think_think"] if "attn_think_think" in data else None
+        attn_ot = data["attn_out_think"] if "attn_out_think" in data else None
+
+        samples.append({
+            "path": path,
+            "meta": meta,
+            "tokens": tokens,
+            "attn_think_think": attn_tt,
+            "attn_out_think": attn_ot,
+        })
+    return samples
+
+
+def _segment_into_sentences(tokens: list, boundary: int) -> list:
+    """Split token list into sentence-like segments by `. `, `\\n\\n`, `?`, `!`.
+
+    Returns list of dicts: {"label": str, "start": int, "end": int, "section": str}
+    where start/end are token indices (exclusive end).
+    """
+    import re
+
+    # Build full text with token boundaries
+    segments = []
+    current_start = 0
+    accumulated = ""
+
+    for i, tok in enumerate(tokens):
+        accumulated += tok
+        # Check if this token ends a sentence
+        is_boundary = False
+        if "\n\n" in tok:
+            is_boundary = True
+        elif re.search(r'[.?!]\s*$', accumulated):
+            is_boundary = True
+        elif re.search(r'[.?!]$', tok):
+            is_boundary = True
+
+        if is_boundary and i > current_start:
+            section = "thinking" if current_start < boundary else "output"
+            if current_start < boundary <= i + 1:
+                # Sentence spans boundary — split it
+                if current_start < boundary:
+                    segments.append({
+                        "start": current_start,
+                        "end": boundary,
+                        "section": "thinking",
+                    })
+                if boundary < i + 1:
+                    segments.append({
+                        "start": boundary,
+                        "end": i + 1,
+                        "section": "output",
+                    })
+            else:
+                segments.append({
+                    "start": current_start,
+                    "end": i + 1,
+                    "section": section,
+                })
+            current_start = i + 1
+            accumulated = ""
+
+    # Remaining tokens
+    if current_start < len(tokens):
+        section = "thinking" if current_start < boundary else "output"
+        segments.append({
+            "start": current_start,
+            "end": len(tokens),
+            "section": section,
+        })
+
+    # Create short labels
+    for idx, seg in enumerate(segments):
+        seg_tokens = tokens[seg["start"]:seg["end"]]
+        text = "".join(seg_tokens).strip()
+        if len(text) > 30:
+            text = text[:27] + "..."
+        seg["label"] = f"S{idx}[{seg['section'][0].upper()}]: {text}"
+
+    return segments
+
+
+def _compute_sentence_attention(attn_matrix: np.ndarray, segments: list,
+                                row_offset: int, col_offset: int) -> np.ndarray:
+    """Compute sentence-level attention from token-level attention matrix.
+
+    attn_matrix: (rows, cols) token-level attention (already head-averaged).
+    segments: list of sentence segments with start/end indices.
+    row_offset, col_offset: global token offsets for rows and cols.
+
+    Returns: (n_segments_row, n_segments_col) matrix.
+    """
+    n = len(segments)
+    sent_attn = np.zeros((n, n))
+
+    for i, seg_i in enumerate(segments):
+        ri_start = seg_i["start"] - row_offset
+        ri_end = seg_i["end"] - row_offset
+        # Clip to valid range
+        ri_start = max(0, ri_start)
+        ri_end = min(attn_matrix.shape[0], ri_end)
+        if ri_start >= ri_end:
+            continue
+
+        for j, seg_j in enumerate(segments):
+            cj_start = seg_j["start"] - col_offset
+            cj_end = seg_j["end"] - col_offset
+            cj_start = max(0, cj_start)
+            cj_end = min(attn_matrix.shape[1], cj_end)
+            if cj_start >= cj_end:
+                continue
+
+            block = attn_matrix[ri_start:ri_end, cj_start:cj_end]
+            sent_attn[i, j] = block.mean()
+
+    return sent_attn
+
+
+def generate_attention_heatmaps(internals_dir: str, output_dir: str,
+                                max_samples: int = 50):
+    """Generate per-token and per-sentence attention heatmap PNGs."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LogNorm
+
+    samples = _load_npz_samples(internals_dir, max_samples)
+    if not samples:
+        return
+
+    attn_dir = os.path.join(output_dir, "attention_heatmaps")
+    os.makedirs(attn_dir, exist_ok=True)
+
+    for sample_idx, sample in enumerate(samples):
+        meta = sample["meta"]
+        tokens = sample["tokens"]
+        think_boundary = meta["think_boundary"]
+        layers_saved = meta.get("attn_layers_saved", [])
+
+        attn_tt = sample["attn_think_think"]  # (layers, heads, think, think)
+        attn_ot = sample["attn_out_think"]    # (layers, heads, out, think)
+
+        if attn_tt is None and attn_ot is None:
+            continue
+
+        # Use last saved layer, average across heads
+        # --- Token-level heatmaps ---
+
+        if attn_tt is not None:
+            # Last layer, mean over heads → (think_len, think_len)
+            tt = attn_tt[-1].mean(axis=0).astype(np.float32)
+            think_tokens = tokens[:think_boundary]
+
+            # Truncate labels if too many tokens
+            max_ticks = 80
+            fig_w = max(8, min(30, len(think_tokens) * 0.3))
+            fig_h = max(6, min(25, len(think_tokens) * 0.25))
+
+            fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+            im = ax.imshow(tt, aspect="auto", cmap="Blues")
+            ax.set_title(f"Think→Think Attention (sample {sample_idx}, "
+                         f"layer {layers_saved[-1] if layers_saved else '?'}, "
+                         f"head avg)")
+            ax.set_xlabel("Key (thinking tokens)")
+            ax.set_ylabel("Query (thinking tokens)")
+            if len(think_tokens) <= max_ticks:
+                ax.set_xticks(range(len(think_tokens)))
+                ax.set_xticklabels(think_tokens, rotation=90, fontsize=5)
+                ax.set_yticks(range(len(think_tokens)))
+                ax.set_yticklabels(think_tokens, fontsize=5)
+            plt.colorbar(im, ax=ax, shrink=0.8)
+            plt.tight_layout()
+            plt.savefig(os.path.join(attn_dir, f"sample_{sample_idx:03d}_think_think_tokens.png"),
+                        dpi=150)
+            plt.close()
+
+        if attn_ot is not None:
+            ot = attn_ot[-1].mean(axis=0).astype(np.float32)
+            think_tokens = tokens[:think_boundary]
+            out_tokens = tokens[think_boundary:]
+
+            fig_w = max(8, min(30, len(think_tokens) * 0.3))
+            fig_h = max(6, min(20, len(out_tokens) * 0.3))
+
+            fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+            im = ax.imshow(ot, aspect="auto", cmap="Oranges")
+            ax.set_title(f"Output→Think Attention (sample {sample_idx}, "
+                         f"layer {layers_saved[-1] if layers_saved else '?'}, "
+                         f"head avg)")
+            ax.set_xlabel("Key (thinking tokens)")
+            ax.set_ylabel("Query (output tokens)")
+            if len(think_tokens) <= max_ticks:
+                ax.set_xticks(range(len(think_tokens)))
+                ax.set_xticklabels(think_tokens, rotation=90, fontsize=5)
+            if len(out_tokens) <= max_ticks:
+                ax.set_yticks(range(len(out_tokens)))
+                ax.set_yticklabels(out_tokens, fontsize=5)
+            plt.colorbar(im, ax=ax, shrink=0.8)
+            plt.tight_layout()
+            plt.savefig(os.path.join(attn_dir, f"sample_{sample_idx:03d}_out_think_tokens.png"),
+                        dpi=150)
+            plt.close()
+
+        # --- Sentence-level heatmaps ---
+        segments = _segment_into_sentences(tokens, think_boundary)
+        if len(segments) < 2:
+            continue
+
+        labels = [s["label"] for s in segments]
+
+        if attn_tt is not None:
+            tt = attn_tt[-1].mean(axis=0).astype(np.float32)
+            sent_attn = _compute_sentence_attention(tt, segments,
+                                                    row_offset=0, col_offset=0)
+
+            fig_size = max(6, min(20, len(segments) * 0.5))
+            fig, ax = plt.subplots(figsize=(fig_size, fig_size))
+            im = ax.imshow(sent_attn, aspect="auto", cmap="Blues")
+            ax.set_title(f"Sentence-level Think→Think (sample {sample_idx})")
+            ax.set_xticks(range(len(labels)))
+            ax.set_xticklabels(labels, rotation=90, fontsize=6)
+            ax.set_yticks(range(len(labels)))
+            ax.set_yticklabels(labels, fontsize=6)
+            plt.colorbar(im, ax=ax, shrink=0.8)
+            plt.tight_layout()
+            plt.savefig(os.path.join(attn_dir, f"sample_{sample_idx:03d}_think_think_sentences.png"),
+                        dpi=150)
+            plt.close()
+
+        if attn_ot is not None:
+            ot = attn_ot[-1].mean(axis=0).astype(np.float32)
+            sent_attn = _compute_sentence_attention(ot, segments,
+                                                    row_offset=think_boundary,
+                                                    col_offset=0)
+
+            fig_size = max(6, min(20, len(segments) * 0.5))
+            fig, ax = plt.subplots(figsize=(fig_size, fig_size))
+            im = ax.imshow(sent_attn, aspect="auto", cmap="Oranges")
+            ax.set_title(f"Sentence-level Output→Think (sample {sample_idx})")
+            ax.set_xticks(range(len(labels)))
+            ax.set_xticklabels(labels, rotation=90, fontsize=6)
+            ax.set_yticks(range(len(labels)))
+            ax.set_yticklabels(labels, fontsize=6)
+            plt.colorbar(im, ax=ax, shrink=0.8)
+            plt.tight_layout()
+            plt.savefig(os.path.join(attn_dir, f"sample_{sample_idx:03d}_out_think_sentences.png"),
+                        dpi=150)
+            plt.close()
+
+    print(f"  Saved attention heatmaps ({len(samples)} samples) to {attn_dir}/")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -900,6 +1177,9 @@ def main():
                         help="Output directory for plots and HTML files")
     parser.add_argument("--no_plots", action="store_true",
                         help="Skip generating statistical plots (useful if matplotlib not available)")
+    parser.add_argument("--internals_dir", type=str, default=None,
+                        help="Directory containing .npz files from attention extraction "
+                             "(e.g. reasoning_analysis/outputs/internals)")
     args = parser.parse_args()
 
     print(f"Loading results from {args.input_path} ...")
@@ -934,6 +1214,14 @@ def main():
 
     print("Generating entropy HTML ...")
     generate_entropy_html(results, os.path.join(args.output_dir, "entropy.html"))
+
+    # Generate attention heatmaps if internals_dir provided
+    if args.internals_dir:
+        print("Generating attention heatmaps ...")
+        try:
+            generate_attention_heatmaps(args.internals_dir, args.output_dir)
+        except ImportError as e:
+            print(f"  WARNING: Attention heatmaps skipped ({e})")
 
     print(f"\nAll outputs saved to {args.output_dir}/")
     print("Files generated:")
