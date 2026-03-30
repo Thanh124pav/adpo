@@ -439,6 +439,13 @@ def extract_attention_hidden_states(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # Default: only save the last half of layers (saves time + memory)
+    if layers is None:
+        n_total_layers = model.config.num_hidden_layers
+        layers = list(range(n_total_layers // 2, n_total_layers))
+        print(f"  Saving attention for last {len(layers)}/{n_total_layers} layers: "
+              f"[{layers[0]}..{layers[-1]}]")
+
     os.makedirs(output_dir, exist_ok=True)
 
     for i, result in enumerate(results):
