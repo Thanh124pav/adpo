@@ -1,99 +1,56 @@
+# Inherit from verl's ppo_trainer.yaml — only override what ADPO needs.
+# All fields not listed here use verl's defaults.
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
 defaults:
+  - ppo_trainer
   - _self_
 
-# --- ADPO-specific algorithm config ---
+# --- ADPO-specific algorithm extensions ---
+# Fields like gamma, lam, kl_ctrl, use_pf_ppo etc. are inherited from ppo_trainer.
 algorithm:
   adv_estimator: grpo
-  gamma: 1.0
-  lam: 1.0
-  norm_adv_by_std_in_grpo: true
   # Phase Decomposition
-  phase_method: adaptive       # "adaptive" (percentile on -log pi), "threshold" (fixed delta), "entropy" (percentile on token entropy)
-  phase_delta: 2.0             # Fixed threshold for -log pi (if method=threshold)
-  phase_percentile: 85.0       # Percentile threshold (adaptive: on -log pi; entropy: 80=top 20% highest entropy are breakpoints)
-  phase_min_len: 10            # Minimum tokens per phase
-  phase_max_K: 10              # Maximum number of phases per response
-  phase_sigma: 0.0             # Soft assignment bandwidth. 0=hard, >0=Gaussian blend
+  phase_method: adaptive
+  phase_delta: 2.0
+  phase_percentile: 85.0
+  phase_min_len: 10
+  phase_max_K: 10
+  phase_decay_gamma: 0.0       # 0 = off, >0 = in-phase decreasing (e.g. 0.9)
+  # Score mapping
+  correct_reward_floor: 0.5    # Min phase reward for correct responses
+  # Overlong reward shaping (DAPO-style)
+  overlong_buffer_len: 0       # 0 = off, >0 = soft penalty buffer (e.g. 4096)
+  overlong_penalty_factor: 1.0 # Max penalty when response exceeds buffer
+  # Output phase reward (after </think>)
+  output_correct_reward: 0.5   # Reward for output phase when answer is correct
+  output_incorrect_reward: 0.0 # Reward for output phase when answer is wrong
   # LLM-as-Judge
-  judge_type: endpoint          # "rule", "vllm", "api" (openai SDK), "endpoint" (raw HTTP)
-  judge_model: Qwen3-14B       # Model for vllm/api/endpoint judge
-  judge_endpoint: ""           # HTTP endpoint for "endpoint" judge
-  max_ref_solutions_in_prompt: 3
-  # SolutionBank
-  max_solutions_per_question: 8
-  solution_bank_dir: data/solutions
-  solution_bank_save_path: checkpoints/solution_bank.jsonl
-  solution_bank_save_freq: 50
-  # KL
-  use_kl_in_reward: false
-  kl_penalty: kl
-  kl_ctrl:
-    type: fixed
-    kl_coef: 0.001
-    horizon: 10000
-    target_kl: 0.1
-  # PF-PPO (disabled)
-  use_pf_ppo: false
-  pf_ppo:
-    reweight_method: pow
-    weight_pow: 2.0
-  # Rollout correction
-  rollout_correction:
-    enabled: false
+  judge_type: endpoint
+  judge_model: Qwen3-14B
+  judge_endpoint: ""
 
-# --- Actor / Rollout / Ref ---
+# --- Actor / Rollout / Ref overrides ---
 actor_rollout_ref:
-  hybrid_engine: true
-  nccl_timeout: 600
   model:
     path: Qwen3-4B
-    override_config: {}
-    enable_gradient_checkpointing: true
   actor:
-    strategy: fsdp
     ppo_mini_batch_size: 128
-    ppo_epochs: 1
-    loss_agg_mode: seq-mean-token-sum-norm
     use_kl_loss: true
-    kl_loss_coef: 0.001
-    kl_loss_type: low_var_kl
-    clip_ratio: 0.2
-    entropy_coeff: 0.0
+    use_torch_compile: false
+    loss_agg_mode: seq-mean-token-sum-norm
   rollout:
     name: vllm
-    temperature: 1.0
-    top_p: 1.0
-    top_k: -1
     n: 8
-    max_new_tokens: 2048
     tensor_model_parallel_size: 1
     gpu_memory_utilization: 0.4
-    layered_summon: false
+    enforce_eager: true
   ref:
     fsdp_config:
       param_offload: true
-
-# --- Critic (disabled for GRPO, but verl requires the key) ---
-critic:
-  strategy: fsdp
-
-# --- Reward model (disabled, using custom reward function) ---
-reward_model:
-  enable: false
-  enable_resource_pool: false
-  strategy: fsdp
-  n_gpus_per_node: 0
-  nnodes: 1
-  reward_kwargs: {}
-
-# --- Reward manager ---
-reward_manager:
-  reward_fn_key: data_source
-  default_reward_fn:
-    cls: identity
-    kwargs: {}
-  overrides: {}
-  verbose: false
 
 # --- Data ---
 data:
@@ -102,79 +59,22 @@ data:
   train_batch_size: 128
   max_prompt_length: 1024
   max_response_length: 2048
-  shuffle: true
-  trust_remote_code: false
 
-# --- Custom reward function ---
-custom_reward_function:
-  path: adpo/reward_functions.py
-  name: compute_score
+# --- Reward (new verl structure) ---
+reward:
+  custom_reward_function:
+    path: adpo/reward_functions.py
+    name: compute_score
+  reward_model:
+    enable: false
 
-# --- Trainer ---
+# --- Trainer overrides ---
 trainer:
   total_epochs: 3
-  total_training_steps: null
-  balance_batch: true
   save_freq: 50
   test_freq: 50
-  log_freq: 1
   project_name: adpo
   experiment_name: adpo-qwen-7b-math
   logger:
     - tensorboard
-  log_val_generations: 0
-  rollout_data_dir: null
-  validation_data_dir: null
   default_local_dir: checkpoints/
-  default_hdfs_dir: null
-  del_local_ckpt_after_load: false
-  max_actor_ckpt_to_keep: null
-  max_critic_ckpt_to_keep: null
-  nnodes: 1
-  n_gpus_per_node: 8
-  device: cuda
-  use_legacy_worker_impl: auto
-  resume_mode: auto
-  resume_from_path: null
-  val_before_train: true
-  val_only: false
-  critic_warmup: 0
-  ray_wait_register_center_timeout: 300
-  esi_redundant_time: 0
-
-# --- Profiler ---
-global_profiler:
-  tool: null
-  steps: null
-  profile_continuous_steps: false
-  save_path: "outputs/profile"
-  global_tool_config:
-    nsys:
-      discrete: false
-      controller_nsight_options:
-        trace: "cuda,nvtx,cublas,ucx"
-        cuda-memory-usage: "true"
-        cuda-graph-trace: "graph"
-      worker_nsight_options:
-        trace: "cuda,nvtx,cublas,ucx"
-        cuda-memory-usage: "true"
-        cuda-graph-trace: "graph"
-        capture-range: "cudaProfilerApi"
-        capture-range-end: null
-        kill: none
-    torch_memory:
-      trace_alloc_max_entries: 100000
-      stack_depth: 32
-      context: "all"
-      stacks: "all"
-      kw_args: {}
-
-# --- Transfer queue ---
-transfer_queue:
-  enable: false
-
-# --- Ray ---
-ray_kwargs:
-  ray_init:
-    num_cpus: null
-  timeline_json_file: null

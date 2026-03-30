@@ -36,7 +36,7 @@ python -m adpo.main_adpo \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.clip_ratio=0.2 \
     actor_rollout_ref.actor.loss_agg_mode=token-mean \
-    +algorithm.norm_adv_by_std_in_grpo=true \
+    algorithm.norm_adv_by_std_in_grpo=true \
     data.train_files="$TRAIN_DATA" \
     data.val_files="$VAL_DATA" \
     data.train_batch_size="$BATCH_SIZE" \

@@ -13,6 +13,7 @@ phase-level credit assignment.
 """
 
 import torch
+import re
 import numpy as np
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
@@ -79,18 +80,313 @@ def detect_phase_boundaries_threshold(
     return all_boundaries
 
 
+def _get_delimiter_token_ids(tokenizer) -> set:
+    """Build set of token IDs that represent sentence delimiters.
+
+    Scans the tokenizer vocabulary for tokens that ARE delimiters
+    (contain sentence-ending punctuation followed by whitespace/newline,
+    or are newline tokens themselves).
+
+    Cached per tokenizer instance.
+    """
+    if not hasattr(tokenizer, '_adpo_delim_ids'):
+        _DELIM_PATTERN = re.compile(r'(?:[.?!](?:\s|$))|(?:\.{2,})|(?:\n)')
+        delim_ids = set()
+
+        # Scan entire vocab for tokens matching delimiter pattern
+        vocab = tokenizer.get_vocab()
+        for token_str, token_id in vocab.items():
+            # Decode the token to get its actual text representation
+            # (vocab keys may use special encoding like Ġ for space)
+            decoded = tokenizer.decode([token_id], skip_special_tokens=False)
+            if _DELIM_PATTERN.search(decoded):
+                delim_ids.add(token_id)
+
+        # Remove common false positives (single "." appears in numbers like 3.14)
+        # Only keep "." if it's followed by space/newline in the token
+        dot_only_ids = set()
+        for token_str, token_id in vocab.items():
+            decoded = tokenizer.decode([token_id], skip_special_tokens=False)
+            if decoded.strip() == ".":
+                dot_only_ids.add(token_id)
+        # Keep dot-only tokens since they usually end sentences;
+        # false positives in "3.14" are acceptable (will be merged by min_sentence_len)
+
+        tokenizer._adpo_delim_ids = delim_ids
+        print(f"[ADPO] Built delimiter token set: {len(delim_ids)} tokens", flush=True)
+    return tokenizer._adpo_delim_ids
+
+
+def _find_sentence_boundaries(
+    token_ids: torch.Tensor,
+    response_mask: torch.Tensor,
+    tokenizer,
+    min_sentence_len: int = 5,
+) -> List[List[Tuple[int, int]]]:
+    """Split response tokens into sentence spans by finding delimiter tokens.
+
+    Compares token IDs directly against pre-computed delimiter token IDs.
+    No per-token decoding needed.
+
+    Sentences shorter than min_sentence_len are merged into the next sentence.
+
+    Returns:
+        List (per batch) of list of (start_idx, end_idx) token spans.
+    """
+    delim_ids = _get_delimiter_token_ids(tokenizer)
+
+    batch_size = response_mask.shape[0]
+    all_sentences = []
+
+    for b in range(batch_size):
+        active = response_mask[b].nonzero(as_tuple=True)[0]
+        if len(active) == 0:
+            all_sentences.append([(0, 0)])
+            continue
+
+        start = active[0].item()
+        end = active[-1].item() + 1
+
+        # Find delimiter positions by comparing token IDs directly
+        ids = token_ids[b, start:end].tolist()
+        break_positions = [i for i, tid in enumerate(ids) if tid in delim_ids]
+
+        # Convert break positions to sentence spans
+        raw_sentences = []
+        sent_start = 0  # relative to `start`
+        for bp in break_positions:
+            sent_end = bp + 1  # exclusive, include the delimiter token
+            if sent_end > sent_start:
+                raw_sentences.append((start + sent_start, start + sent_end))
+            sent_start = sent_end
+
+        # Remaining tokens form the last sentence
+        if sent_start < (end - start):
+            raw_sentences.append((start + sent_start, end))
+
+        # Merge short sentences into the next one
+        sentences = []
+        for s_start, s_end in raw_sentences:
+            if sentences and (s_start - sentences[-1][0]) < min_sentence_len:
+                # Previous sentence too short — extend it
+                sentences[-1] = (sentences[-1][0], s_end)
+            else:
+                sentences.append((s_start, s_end))
+
+        # Fallback: if no sentences found, whole response = 1 sentence
+        if not sentences:
+            sentences = [(start, end)]
+
+        all_sentences.append(sentences)
+
+    return all_sentences
+
+
+def _find_think_boundary(token_ids, response_mask, tokenizer):
+    """Find token index where </think> ends for each response in batch.
+
+    Tries multiple strategies:
+    1. Single special token ID lookup
+    2. Multi-token encode match
+    3. Decode full response and find </think> string, then map back to token position
+
+    Returns list of int or None (one per batch element).
+    """
+    batch_size = response_mask.shape[0]
+    results = []
+
+    # Strategy 1: check if </think> is a single token in vocab
+    think_end_single = None
+    if hasattr(tokenizer, 'convert_tokens_to_ids'):
+        tid = tokenizer.convert_tokens_to_ids("</think>")
+        if tid is not None and tid != getattr(tokenizer, 'unk_token_id', None):
+            think_end_single = tid
+
+    # Strategy 2: encode the marker
+    think_end_ids = tokenizer.encode("</think>", add_special_tokens=False)
+    marker_len = len(think_end_ids)
+
+    # Debug once
+    _logged = False
+
+    for b in range(batch_size):
+        active = response_mask[b].nonzero(as_tuple=True)[0]
+        if len(active) == 0:
+            results.append(None)
+            continue
+        start = active[0].item()
+        end = active[-1].item() + 1
+        ids = token_ids[b, start:end].tolist()
+
+        found = None
+
+        # Strategy 1: single special token
+        if think_end_single is not None:
+            for i, tid in enumerate(ids):
+                if tid == think_end_single:
+                    found = start + i + 1
+                    break
+
+        # Strategy 2: multi-token match
+        if found is None and marker_len > 0:
+            for i in range(len(ids) - marker_len + 1):
+                if ids[i:i + marker_len] == think_end_ids:
+                    found = start + i + marker_len
+                    break
+
+        # Strategy 3: decode and string search (fallback)
+        if found is None:
+            decoded = tokenizer.decode(token_ids[b, start:end].tolist(), skip_special_tokens=False)
+            think_pos = decoded.find("</think>")
+            if think_pos >= 0:
+                # Map character position back to token position
+                # Decode token by token until we pass the character position
+                char_count = 0
+                for i in range(len(ids)):
+                    tok_text = tokenizer.decode([ids[i]], skip_special_tokens=False)
+                    char_count += len(tok_text)
+                    if char_count > think_pos + len("</think>") - 1:
+                        found = start + i + 1
+                        break
+
+        # Debug for first response
+        if b == 0 and not _logged:
+            _logged = True
+            print(f"[ADPO Think] single_token_id={think_end_single}, "
+                  f"encode_ids={think_end_ids}, "
+                  f"found_at={found}, resp_len={end-start}", flush=True)
+
+        results.append(found)
+    return results
+
+
 def detect_phase_boundaries_adaptive(
+    neg_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    percentile: float = 85.0,
+    min_phase_len: int = 5,
+    max_phases: int = 10,
+    token_ids: Optional[torch.Tensor] = None,
+    tokenizer=None,
+) -> List[List[int]]:
+    """Detect phase boundaries: find </think>, split thinking into phases, output = 1 phase.
+
+    Algorithm:
+    1. Find </think> position → split response into [think_region, output_region]
+    2. Within think_region only: split into sentences, compute mean -log_pi
+       of first 1/3 tokens per sentence, select top-K above percentile threshold
+    3. Output region = 1 single phase (last phase)
+
+    Falls back to peak-based detection if token_ids/tokenizer not available.
+    """
+    if token_ids is None or tokenizer is None:
+        return _detect_phase_boundaries_peak(
+            neg_log_probs, response_mask, percentile, min_phase_len, max_phases,
+        )
+
+    batch_size = neg_log_probs.shape[0]
+    think_ends = _find_think_boundary(token_ids, response_mask, tokenizer)
+    all_boundaries = []
+
+    for b in range(batch_size):
+        nlp = neg_log_probs[b]
+        active = response_mask[b].nonzero(as_tuple=True)[0]
+        if len(active) == 0:
+            all_boundaries.append([0])
+            continue
+
+        start = active[0].item()
+        end = active[-1].item() + 1
+        think_end = think_ends[b]
+
+        # Determine think region
+        if think_end is not None and think_end > start:
+            think_start = start
+            think_end_pos = think_end  # token after </think>
+        else:
+            # No </think> → entire response is "thinking"
+            think_start = start
+            think_end_pos = end
+
+        # Step 1: Find sentences ONLY within think region
+        # Build a temporary mask for just the think region
+        think_len = think_end_pos - think_start
+        think_ids = token_ids[b, think_start:think_end_pos].tolist()
+        delim_ids = _get_delimiter_token_ids(tokenizer)
+        break_positions = [i for i, tid in enumerate(think_ids) if tid in delim_ids]
+
+        # Build sentence spans within think region
+        raw_sentences = []
+        sent_start = 0
+        for bp in break_positions:
+            sent_end = bp + 1
+            if sent_end > sent_start:
+                raw_sentences.append((think_start + sent_start, think_start + sent_end))
+            sent_start = sent_end
+        if sent_start < think_len:
+            raw_sentences.append((think_start + sent_start, think_end_pos))
+
+        # Merge short sentences
+        sentences = []
+        for s_start, s_end in raw_sentences:
+            if sentences and (s_start - sentences[-1][0]) < min_phase_len:
+                sentences[-1] = (sentences[-1][0], s_end)
+            else:
+                sentences.append((s_start, s_end))
+
+        if not sentences:
+            sentences = [(think_start, think_end_pos)]
+
+        # Step 2: Score sentences and select phase boundaries
+        sent_scores = []
+        for s_start, s_end in sentences:
+            T = s_end - s_start
+            head_len = max(1, T // 3)
+            head_mean = nlp[s_start:s_start + head_len].mean().item()
+            sent_scores.append(head_mean)
+
+        # Select candidates above percentile threshold
+        candidates = []
+        if len(sent_scores) > 1:
+            threshold = np.percentile(sent_scores, percentile)
+            for i in range(1, len(sentences)):  # skip first
+                if sent_scores[i] > threshold:
+                    candidates.append((sent_scores[i], sentences[i][0]))
+            candidates.sort(key=lambda x: -x[0])
+
+        # Build boundaries: [start] + think candidates + [think_end (output)]
+        boundaries = [start]
+        max_think_phases = max_phases - 1 if think_end is not None else max_phases
+        for _, s_start in candidates[:max_think_phases - 1]:
+            boundaries.append(s_start)
+
+        # Add output phase boundary (after </think>)
+        if think_end is not None and think_end > start and think_end < end:
+            boundaries.append(think_end)
+
+        boundaries.sort()
+        all_boundaries.append(boundaries)
+
+        # Debug for first response
+        if b == 0:
+            n_think_phases = sum(1 for bd in boundaries if think_end is None or bd < think_end)
+            has_output = think_end is not None and think_end in boundaries
+            print(f"[ADPO Boundaries] resp=0: {len(sentences)} think_sents, "
+                  f"think_end={think_end}, "
+                  f"n_think_phases={n_think_phases}, has_output={has_output}, "
+                  f"boundaries={boundaries}", flush=True)
+
+    return all_boundaries
+
+
+def _detect_phase_boundaries_peak(
     neg_log_probs: torch.Tensor,
     response_mask: torch.Tensor,
     percentile: float = 85.0,
     min_phase_len: int = 10,
     max_phases: int = 10,
 ) -> List[List[int]]:
-    """Detect phase boundaries using adaptive per-response percentile.
-
-    Uses the p-th percentile of -log pi as threshold, then selects
-    local maxima greedily (highest peaks first, respecting min spacing).
-    """
+    """Legacy fallback: peak-based detection on -log pi."""
     batch_size = neg_log_probs.shape[0]
     all_boundaries = []
 
@@ -109,7 +405,6 @@ def detect_phase_boundaries_adaptive(
         active_nlp = nlp[active].cpu().numpy()
         delta = np.percentile(active_nlp, percentile)
 
-        # Find local maxima above threshold
         candidates = []
         for t in range(start + 1, end - 1):
             val = nlp[t].item()
@@ -118,7 +413,6 @@ def detect_phase_boundaries_adaptive(
                     and val >= nlp[t + 1].item()):
                 candidates.append((t, val))
 
-        # Greedy selection: highest peaks first, respecting min distance
         candidates.sort(key=lambda x: -x[1])
         boundaries = [start]
         for t, val in candidates:
@@ -171,67 +465,112 @@ def detect_phase_boundaries_entropy(
     entropy: torch.Tensor,
     response_mask: torch.Tensor,
     percentile: float = 80.0,
-    min_phase_len: int = 10,
+    min_phase_len: int = 5,
     max_phases: int = 10,
+    token_ids: Optional[torch.Tensor] = None,
+    tokenizer=None,
 ) -> List[List[int]]:
-    """Detect phase boundaries using per-token entropy (80/20 rule).
+    """Detect phase boundaries: find </think>, split thinking into phases using entropy.
 
-    Selects positions where entropy is in the top (100-percentile)% as
-    candidate break points (the start of a new phase). For the default
-    percentile=80, this means the top 20% highest-entropy positions.
+    Algorithm (same as adaptive, but uses entropy instead of -log_pi):
+    1. Find </think> position → split response into [think_region, output_region]
+    2. Within think_region only: split into sentences, compute mean entropy
+       of first 1/3 tokens per sentence, select top-K above percentile threshold
+    3. Output region = 1 single phase (last phase)
 
-    Greedy selection picks the highest entropy candidates first, respecting
-    min_phase_len spacing.
-
-    Args:
-        entropy: (batch, seq_len) per-token entropy values.
-        response_mask: (batch, seq_len) binary mask for response tokens.
-        percentile: Threshold percentile (default 80 → top 20% are candidates).
-        min_phase_len: Minimum tokens between consecutive boundaries.
-        max_phases: Maximum number of phases per response.
-
-    Returns:
-        List of boundary index lists, one per batch element.
+    Falls back to peak-based detection if token_ids/tokenizer not available.
     """
+    if token_ids is None or tokenizer is None:
+        return _detect_phase_boundaries_peak(
+            entropy, response_mask, percentile, min_phase_len, max_phases,
+        )
+
     batch_size = entropy.shape[0]
+    think_ends = _find_think_boundary(token_ids, response_mask, tokenizer)
     all_boundaries = []
 
     for b in range(batch_size):
-        mask = response_mask[b]
         ent = entropy[b]
-
-        active = mask.nonzero(as_tuple=True)[0]
+        active = response_mask[b].nonzero(as_tuple=True)[0]
         if len(active) == 0:
             all_boundaries.append([0])
             continue
 
         start = active[0].item()
         end = active[-1].item() + 1
+        think_end = think_ends[b]
 
-        # Compute threshold from active tokens
-        active_ent = ent[active].cpu().numpy()
-        threshold = np.percentile(active_ent, percentile)
+        # Determine think region
+        if think_end is not None and think_end > start:
+            think_end_pos = think_end
+        else:
+            think_end_pos = end
 
-        # Find local maxima above threshold (entropy peaks)
+        # Split sentences ONLY within think region
+        think_len = think_end_pos - start
+        think_ids = token_ids[b, start:think_end_pos].tolist()
+        delim_ids = _get_delimiter_token_ids(tokenizer)
+        break_positions = [i for i, tid in enumerate(think_ids) if tid in delim_ids]
+
+        raw_sentences = []
+        sent_start = 0
+        for bp in break_positions:
+            sent_end = bp + 1
+            if sent_end > sent_start:
+                raw_sentences.append((start + sent_start, start + sent_end))
+            sent_start = sent_end
+        if sent_start < think_len:
+            raw_sentences.append((start + sent_start, think_end_pos))
+
+        # Merge short sentences
+        sentences = []
+        for s_start, s_end in raw_sentences:
+            if sentences and (s_start - sentences[-1][0]) < min_phase_len:
+                sentences[-1] = (sentences[-1][0], s_end)
+            else:
+                sentences.append((s_start, s_end))
+
+        if not sentences:
+            sentences = [(start, think_end_pos)]
+
+        # Score sentences by mean entropy of first 1/3 tokens
+        sent_scores = []
+        for s_start, s_end in sentences:
+            T = s_end - s_start
+            head_len = max(1, T // 3)
+            head_mean = ent[s_start:s_start + head_len].mean().item()
+            sent_scores.append(head_mean)
+
+        # Select candidates above percentile threshold
         candidates = []
-        for t in range(start + 1, end - 1):
-            val = ent[t].item()
-            if (val > threshold
-                    and val >= ent[t - 1].item()
-                    and val >= ent[t + 1].item()):
-                candidates.append((t, val))
+        if len(sent_scores) > 1:
+            threshold = np.percentile(sent_scores, percentile)
+            for i in range(1, len(sentences)):
+                if sent_scores[i] > threshold:
+                    candidates.append((sent_scores[i], sentences[i][0]))
+            candidates.sort(key=lambda x: -x[0])
 
-        # Greedy selection: highest entropy peaks first, respecting min distance
-        candidates.sort(key=lambda x: -x[1])
+        # Build boundaries: [start] + [think_end] + think candidates
         boundaries = [start]
-        for t, val in candidates:
-            if len(boundaries) >= max_phases:
-                break
-            if all(abs(t - b_) >= min_phase_len for b_ in boundaries):
-                boundaries.append(t)
+        if think_end is not None and think_end > start and think_end < end:
+            boundaries.append(think_end)
+
+        max_think_phases = max_phases - len(boundaries)
+        for _, s_start in candidates[:max_think_phases]:
+            if s_start not in boundaries and s_start < (think_end_pos if think_end else end):
+                boundaries.append(s_start)
 
         boundaries.sort()
         all_boundaries.append(boundaries)
+
+        # Debug for first response
+        if b == 0:
+            n_think_phases = sum(1 for bd in boundaries if think_end is None or bd < think_end)
+            has_output = think_end is not None and think_end in boundaries
+            print(f"[ADPO Entropy Boundaries] resp=0: {len(sentences)} think_sents, "
+                  f"think_end={think_end}, "
+                  f"n_think_phases={n_think_phases}, has_output={has_output}, "
+                  f"boundaries={boundaries}", flush=True)
 
     return all_boundaries
 
@@ -245,13 +584,15 @@ def detect_phase_boundaries(
     min_phase_len: int = 10,
     max_phases: int = 10,
     entropy: Optional[torch.Tensor] = None,
+    token_ids: Optional[torch.Tensor] = None,
+    tokenizer=None,
 ) -> List[List[int]]:
     """Unified boundary detection dispatcher.
 
     Methods:
         threshold - Fixed -log pi threshold.
-        adaptive  - Per-response percentile on -log pi (default).
-        entropy   - Per-response percentile on token entropy (80/20 rule).
+        adaptive  - Sentence-based + mean -log pi of first 1/3 tokens.
+        entropy   - Sentence-based + mean entropy of first 1/3 tokens.
     """
     if method == "threshold":
         return detect_phase_boundaries_threshold(
@@ -262,14 +603,15 @@ def detect_phase_boundaries(
         return detect_phase_boundaries_adaptive(
             neg_log_probs, response_mask, percentile=percentile,
             min_phase_len=min_phase_len, max_phases=max_phases,
+            token_ids=token_ids, tokenizer=tokenizer,
         )
     elif method == "entropy":
         if entropy is None:
-            # Fallback: use -log_prob as entropy proxy
             entropy = neg_log_probs
         return detect_phase_boundaries_entropy(
             entropy, response_mask, percentile=percentile,
             min_phase_len=min_phase_len, max_phases=max_phases,
+            token_ids=token_ids, tokenizer=tokenizer,
         )
     else:
         raise ValueError(f"Unknown boundary method: {method}")
@@ -329,65 +671,6 @@ def build_phase_mask(
             phase_ids[b, start:end] = k
 
     return phase_ids
-
-
-# ---------------------------------------------------------------------------
-# Soft Phase Assignment (Generalized Form, Section 5 of theory)
-# ---------------------------------------------------------------------------
-
-def compute_soft_phase_weights(
-    phase_ids: torch.Tensor,
-    boundaries_batch: List[List[int]],
-    response_mask: torch.Tensor,
-    sigma: float = 0.0,
-) -> torch.Tensor:
-    """Compute soft phase assignment weights using Gaussian kernel.
-
-    w_{t,k} = exp(-(t - c_k)^2 / 2*sigma^2) / sum_k' exp(...)
-
-    sigma=0: hard assignment (one-hot).
-    sigma>0: blended near boundaries.
-    sigma->inf: uniform (recovers GRPO).
-
-    Returns:
-        weights: (batch, seq_len, max_K) soft assignment weights.
-    """
-    batch_size, seq_len = phase_ids.shape
-    device = phase_ids.device
-    max_K = max(len(b) for b in boundaries_batch) if boundaries_batch else 1
-
-    if sigma <= 0:
-        weights = torch.zeros(batch_size, seq_len, max_K, device=device)
-        for b in range(batch_size):
-            for t in range(seq_len):
-                k = phase_ids[b, t].item()
-                if k >= 0:
-                    weights[b, t, k] = 1.0
-        return weights
-
-    weights = torch.zeros(batch_size, seq_len, max_K, device=device)
-    for b in range(batch_size):
-        boundaries = boundaries_batch[b]
-        active = response_mask[b].nonzero(as_tuple=True)[0]
-        if len(active) == 0:
-            continue
-        resp_end = active[-1].item() + 1
-
-        centroids = []
-        for k in range(len(boundaries)):
-            start = boundaries[k]
-            end = boundaries[k + 1] if k + 1 < len(boundaries) else resp_end
-            centroids.append((start + end) / 2.0)
-
-        for t in active.tolist():
-            log_w = torch.tensor(
-                [-((t - c) ** 2) / (2 * sigma ** 2) for c in centroids],
-                device=device,
-            )
-            w = torch.softmax(log_w, dim=0)
-            weights[b, t, :len(centroids)] = w
-
-    return weights
 
 
 # ---------------------------------------------------------------------------
@@ -538,20 +821,26 @@ def assign_phase_advantages_to_tokens(
     phase_advantages: torch.Tensor,
     phase_ids: torch.Tensor,
     response_mask: torch.Tensor,
-    soft_weights: Optional[torch.Tensor] = None,
+    decay_gamma: float = 0.0,
+    boundaries_batch: Optional[List[List[int]]] = None,
 ) -> torch.Tensor:
     """Map phase-level advantages back to token-level.
 
     Hard: A(t) = A^(k(t))
-    Soft: A(t) = sum_k w_{t,k} * A^(k)
+    Decreasing (decay_gamma > 0): Within each phase, token advantages decay
+        geometrically so earlier tokens get more credit:
+            c = A_phase / (2 * T)
+            a'_1 = A * (1 - gamma) * T / (9 * gamma)
+            a_i = c + a'_i
+            a'_{i+1} = a'_i * gamma
     """
     batch_size, seq_len = phase_ids.shape
     device = phase_ids.device
 
-    if soft_weights is not None:
-        # (batch, seq_len, max_K) @ (batch, max_K) -> (batch, seq_len)
-        token_advantages = torch.einsum(
-            "btk,bk->bt", soft_weights, phase_advantages
+    if decay_gamma > 0 and boundaries_batch is not None:
+        token_advantages = _assign_with_decay(
+            phase_advantages, phase_ids, response_mask,
+            boundaries_batch, decay_gamma,
         )
     else:
         token_advantages = torch.zeros(batch_size, seq_len, device=device)
@@ -562,6 +851,63 @@ def assign_phase_advantages_to_tokens(
                     token_advantages[b, t] = phase_advantages[b, k]
 
     return token_advantages * response_mask
+
+
+def _assign_with_decay(
+    phase_advantages: torch.Tensor,
+    phase_ids: torch.Tensor,
+    response_mask: torch.Tensor,
+    boundaries_batch: List[List[int]],
+    gamma: float,
+) -> torch.Tensor:
+    """In-phase advantage decreasing: earlier tokens get more credit.
+
+    For each phase with advantage A and T tokens:
+        c       = A / (2 * T)       (constant baseline per token)
+        a'_1    = A * (1 - gamma) * T / (9 * gamma)  (initial decay value)
+        a_i     = c + a'_i          (token i gets baseline + decayed part)
+        a'_{i+1}= a'_i * gamma      (geometric decay)
+    """
+    batch_size, seq_len = phase_ids.shape
+    device = phase_ids.device
+    token_advantages = torch.zeros(batch_size, seq_len, device=device)
+
+    logged = False
+    for b in range(batch_size):
+        boundaries = boundaries_batch[b]
+        active = response_mask[b].nonzero(as_tuple=True)[0]
+        if len(active) == 0:
+            continue
+        resp_end = active[-1].item() + 1
+
+        for k in range(len(boundaries)):
+            start = boundaries[k]
+            end = boundaries[k + 1] if k + 1 < len(boundaries) else resp_end
+            T = end - start
+            if T <= 0:
+                continue
+
+            A = phase_advantages[b, k].item()
+            c = A / (2.0 * T)
+            a_prime = A * (1 - gamma) * T / (9 * gamma)  # a'_1
+            for i in range(T):
+                token_advantages[b, start + i] = c + a_prime
+                a_prime *= gamma
+
+            # Log first response's decay info
+            if not logged and T > 1:
+                first_adv = token_advantages[b, start].item()
+                last_adv = token_advantages[b, end - 1].item()
+                print(
+                    f"[ADPO Decay] b={b} phase={k} | T={T} A={A:.6e} "
+                    f"gamma={gamma} | adv_first={first_adv:.6e} "
+                    f"adv_last={last_adv:.6e} diff={first_adv - last_adv:.6e}",
+                    flush=True,
+                )
+        if not logged:
+            logged = True
+
+    return token_advantages
 
 
 # ---------------------------------------------------------------------------
@@ -575,7 +921,7 @@ def compute_adpo_phase_advantages(
     response_mask: torch.Tensor,
     index: torch.Tensor,
     boundaries_batch: List[List[int]],
-    sigma: float = 0.0,
+    decay_gamma: float = 0.0,
     eps: float = 1e-8,
 ) -> torch.Tensor:
     """Full ADPO pipeline: phase rewards -> phase advantages -> token advantages.
@@ -588,6 +934,10 @@ def compute_adpo_phase_advantages(
 
     lambda_k = sigma_k^global / (sigma_k^global + sigma_i^local + eps)
     A_{i,k} = lambda_k * A_local + (1-lambda_k) * A_global
+
+    Token-level mapping modes:
+    - decay_gamma > 0: In-phase decreasing — earlier tokens get more credit.
+    - Otherwise: Hard assignment (all tokens in a phase share the same adv).
     """
     seq_len = response_mask.shape[1]
 
@@ -600,17 +950,12 @@ def compute_adpo_phase_advantages(
 
     phase_ids = build_phase_mask(boundaries_batch, seq_len, response_mask)
 
-    soft_weights = None
-    if sigma > 0:
-        soft_weights = compute_soft_phase_weights(
-            phase_ids, boundaries_batch, response_mask, sigma=sigma,
-        )
-
     token_advantages = assign_phase_advantages_to_tokens(
         phase_advantages=phase_advantages,
         phase_ids=phase_ids,
         response_mask=response_mask,
-        soft_weights=soft_weights,
+        decay_gamma=decay_gamma,
+        boundaries_batch=boundaries_batch,
     )
 
     return token_advantages

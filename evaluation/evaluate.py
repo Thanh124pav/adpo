@@ -15,10 +15,24 @@ Usage:
 
 import argparse
 import json
+import math
 import os
+from collections import Counter
 
 import pandas as pd
 import torch
+
+
+def _parse_field(val):
+    """Parse a field that may be a JSON string, dict, list, or ndarray."""
+    if isinstance(val, str):
+        return json.loads(val)
+    if isinstance(val, (dict, list)):
+        return val
+    # numpy ndarray or other — convert to list
+    if hasattr(val, 'tolist'):
+        return val.tolist()
+    return val
 
 
 def load_eval_data(dataset_name, data_dir="data/processed/eval"):
@@ -31,11 +45,15 @@ def load_eval_data(dataset_name, data_dir="data/processed/eval"):
     df = pd.read_parquet(path)
     records = []
     for _, row in df.iterrows():
+        prompt = _parse_field(row["prompt"])
+        reward_model = _parse_field(row["reward_model"])
+        extra_info = _parse_field(row.get("extra_info", "{}"))
+        gt = reward_model["ground_truth"] if isinstance(reward_model, dict) else str(reward_model)
         records.append({
             "data_source": row["data_source"],
-            "prompt": json.loads(row["prompt"]),
-            "ground_truth": json.loads(row["reward_model"])["ground_truth"],
-            "extra_info": json.loads(row["extra_info"]),
+            "prompt": prompt,
+            "ground_truth": gt,
+            "extra_info": extra_info if isinstance(extra_info, dict) else {},
         })
     return records
 
@@ -43,25 +61,35 @@ def load_eval_data(dataset_name, data_dir="data/processed/eval"):
 def generate_responses_vllm(
     model_path, prompts, n_samples=1, temperature=0.0,
     max_tokens=2048, top_p=0.95, tensor_parallel_size=1,
+    gpu_memory_utilization=0.9, max_model_len=None,
 ):
     from vllm import LLM, SamplingParams
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
-    llm = LLM(
+    llm_kwargs = dict(
         model=model_path,
         tensor_parallel_size=tensor_parallel_size,
         trust_remote_code=True,
+        gpu_memory_utilization=gpu_memory_utilization,
     )
+    if max_model_len is not None:
+        llm_kwargs["max_model_len"] = max_model_len
+    llm = LLM(**llm_kwargs)
 
     formatted_prompts = []
     for p in prompts:
         text = tokenizer.apply_chat_template(p, tokenize=False, add_generation_prompt=True)
         formatted_prompts.append(text)
 
+    # Greedy only supports n=1; auto-set temperature if n_samples > 1
+    if n_samples > 1 and temperature == 0.0:
+        temperature = 0.7
+        print(f"  [WARN] n_samples={n_samples} requires temperature>0, auto-set to {temperature}")
+
     sampling_params = SamplingParams(
         n=n_samples,
-        temperature=temperature if temperature > 0 else 0.0,
+        temperature=temperature,
         top_p=top_p if temperature > 0 else 1.0,
         max_tokens=max_tokens,
     )
@@ -77,6 +105,7 @@ def generate_responses_vllm(
 def evaluate_dataset(
     model_path, dataset_name, data_dir="data/processed/eval",
     n_samples=1, temperature=0.0, max_tokens=2048, tensor_parallel_size=1,
+    gpu_memory_utilization=0.9, max_model_len=None,
 ):
     from adpo.reward_functions import compute_score
 
@@ -92,10 +121,11 @@ def evaluate_dataset(
         model_path=model_path, prompts=prompts, n_samples=n_samples,
         temperature=temperature, max_tokens=max_tokens,
         tensor_parallel_size=tensor_parallel_size,
+        gpu_memory_utilization=gpu_memory_utilization,
+        max_model_len=max_model_len,
     )
 
     results = []
-    correct = 0
     total = 0
 
     for record, response_list in zip(records, responses):
@@ -109,39 +139,70 @@ def evaluate_dataset(
             )
             scores.append(score)
 
-        best_score = max(scores)
-        avg_score = sum(scores) / len(scores)
-
+        n_correct = sum(1 for s in scores if s > 0.5)
         results.append({
             "data_source": record["data_source"],
             "ground_truth": record["ground_truth"],
             "responses": response_list,
             "scores": scores,
-            "best_score": best_score,
-            "avg_score": avg_score,
+            "n_correct": n_correct,
         })
-
-        if best_score > 0.5:
-            correct += 1
         total += 1
 
-    accuracy = correct / total if total > 0 else 0.0
+    # --- Metrics ---
+    n = n_samples
     metrics = {
         "dataset": dataset_name,
         "num_problems": total,
-        "num_correct": correct,
-        "accuracy": accuracy,
-        "n_samples": n_samples,
+        "n_samples": n,
         "temperature": temperature,
     }
 
-    if n_samples > 1:
-        maj_correct = sum(1 for r in results if r["avg_score"] > 0.5)
-        metrics["maj_accuracy"] = maj_correct / total if total > 0 else 0.0
+    # Pass@1: fraction of problems where at least 1 sample is correct
+    # When n=1, this is standard greedy accuracy
+    pass_at_1_count = sum(1 for r in results if r["n_correct"] > 0)
+    metrics["pass@1"] = pass_at_1_count / total if total > 0 else 0.0
 
-    print(f"  Accuracy: {accuracy:.4f} ({correct}/{total})")
-    if n_samples > 1:
-        print(f"  Maj@{n_samples}: {metrics.get('maj_accuracy', 0):.4f}")
+    # Avg@n: average score across all samples per problem, then mean across problems
+    avg_scores = [sum(r["scores"]) / len(r["scores"]) for r in results]
+    metrics["avg@n"] = sum(avg_scores) / total if total > 0 else 0.0
+
+    if n > 1:
+        # Pass@k (unbiased estimator): E[1 - C(n-c, k) / C(n, k)]
+        # where c = number of correct samples out of n
+        for k in [1, 2, 4, 8, 16, 32, 64]:
+            if k > n:
+                break
+            pass_at_k_sum = 0.0
+            for r in results:
+                c = r["n_correct"]
+                if c >= k:
+                    pass_at_k_sum += 1.0
+                elif n - c < k:
+                    pass_at_k_sum += 1.0
+                else:
+                    # 1 - C(n-c, k) / C(n, k)
+                    pass_at_k_sum += 1.0 - math.comb(n - c, k) / math.comb(n, k)
+            metrics[f"pass@{k}"] = pass_at_k_sum / total if total > 0 else 0.0
+
+        # Maj@n: majority voting — most common answer wins
+        maj_correct = 0
+        for r in results:
+            # Use score > 0.5 as "correct", count majority
+            correct_count = r["n_correct"]
+            if correct_count > n / 2:
+                maj_correct += 1
+        metrics[f"maj@{n}"] = maj_correct / total if total > 0 else 0.0
+
+    # Print results
+    print(f"  Pass@1:  {metrics['pass@1']:.4f} ({pass_at_1_count}/{total})")
+    print(f"  Avg@{n}:  {metrics['avg@n']:.4f}")
+    if n > 1:
+        for k in [1, 2, 4, 8, 16, 32, 64]:
+            if f"pass@{k}" not in metrics:
+                break
+            print(f"  Pass@{k}: {metrics[f'pass@{k}']:.4f}")
+        print(f"  Maj@{n}:  {metrics[f'maj@{n}']:.4f}")
 
     return metrics, results
 
@@ -156,6 +217,8 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max_tokens", type=int, default=2048)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
+    parser.add_argument("--gpu_memory_utilization", type=float, default=0.9)
+    parser.add_argument("--max_model_len", type=int, default=None, help="Override model's max sequence length for vLLM")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -168,6 +231,8 @@ def main():
                 data_dir=args.data_dir, n_samples=args.n_samples,
                 temperature=args.temperature, max_tokens=args.max_tokens,
                 tensor_parallel_size=args.tensor_parallel_size,
+                gpu_memory_utilization=args.gpu_memory_utilization,
+                max_model_len=args.max_model_len,
             )
             all_metrics.append(metrics)
             result_path = os.path.join(args.output_dir, f"{dataset_name}_results.json")
@@ -181,17 +246,25 @@ def main():
     with open(summary_path, "w") as f:
         json.dump(all_metrics, f, indent=2)
 
-    print(f"\n{'='*60}")
+    print(f"\n{'='*70}")
     print("EVALUATION SUMMARY")
-    print(f"{'='*60}")
-    print(f"{'Dataset':<20} {'Accuracy':>10} {'Correct':>10} {'Total':>10}")
-    print("-" * 60)
+    print(f"{'='*70}")
+    header = f"{'Dataset':<20} {'Pass@1':>8} {'Avg@n':>8}"
+    if args.n_samples > 1:
+        header += f" {'Maj@n':>8}"
+    header += f" {'Total':>8}"
+    print(header)
+    print("-" * 70)
     for m in all_metrics:
         if "error" in m:
-            print(f"{m['dataset']:<20} {'ERROR':>10}")
+            print(f"{m['dataset']:<20} {'ERROR':>8}")
         else:
-            print(f"{m['dataset']:<20} {m['accuracy']:>10.4f} "
-                  f"{m['num_correct']:>10} {m['num_problems']:>10}")
+            n = m['n_samples']
+            line = f"{m['dataset']:<20} {m['pass@1']:>8.4f} {m['avg@n']:>8.4f}"
+            if n > 1:
+                line += f" {m.get(f'maj@{n}', 0):>8.4f}"
+            line += f" {m['num_problems']:>8}"
+            print(line)
     print(f"\nResults saved to {args.output_dir}")
 
 

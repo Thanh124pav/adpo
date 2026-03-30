@@ -118,8 +118,8 @@ bash scripts/train_math.sh algorithm.judge_type=vllm algorithm.judge_model=Qwen/
 # Customize phase detection
 bash scripts/train_math.sh algorithm.phase_method=adaptive algorithm.phase_percentile=80.0
 
-# Soft phase assignment (Gaussian blending near boundaries)
-bash scripts/train_math.sh algorithm.phase_sigma=5.0
+# In-phase advantage decreasing (earlier tokens get more credit)
+bash scripts/train_math.sh algorithm.phase_decay_gamma=0.9
 
 # Override model, GPUs, batch size
 NUM_GPUS=4 BATCH_SIZE=64 MODEL=Qwen/Qwen2.5-Math-1.5B bash scripts/train_math.sh
@@ -147,7 +147,7 @@ bash scripts/eval_passn.sh --model_path checkpoints/adpo-qwen7b-math --n 8
 | `algorithm.phase_delta` | 2.0 | Fixed threshold for -log pi (if method=threshold) |
 | `algorithm.phase_min_len` | 10 | Minimum tokens per phase |
 | `algorithm.phase_max_K` | 10 | Maximum phases per response |
-| `algorithm.phase_sigma` | 0.0 | Soft assignment bandwidth (0=hard, >0=Gaussian) |
+| `algorithm.phase_decay_gamma` | 0.0 | In-phase decay factor (0=off, >0=geometric decay) |
 | `algorithm.judge_type` | rule | Judge backend: "rule", "vllm", or "api" |
 | `algorithm.judge_model` | Qwen/Qwen2.5-7B-Instruct | Model for vllm/api judge |
 

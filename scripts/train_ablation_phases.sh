@@ -37,14 +37,14 @@ for delta in 1.0 1.5 2.0 3.0; do
         "$@" || echo "[WARN] delta=$delta failed"
 done
 
-# --- Ablation 3: Soft assignment sigma ---
-echo ">>> Ablation 3: Sigma sweep"
-for sigma in 0.0 5.0 10.0 20.0; do
-    echo "--- sigma=$sigma ---"
-    EXPERIMENT="adpo-ablation-sigma${sigma}" EPOCHS="$EPOCHS" \
+# --- Ablation 3: In-phase decay gamma ---
+echo ">>> Ablation 3: Decay gamma sweep"
+for gamma in 0.0 0.8 0.9 0.95; do
+    echo "--- decay_gamma=$gamma ---"
+    EXPERIMENT="adpo-ablation-decay${gamma}" EPOCHS="$EPOCHS" \
         bash scripts/train_math.sh \
-        algorithm.phase_sigma="$sigma" \
-        "$@" || echo "[WARN] sigma=$sigma failed"
+        algorithm.phase_decay_gamma="$gamma" \
+        "$@" || echo "[WARN] decay_gamma=$gamma failed"
 done
 
 # --- Ablation 4: Judge type (if GPU available) ---

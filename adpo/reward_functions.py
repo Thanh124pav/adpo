@@ -70,34 +70,130 @@ def normalize_numeric(value: str) -> Optional[float]:
 
 
 def normalize_answer(answer: str) -> str:
-    """Normalize a LaTeX/text answer for comparison."""
+    """Normalize a LaTeX/text answer for comparison.
+
+    Handles common LaTeX variants that are mathematically identical:
+    - \\dfrac, \\tfrac, \\cfrac → \\frac
+    - \\left, \\right, \\big, \\Big, etc. → removed
+    - \\text{...}, \\mathrm{...}, \\textbf{...} → content only
+    - Spacing: \\, \\; \\: \\! \\quad → removed
+    - Whitespace inside tuples/intervals: (2, 12) → (2,12)
+    """
     if answer is None:
         return ""
     answer = answer.strip()
+    # Remove dollar signs
     answer = answer.replace(r"\$", "").replace("$", "")
+    # Normalize fraction commands
+    answer = answer.replace(r"\dfrac", r"\frac")
+    answer = answer.replace(r"\tfrac", r"\frac")
+    answer = answer.replace(r"\cfrac", r"\frac")
+    # Remove sizing delimiters
+    for cmd in [r"\left", r"\right", r"\big", r"\Big", r"\bigg", r"\Bigg",
+                r"\bigl", r"\bigr", r"\Bigl", r"\Bigr"]:
+        answer = answer.replace(cmd, "")
+    # Remove text wrappers: \text{...}, \mathrm{...}, \textbf{...}, \operatorname{...}
+    answer = re.sub(r'\\(?:text|mathrm|textbf|textit|operatorname)\s*\{([^}]*)\}', r'\1', answer)
+    # Normalize \% → %
     answer = answer.replace(r"\%", "%")
-    answer = answer.replace(r"\text{", "").rstrip("}")
-    answer = answer.replace(r"\mathrm{", "").rstrip("}")
-    answer = answer.replace(r"\,", "").replace(r"\!", "")
-    answer = answer.replace(r"\left", "").replace(r"\right", "")
+    # Remove spacing commands
+    for cmd in [r"\,", r"\;", r"\:", r"\!", r"\quad", r"\qquad", r"\ "]:
+        answer = answer.replace(cmd, "")
+    # Remove \cdot → *
     answer = answer.replace(r"\cdot", "*")
-    return answer.strip()
+    # Normalize ×, · to *
+    answer = answer.replace("×", "*").replace("·", "*")
+    # Normalize \sqrt without braces: \sqrt2 → \sqrt{2}, \sqrtx → \sqrt{x}
+    # But don't touch \sqrt{...} which already has braces
+    answer = re.sub(r'\\sqrt(?!\{)(\w)', r'\\sqrt{\1}', answer)
+    # Remove all whitespace (handles "(2, 12)" vs "(2,12)")
+    answer = re.sub(r'\s+', '', answer)
+    return answer
+
+
+def _extract_rhs(expr: str) -> Optional[str]:
+    """Extract right-hand side from equations like 'x=5', 'n = 42', 'y=\\frac{1}{2}'.
+
+    Returns None if not an equation or has multiple '=' signs (system of equations).
+    """
+    if '=' not in expr:
+        return None
+    # Don't split on \neq, \leq, \geq, ==
+    clean = expr.replace(r'\neq', '≠').replace(r'\leq', '≤').replace(r'\geq', '≥').replace('==', '≡')
+    if '=' not in clean:
+        return None
+    parts = clean.split('=')
+    if len(parts) != 2:
+        return None
+    lhs = parts[0].strip()
+    rhs = parts[1].strip()
+    # LHS should be short (variable name like x, n, y, etc.)
+    # Restore original chars in rhs
+    rhs_original = expr.split('=', 1)[1].strip()
+    if len(lhs) <= 10:
+        return rhs_original
+    return None
 
 
 def is_equiv(pred: str, target: str, tol: float = 1e-5) -> bool:
-    """Check if two answers are mathematically equivalent."""
+    """Check if two answers are mathematically equivalent.
+
+    Comparison pipeline:
+    1. Exact string match after LaTeX normalization
+    2. Numeric comparison (handles fractions, percentages)
+    2b. Comma-separated set comparison with order-invariance (1,-2 vs -2,1)
+    3. Equation RHS extraction (x=5 vs 5)
+    4. Structural comparison (strip outer \\boxed, re-normalize)
+    """
     if pred is None or target is None:
         return False
     pred_norm = normalize_answer(pred)
     target_norm = normalize_answer(target)
+    # 1. Exact string match after normalization
     if pred_norm == target_norm:
         return True
+    # 2. Numeric comparison
     pred_num = normalize_numeric(pred_norm)
     target_num = normalize_numeric(target_norm)
     if pred_num is not None and target_num is not None:
         if abs(target_num) < tol:
             return abs(pred_num - target_num) < tol
         return abs(pred_num - target_num) / max(abs(target_num), 1e-10) < tol
+    # 2b. Comma-separated values: sort and compare element-wise
+    # Handles "1,-2" vs "-2,1" and "\frac{1}{2},3" vs "3,\frac{1}{2}"
+    if ',' in pred_norm and ',' in target_norm:
+        pred_parts = sorted(normalize_answer(p) for p in pred_norm.split(','))
+        target_parts = sorted(normalize_answer(p) for p in target_norm.split(','))
+        if len(pred_parts) == len(target_parts) and len(pred_parts) > 1:
+            if all(_elem_equiv(p, t, tol) for p, t in zip(pred_parts, target_parts)):
+                return True
+    # 3. Equation RHS: "x=5" vs "5", or "5" vs "x=5"
+    pred_rhs = _extract_rhs(pred_norm)
+    target_rhs = _extract_rhs(target_norm)
+    if target_rhs is not None:
+        if is_equiv(pred, target_rhs, tol):
+            return True
+    if pred_rhs is not None:
+        if is_equiv(pred_rhs, target, tol):
+            return True
+    # 4. Try stripping outer \boxed{} from both and re-compare
+    pred_inner = extract_boxed_answer(pred_norm)
+    target_inner = extract_boxed_answer(target_norm)
+    if pred_inner is not None and target_inner is not None:
+        return normalize_answer(pred_inner) == normalize_answer(target_inner)
+    return False
+
+
+def _elem_equiv(a: str, b: str, tol: float = 1e-5) -> bool:
+    """Compare two individual elements (used in set comparison)."""
+    if a == b:
+        return True
+    a_num = normalize_numeric(a)
+    b_num = normalize_numeric(b)
+    if a_num is not None and b_num is not None:
+        if abs(b_num) < tol:
+            return abs(a_num - b_num) < tol
+        return abs(a_num - b_num) / max(abs(b_num), 1e-10) < tol
     return False
 
 
