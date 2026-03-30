@@ -1065,17 +1065,255 @@ def _reconstruct_attention_for_sample(model, sample: dict, layer_idx: int):
     return attn.cpu().numpy()  # (num_heads, response_len, response_len)
 
 
+def _normalize_attention_for_viz(matrix: np.ndarray) -> np.ndarray:
+    """Normalize attention matrix to enhance visual contrast.
+
+    Uses percentile-based normalization: maps [p2, p98] to [0, 1],
+    then clips. This makes the color variation much more visible
+    even when most values are near zero (typical for attention).
+    """
+    if matrix.size == 0:
+        return matrix
+    flat = matrix.flatten()
+    # Remove exact zeros from percentile computation (causal mask creates many)
+    nonzero = flat[flat > 0]
+    if len(nonzero) == 0:
+        return matrix
+    vmin = np.percentile(nonzero, 2)
+    vmax = np.percentile(nonzero, 98)
+    if vmax <= vmin:
+        vmax = vmin + 1e-8
+    normed = (matrix - vmin) / (vmax - vmin)
+    return np.clip(normed, 0.0, 1.0)
+
+
+def _render_attention_heatmap_html(
+    matrix: np.ndarray,
+    row_tokens: list,
+    col_tokens: list,
+    title: str,
+    output_path: str,
+    cmap_name: str = "Blues",
+):
+    """Render an attention heatmap as a fully interactive HTML file.
+
+    Every token is shown on both axes. Cells are colored by attention weight
+    with enhanced contrast (percentile normalization). Supports zoom/scroll
+    for large matrices. Hover shows exact value.
+    """
+    n_rows, n_cols = matrix.shape
+
+    # Normalize for color mapping
+    normed = _normalize_attention_for_viz(matrix)
+
+    # Generate color for each cell
+    # Blues-like: 0 → white (255,255,255), 1 → dark blue (8,48,107)
+    if "Orange" in cmap_name:
+        def val_to_rgb(v):
+            r = 255
+            g = int(255 - v * 190)
+            b = int(255 - v * 225)
+            return f"rgb({r},{g},{b})"
+    else:
+        def val_to_rgb(v):
+            r = int(255 - v * 247)
+            g = int(255 - v * 207)
+            b = int(255 - v * 148)
+            return f"rgb({r},{g},{b})"
+
+    # Compute cell size: at least 20px, scale with token count
+    cell_size = max(20, min(40, 800 // max(n_rows, n_cols, 1)))
+
+    # Escape token strings for HTML
+    def esc(s):
+        return html_lib.escape(str(s)).replace(" ", "&nbsp;")
+
+    html_parts = []
+    html_parts.append(f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>{html_lib.escape(title)}</title>
+<style>
+body {{ font-family: monospace; margin: 20px; background: #fafafa; }}
+h1 {{ font-size: 18px; color: #2c3e50; }}
+.info {{ font-size: 13px; color: #555; margin-bottom: 10px; }}
+.heatmap-wrap {{
+    overflow: auto;
+    max-width: 95vw;
+    max-height: 90vh;
+    border: 1px solid #ccc;
+    position: relative;
+}}
+table {{
+    border-collapse: collapse;
+    font-size: 10px;
+}}
+td, th {{
+    width: {cell_size}px;
+    min-width: {cell_size}px;
+    max-width: {cell_size}px;
+    height: {cell_size}px;
+    text-align: center;
+    padding: 0;
+    border: 1px solid rgba(200,200,200,0.3);
+    overflow: hidden;
+}}
+th {{
+    background: #f8f8f8;
+    position: sticky;
+    z-index: 2;
+    font-weight: normal;
+    font-size: 9px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: {cell_size}px;
+    padding: 2px;
+}}
+th.col-header {{
+    top: 0;
+    writing-mode: vertical-rl;
+    text-orientation: mixed;
+    height: 80px;
+    max-height: 80px;
+    vertical-align: bottom;
+}}
+th.row-header {{
+    left: 0;
+    text-align: right;
+    padding-right: 4px;
+    max-width: 120px;
+    width: 120px;
+    min-width: 120px;
+}}
+th.corner {{
+    top: 0; left: 0; z-index: 3;
+    background: #f0f0f0;
+    width: 120px; min-width: 120px;
+    height: 80px;
+}}
+td:hover {{
+    outline: 2px solid #333;
+    z-index: 1;
+}}
+.tooltip {{
+    display: none;
+    position: fixed;
+    background: rgba(0,0,0,0.85);
+    color: #fff;
+    padding: 6px 10px;
+    border-radius: 4px;
+    font-size: 12px;
+    pointer-events: none;
+    z-index: 999;
+    white-space: pre;
+}}
+.legend {{
+    margin: 10px 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+}}
+.legend-bar {{
+    width: 200px;
+    height: 16px;
+    border-radius: 3px;
+    border: 1px solid #ccc;
+}}
+</style>
+</head>
+<body>
+<h1>{html_lib.escape(title)}</h1>
+<div class="info">
+  Matrix size: {n_rows} (query) &times; {n_cols} (key) &nbsp;|&nbsp;
+  Raw value range: [{matrix.min():.6f}, {matrix.max():.6f}] &nbsp;|&nbsp;
+  Non-zero cells: {np.count_nonzero(matrix)}/{matrix.size}
+</div>
+""")
+
+    # Legend
+    if "Orange" in cmap_name:
+        grad = "linear-gradient(to right, rgb(255,255,255), rgb(255,65,30))"
+    else:
+        grad = "linear-gradient(to right, rgb(255,255,255), rgb(8,48,107))"
+    html_parts.append(f"""<div class="legend">
+  <span>Low attention</span>
+  <div class="legend-bar" style="background: {grad}"></div>
+  <span>High attention</span>
+  <span style="color:#888">(percentile-normalized for contrast)</span>
+</div>
+""")
+
+    html_parts.append('<div class="heatmap-wrap">\n<table>\n')
+
+    # Header row with column tokens
+    html_parts.append('<tr><th class="corner">Query \\ Key</th>')
+    for j, tok in enumerate(col_tokens):
+        html_parts.append(f'<th class="col-header" title="col {j}: {esc(tok)}">{esc(tok)}</th>')
+    html_parts.append('</tr>\n')
+
+    # Data rows
+    for i in range(n_rows):
+        html_parts.append(f'<tr><th class="row-header" title="row {i}: {esc(row_tokens[i])}">{esc(row_tokens[i])}</th>')
+        for j in range(n_cols):
+            raw_val = matrix[i, j]
+            norm_val = normed[i, j]
+            color = val_to_rgb(float(norm_val))
+            html_parts.append(
+                f'<td style="background:{color}" '
+                f'data-r="{i}" data-c="{j}" data-v="{raw_val:.6f}">'
+                f'</td>'
+            )
+        html_parts.append('</tr>\n')
+
+    html_parts.append('</table>\n</div>\n')
+
+    # Tooltip + hover script
+    html_parts.append("""
+<div class="tooltip" id="tooltip"></div>
+<script>
+const tip = document.getElementById('tooltip');
+document.querySelector('.heatmap-wrap').addEventListener('mousemove', function(e) {
+    const td = e.target.closest('td[data-v]');
+    if (td) {
+        const r = td.dataset.r, c = td.dataset.c, v = td.dataset.v;
+        const rt = document.querySelectorAll('th.row-header')[r];
+        const ct = document.querySelectorAll('th.col-header')[c];
+        const rn = rt ? rt.textContent : r;
+        const cn = ct ? ct.textContent : c;
+        tip.innerHTML = `Query[${r}]: ${rn}\\nKey[${c}]: ${cn}\\nAttention: ${v}`;
+        tip.style.display = 'block';
+        tip.style.left = (e.clientX + 14) + 'px';
+        tip.style.top = (e.clientY + 14) + 'px';
+    } else {
+        tip.style.display = 'none';
+    }
+});
+document.querySelector('.heatmap-wrap').addEventListener('mouseleave', function() {
+    tip.style.display = 'none';
+});
+</script>
+</body></html>""")
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("".join(html_parts))
+
+
 def generate_attention_heatmaps(model_path: str, internals_dir: str,
                                 output_dir: str, max_samples: int = 50,
                                 attn_impl: str = "eager"):
-    """Generate per-token and per-sentence attention heatmap PNGs.
+    """Generate attention heatmaps as interactive HTML files + PNG fallbacks.
 
     Reconstructs attention matrices from hidden states + model weights.
-    No pre-computed attention matrices needed.
+    All tokens are shown on axes (no truncation). Color is percentile-
+    normalized to ensure visible contrast even with sparse attention.
     """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize
     import torch
     from transformers import AutoModelForCausalLM
 
@@ -1122,33 +1360,48 @@ def generate_attention_heatmaps(model_path: str, internals_dir: str,
         # Average across heads → (response_len, response_len)
         attn_avg = attn_full.mean(axis=0).astype(np.float32)
 
-        max_ticks = 80
+        # Debug: report value stats for diagnostics
+        nonzero_vals = attn_avg[attn_avg > 0]
+        if len(nonzero_vals) > 0:
+            print(f"    sample {sample_idx}: attn nonzero={len(nonzero_vals)}/{attn_avg.size}, "
+                  f"range=[{nonzero_vals.min():.6f}, {nonzero_vals.max():.6f}], "
+                  f"median={np.median(nonzero_vals):.6f}")
+        else:
+            print(f"    sample {sample_idx}: WARNING attn all zeros!")
 
-        # --- Token-level heatmaps ---
+        # --- Token-level heatmaps (HTML + PNG) ---
 
         # Think→Think sub-matrix
         if think_boundary is not None and think_len > 0:
             tt = attn_avg[:think_boundary, :think_boundary]
             think_tokens = tokens[:think_boundary]
+            title = (f"Think→Think Attention (sample {sample_idx}, "
+                     f"layer {viz_layer}, head avg, {len(think_tokens)} tokens)")
 
-            fig_w = max(8, min(30, len(think_tokens) * 0.3))
-            fig_h = max(6, min(25, len(think_tokens) * 0.25))
+            # HTML (primary — always full detail)
+            _render_attention_heatmap_html(
+                tt, think_tokens, think_tokens, title,
+                os.path.join(attn_dir, f"sample_{sample_idx:03d}_think_think.html"),
+                cmap_name="Blues",
+            )
 
+            # PNG (with percentile normalization + all tokens shown)
+            normed_tt = _normalize_attention_for_viz(tt)
+            fig_w = max(10, len(think_tokens) * 0.35)
+            fig_h = max(8, len(think_tokens) * 0.30)
             fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-            im = ax.imshow(tt, aspect="auto", cmap="Blues")
-            ax.set_title(f"Think→Think Attention (sample {sample_idx}, "
-                         f"layer {viz_layer}, head avg)")
+            im = ax.imshow(normed_tt, aspect="auto", cmap="Blues", vmin=0, vmax=1)
+            ax.set_title(title, fontsize=10)
             ax.set_xlabel("Key (thinking tokens)")
             ax.set_ylabel("Query (thinking tokens)")
-            if len(think_tokens) <= max_ticks:
-                ax.set_xticks(range(len(think_tokens)))
-                ax.set_xticklabels(think_tokens, rotation=90, fontsize=5)
-                ax.set_yticks(range(len(think_tokens)))
-                ax.set_yticklabels(think_tokens, fontsize=5)
-            plt.colorbar(im, ax=ax, shrink=0.8)
+            ax.set_xticks(range(len(think_tokens)))
+            ax.set_xticklabels(think_tokens, rotation=90, fontsize=max(4, min(7, 500 // len(think_tokens))))
+            ax.set_yticks(range(len(think_tokens)))
+            ax.set_yticklabels(think_tokens, fontsize=max(4, min(7, 500 // len(think_tokens))))
+            plt.colorbar(im, ax=ax, shrink=0.8, label="attention (normalized)")
             plt.tight_layout()
             plt.savefig(os.path.join(attn_dir, f"sample_{sample_idx:03d}_think_think_tokens.png"),
-                        dpi=150)
+                        dpi=150, bbox_inches="tight")
             plt.close()
 
         # Output→Think sub-matrix
@@ -1156,26 +1409,33 @@ def generate_attention_heatmaps(model_path: str, internals_dir: str,
             ot = attn_avg[think_boundary:, :think_boundary]
             think_tokens = tokens[:think_boundary]
             out_tokens = tokens[think_boundary:]
+            title = (f"Output→Think Attention (sample {sample_idx}, "
+                     f"layer {viz_layer}, head avg, {len(out_tokens)}x{len(think_tokens)})")
 
-            fig_w = max(8, min(30, len(think_tokens) * 0.3))
-            fig_h = max(6, min(20, len(out_tokens) * 0.3))
+            # HTML
+            _render_attention_heatmap_html(
+                ot, out_tokens, think_tokens, title,
+                os.path.join(attn_dir, f"sample_{sample_idx:03d}_out_think.html"),
+                cmap_name="Oranges",
+            )
 
+            # PNG
+            normed_ot = _normalize_attention_for_viz(ot)
+            fig_w = max(10, len(think_tokens) * 0.35)
+            fig_h = max(6, len(out_tokens) * 0.35)
             fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-            im = ax.imshow(ot, aspect="auto", cmap="Oranges")
-            ax.set_title(f"Output→Think Attention (sample {sample_idx}, "
-                         f"layer {viz_layer}, head avg)")
+            im = ax.imshow(normed_ot, aspect="auto", cmap="Oranges", vmin=0, vmax=1)
+            ax.set_title(title, fontsize=10)
             ax.set_xlabel("Key (thinking tokens)")
             ax.set_ylabel("Query (output tokens)")
-            if len(think_tokens) <= max_ticks:
-                ax.set_xticks(range(len(think_tokens)))
-                ax.set_xticklabels(think_tokens, rotation=90, fontsize=5)
-            if len(out_tokens) <= max_ticks:
-                ax.set_yticks(range(len(out_tokens)))
-                ax.set_yticklabels(out_tokens, fontsize=5)
-            plt.colorbar(im, ax=ax, shrink=0.8)
+            ax.set_xticks(range(len(think_tokens)))
+            ax.set_xticklabels(think_tokens, rotation=90, fontsize=max(4, min(7, 500 // len(think_tokens))))
+            ax.set_yticks(range(len(out_tokens)))
+            ax.set_yticklabels(out_tokens, fontsize=max(4, min(7, 500 // len(out_tokens))))
+            plt.colorbar(im, ax=ax, shrink=0.8, label="attention (normalized)")
             plt.tight_layout()
             plt.savefig(os.path.join(attn_dir, f"sample_{sample_idx:03d}_out_think_tokens.png"),
-                        dpi=150)
+                        dpi=150, bbox_inches="tight")
             plt.close()
 
         # --- Sentence-level heatmaps ---
@@ -1190,18 +1450,28 @@ def generate_attention_heatmaps(model_path: str, internals_dir: str,
         sent_attn = _compute_sentence_attention(attn_avg, segments,
                                                 row_offset=0, col_offset=0)
 
-        fig_size = max(6, min(20, len(segments) * 0.5))
+        # HTML
+        _render_attention_heatmap_html(
+            sent_attn, labels, labels,
+            f"Sentence-level Attention (sample {sample_idx}, layer {viz_layer})",
+            os.path.join(attn_dir, f"sample_{sample_idx:03d}_sentences.html"),
+            cmap_name="Blues",
+        )
+
+        # PNG
+        normed_sent = _normalize_attention_for_viz(sent_attn)
+        fig_size = max(8, len(segments) * 0.6)
         fig, ax = plt.subplots(figsize=(fig_size, fig_size))
-        im = ax.imshow(sent_attn, aspect="auto", cmap="Blues")
+        im = ax.imshow(normed_sent, aspect="auto", cmap="Blues", vmin=0, vmax=1)
         ax.set_title(f"Sentence-level Attention (sample {sample_idx}, layer {viz_layer})")
         ax.set_xticks(range(len(labels)))
-        ax.set_xticklabels(labels, rotation=90, fontsize=6)
+        ax.set_xticklabels(labels, rotation=90, fontsize=7)
         ax.set_yticks(range(len(labels)))
-        ax.set_yticklabels(labels, fontsize=6)
-        plt.colorbar(im, ax=ax, shrink=0.8)
+        ax.set_yticklabels(labels, fontsize=7)
+        plt.colorbar(im, ax=ax, shrink=0.8, label="attention (normalized)")
         plt.tight_layout()
         plt.savefig(os.path.join(attn_dir, f"sample_{sample_idx:03d}_sentences.png"),
-                    dpi=150)
+                    dpi=150, bbox_inches="tight")
         plt.close()
 
         if (sample_idx + 1) % 10 == 0:
@@ -1291,10 +1561,13 @@ def main():
 
     print(f"\nAll outputs saved to {args.output_dir}/")
     print("Files generated:")
-    for fname in sorted(os.listdir(args.output_dir)):
-        fpath = os.path.join(args.output_dir, fname)
-        size_kb = os.path.getsize(fpath) / 1024
-        print(f"  {fname} ({size_kb:.1f} KB)")
+    for root, dirs, files in os.walk(args.output_dir):
+        rel = os.path.relpath(root, args.output_dir)
+        for fname in sorted(files):
+            fpath = os.path.join(root, fname)
+            size_kb = os.path.getsize(fpath) / 1024
+            display = fname if rel == "." else os.path.join(rel, fname)
+            print(f"  {display} ({size_kb:.1f} KB)")
 
 
 if __name__ == "__main__":
