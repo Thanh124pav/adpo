@@ -858,10 +858,10 @@ def _assign_with_decay(
     """In-phase advantage decreasing: earlier tokens get more credit.
 
     For each phase with advantage A and T tokens:
-        c       = A / (2 * sqrt(T))       (constant baseline per token)
-        a'_1    = A * (1 - gamma) * sqrt(T) / gamma  (initial decay value)
-        a_i     = c + a'_i          (token i gets baseline + decayed part)
-        a'_{i+1}= a'_i * gamma      (geometric decay)
+        c       = A / 3                  (constant baseline per token)
+        a'_1    = A / 2                  (initial decay value)
+        a_i     = c + a'_i              (token i gets baseline + decayed part)
+        a'_{i+1}= a'_i * gamma          (geometric decay)
     """
     batch_size, seq_len = phase_ids.shape
     device = phase_ids.device
@@ -883,8 +883,8 @@ def _assign_with_decay(
                 continue
 
             A = phase_advantages[b, k].item()
-            c = A / (2.0 * math.sqrt(T))
-            a_prime = A * math.sqrt(T) * (1 - gamma) / gamma  # a'_1
+            c = A / 3.0
+            a_prime = A / 2.0  # a'_1
             for i in range(T):
                 token_advantages[b, start + i] = c + a_prime
                 a_prime *= gamma
