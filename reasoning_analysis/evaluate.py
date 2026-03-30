@@ -431,6 +431,7 @@ def extract_attention_hidden_states(
         model_path,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
+        attn_implementation="eager",
         device_map=device,
     )
     model.eval()
