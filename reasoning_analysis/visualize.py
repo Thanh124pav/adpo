@@ -536,33 +536,55 @@ HTML_HEADER = """<!DOCTYPE html>
         margin-bottom: 10px;
     }}
     .token-container {{
-        line-height: 3.2em;
-        word-wrap: break-word;
+        display: flex;
+        align-items: flex-end;
+        flex-wrap: wrap;
+        gap: 1px;
+        padding-top: 10px;
+        min-height: 80px;
+    }}
+    .line-break {{
+        flex-basis: 100%;
+        height: 0;
+    }}
+    .paragraph-break {{
+        flex-basis: 100%;
+        height: 12px;
     }}
     .token {{
-        display: inline-block;
-        position: relative;
-        padding: 0 1px;
-        margin: 0;
+        display: inline-flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: flex-end;
         cursor: pointer;
-        border-bottom: 2px solid transparent;
+        min-width: 6px;
+        position: relative;
     }}
     .token:hover {{
-        background: #f0f0f0;
-        border-radius: 3px;
+        outline: 1px solid #333;
+        border-radius: 2px;
+    }}
+    .token .bar {{
+        width: 100%;
+        min-width: 6px;
+        border-radius: 2px 2px 0 0;
     }}
     .token .annotation {{
-        position: absolute;
-        top: -1.6em;
-        left: 50%;
-        transform: translateX(-50%);
-        font-size: 0.55em;
+        font-size: 0.5em;
         font-weight: bold;
         white-space: nowrap;
         pointer-events: none;
+        margin-bottom: 1px;
     }}
     .token .token-text {{
         white-space: pre;
+        font-size: 0.7em;
+        max-width: 40px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        text-align: center;
+        border-top: 1px solid #ddd;
+        padding-top: 2px;
     }}
     .legend {{
         margin: 20px 0;
@@ -653,19 +675,36 @@ def value_to_color(value: float, vmin: float, vmax: float, metric: str = "neg_lo
 
 
 def render_tokens_html(tokens: list, metric_key: str, vmin: float, vmax: float) -> str:
-    """Render tokens with color-coded annotations above each token."""
+    """Render tokens as colored bars with height proportional to value."""
+    max_bar_height = 80  # px
     parts = []
     for t in tokens:
         value = t[metric_key]
         color = value_to_color(value, vmin, vmax, metric_key)
-        token_text = html_lib.escape(t["token"]).replace("\n", "&#10;↵")
+        raw_token = t["token"]
+        token_text = html_lib.escape(raw_token).replace("\n", "&#10;↵")
         annotation = f"{value:.2f}"
+
+        # Compute bar height proportional to value
+        if vmax <= vmin:
+            norm = 0.5
+        else:
+            norm = (value - vmin) / (vmax - vmin)
+        norm = max(0.05, min(1.0, norm))  # min 5% height so bar is always visible
+        bar_height = int(norm * max_bar_height)
+
         parts.append(
             f'<span class="token" title="{metric_key}={value:.4f}, pos={t["position"]}">'
             f'<span class="annotation" style="color:{color}">{annotation}</span>'
+            f'<span class="bar" style="height:{bar_height}px;background:{color}"></span>'
             f'<span class="token-text">{token_text}</span>'
             f'</span>'
         )
+        # Insert line/paragraph breaks for newline tokens
+        if "\n\n" in raw_token:
+            parts.append('<div class="paragraph-break"></div>')
+        elif "\n" in raw_token:
+            parts.append('<div class="line-break"></div>')
     return "".join(parts)
 
 
@@ -687,10 +726,17 @@ def get_prompt_text(prompt) -> str:
 # ---------------------------------------------------------------------------
 
 
-def generate_neg_log_prob_html(results: list, output_path: str):
+def generate_neg_log_prob_html(results: list, output_path: str, max_samples: int = 50):
     """Generate HTML with -log_prob annotation above each token."""
+    # Sample to keep HTML lightweight
+    import random
+    if len(results) > max_samples:
+        sampled = random.sample(results, max_samples)
+    else:
+        sampled = results
+
     # Compute global min/max for color scaling
-    all_vals = [t["neg_log_prob"] for r in results for t in r["tokens"]]
+    all_vals = [t["neg_log_prob"] for r in sampled for t in r["tokens"]]
     if not all_vals:
         print("  No tokens found, skipping HTML generation.")
         return
@@ -714,7 +760,8 @@ def generate_neg_log_prob_html(results: list, output_path: str):
         f.write('<table class="summary-table">\n')
         f.write('<tr><th>Metric</th><th>Value</th></tr>\n')
         f.write(f'<tr><td>Total Responses</td><td>{len(results)}</td></tr>\n')
-        f.write(f'<tr><td>Total Tokens</td><td>{len(all_vals)}</td></tr>\n')
+        f.write(f'<tr><td>Sampled Responses</td><td>{len(sampled)}</td></tr>\n')
+        f.write(f'<tr><td>Total Tokens (sampled)</td><td>{len(all_vals)}</td></tr>\n')
         f.write(f'<tr><td>Mean -log_prob</td><td>{np.mean(all_vals):.4f}</td></tr>\n')
         f.write(f'<tr><td>Std -log_prob</td><td>{np.std(all_vals):.4f}</td></tr>\n')
         f.write(f'<tr><td>Median -log_prob</td><td>{np.median(all_vals):.4f}</td></tr>\n')
@@ -722,12 +769,12 @@ def generate_neg_log_prob_html(results: list, output_path: str):
 
         # Navigation
         f.write('<div class="nav"><strong>Jump to:</strong> ')
-        for i in range(len(results)):
+        for i in range(len(sampled)):
             f.write(f'<a href="#resp-{i}">#{i}</a> ')
         f.write('</div>\n')
 
         # Each response
-        for i, r in enumerate(results):
+        for i, r in enumerate(sampled):
             f.write(f'<div class="response-container" id="resp-{i}">\n')
             f.write(f'<div class="response-header">Response #{i} '
                     f'(prompt_idx={r["prompt_idx"]}, sample_idx={r["sample_idx"]}, '
@@ -756,7 +803,7 @@ def generate_neg_log_prob_html(results: list, output_path: str):
 
         f.write(HTML_FOOTER)
 
-    print(f"  Saved -log_prob HTML: {output_path}")
+    print(f"  Saved -log_prob HTML ({len(sampled)}/{len(results)} samples): {output_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -764,9 +811,16 @@ def generate_neg_log_prob_html(results: list, output_path: str):
 # ---------------------------------------------------------------------------
 
 
-def generate_entropy_html(results: list, output_path: str):
+def generate_entropy_html(results: list, output_path: str, max_samples: int = 50):
     """Generate HTML with entropy annotation above each token."""
-    all_vals = [t["entropy"] for r in results for t in r["tokens"]]
+    # Sample to keep HTML lightweight
+    import random
+    if len(results) > max_samples:
+        sampled = random.sample(results, max_samples)
+    else:
+        sampled = results
+
+    all_vals = [t["entropy"] for r in sampled for t in r["tokens"]]
     if not all_vals:
         print("  No tokens found, skipping HTML generation.")
         return
@@ -790,7 +844,8 @@ def generate_entropy_html(results: list, output_path: str):
         f.write('<table class="summary-table">\n')
         f.write('<tr><th>Metric</th><th>Value</th></tr>\n')
         f.write(f'<tr><td>Total Responses</td><td>{len(results)}</td></tr>\n')
-        f.write(f'<tr><td>Total Tokens</td><td>{len(all_vals)}</td></tr>\n')
+        f.write(f'<tr><td>Sampled Responses</td><td>{len(sampled)}</td></tr>\n')
+        f.write(f'<tr><td>Total Tokens (sampled)</td><td>{len(all_vals)}</td></tr>\n')
         f.write(f'<tr><td>Mean Entropy</td><td>{np.mean(all_vals):.4f}</td></tr>\n')
         f.write(f'<tr><td>Std Entropy</td><td>{np.std(all_vals):.4f}</td></tr>\n')
         f.write(f'<tr><td>Median Entropy</td><td>{np.median(all_vals):.4f}</td></tr>\n')
@@ -798,12 +853,12 @@ def generate_entropy_html(results: list, output_path: str):
 
         # Navigation
         f.write('<div class="nav"><strong>Jump to:</strong> ')
-        for i in range(len(results)):
+        for i in range(len(sampled)):
             f.write(f'<a href="#resp-{i}">#{i}</a> ')
         f.write('</div>\n')
 
         # Each response
-        for i, r in enumerate(results):
+        for i, r in enumerate(sampled):
             f.write(f'<div class="response-container" id="resp-{i}">\n')
             f.write(f'<div class="response-header">Response #{i} '
                     f'(prompt_idx={r["prompt_idx"]}, sample_idx={r["sample_idx"]}, '
@@ -829,7 +884,284 @@ def generate_entropy_html(results: list, output_path: str):
 
         f.write(HTML_FOOTER)
 
-    print(f"  Saved entropy HTML: {output_path}")
+    print(f"  Saved entropy HTML ({len(sampled)}/{len(results)} samples): {output_path}")
+
+
+# ---------------------------------------------------------------------------
+# Attention Heatmap Visualization
+# ---------------------------------------------------------------------------
+
+
+def _load_npz_samples(internals_dir: str, max_samples: int = 50) -> list:
+    """Load .npz attention files, randomly sampling up to max_samples."""
+    import glob as glob_mod
+    import random
+
+    npz_files = sorted(glob_mod.glob(os.path.join(internals_dir, "response_*.npz")))
+    if not npz_files:
+        print(f"  No .npz files found in {internals_dir}")
+        return []
+
+    if len(npz_files) > max_samples:
+        npz_files = random.sample(npz_files, max_samples)
+        npz_files.sort()
+
+    samples = []
+    for path in npz_files:
+        data = np.load(path, allow_pickle=True)
+        meta = json.loads(str(data["metadata"]))
+        tokens = list(data["tokens"])
+
+        attn_tt = data["attn_think_think"] if "attn_think_think" in data else None
+        attn_ot = data["attn_out_think"] if "attn_out_think" in data else None
+
+        samples.append({
+            "path": path,
+            "meta": meta,
+            "tokens": tokens,
+            "attn_think_think": attn_tt,
+            "attn_out_think": attn_ot,
+        })
+    return samples
+
+
+def _segment_into_sentences(tokens: list, boundary: int) -> list:
+    """Split token list into sentence-like segments by `. `, `\\n\\n`, `?`, `!`.
+
+    Returns list of dicts: {"label": str, "start": int, "end": int, "section": str}
+    where start/end are token indices (exclusive end).
+    """
+    import re
+
+    # Build full text with token boundaries
+    segments = []
+    current_start = 0
+    accumulated = ""
+
+    for i, tok in enumerate(tokens):
+        accumulated += tok
+        # Check if this token ends a sentence
+        is_boundary = False
+        if "\n\n" in tok:
+            is_boundary = True
+        elif re.search(r'[.?!]\s*$', accumulated):
+            is_boundary = True
+        elif re.search(r'[.?!]$', tok):
+            is_boundary = True
+
+        if is_boundary and i > current_start:
+            section = "thinking" if current_start < boundary else "output"
+            if current_start < boundary <= i + 1:
+                # Sentence spans boundary — split it
+                if current_start < boundary:
+                    segments.append({
+                        "start": current_start,
+                        "end": boundary,
+                        "section": "thinking",
+                    })
+                if boundary < i + 1:
+                    segments.append({
+                        "start": boundary,
+                        "end": i + 1,
+                        "section": "output",
+                    })
+            else:
+                segments.append({
+                    "start": current_start,
+                    "end": i + 1,
+                    "section": section,
+                })
+            current_start = i + 1
+            accumulated = ""
+
+    # Remaining tokens
+    if current_start < len(tokens):
+        section = "thinking" if current_start < boundary else "output"
+        segments.append({
+            "start": current_start,
+            "end": len(tokens),
+            "section": section,
+        })
+
+    # Create short labels
+    for idx, seg in enumerate(segments):
+        seg_tokens = tokens[seg["start"]:seg["end"]]
+        text = "".join(seg_tokens).strip()
+        if len(text) > 30:
+            text = text[:27] + "..."
+        seg["label"] = f"S{idx}[{seg['section'][0].upper()}]: {text}"
+
+    return segments
+
+
+def _compute_sentence_attention(attn_matrix: np.ndarray, segments: list,
+                                row_offset: int, col_offset: int) -> np.ndarray:
+    """Compute sentence-level attention from token-level attention matrix.
+
+    attn_matrix: (rows, cols) token-level attention (already head-averaged).
+    segments: list of sentence segments with start/end indices.
+    row_offset, col_offset: global token offsets for rows and cols.
+
+    Returns: (n_segments_row, n_segments_col) matrix.
+    """
+    n = len(segments)
+    sent_attn = np.zeros((n, n))
+
+    for i, seg_i in enumerate(segments):
+        ri_start = seg_i["start"] - row_offset
+        ri_end = seg_i["end"] - row_offset
+        # Clip to valid range
+        ri_start = max(0, ri_start)
+        ri_end = min(attn_matrix.shape[0], ri_end)
+        if ri_start >= ri_end:
+            continue
+
+        for j, seg_j in enumerate(segments):
+            cj_start = seg_j["start"] - col_offset
+            cj_end = seg_j["end"] - col_offset
+            cj_start = max(0, cj_start)
+            cj_end = min(attn_matrix.shape[1], cj_end)
+            if cj_start >= cj_end:
+                continue
+
+            block = attn_matrix[ri_start:ri_end, cj_start:cj_end]
+            sent_attn[i, j] = block.mean()
+
+    return sent_attn
+
+
+def generate_attention_heatmaps(internals_dir: str, output_dir: str,
+                                max_samples: int = 50):
+    """Generate per-token and per-sentence attention heatmap PNGs."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LogNorm
+
+    samples = _load_npz_samples(internals_dir, max_samples)
+    if not samples:
+        return
+
+    attn_dir = os.path.join(output_dir, "attention_heatmaps")
+    os.makedirs(attn_dir, exist_ok=True)
+
+    for sample_idx, sample in enumerate(samples):
+        meta = sample["meta"]
+        tokens = sample["tokens"]
+        think_boundary = meta["think_boundary"]
+        layers_saved = meta.get("attn_layers_saved", [])
+
+        attn_tt = sample["attn_think_think"]  # (layers, heads, think, think)
+        attn_ot = sample["attn_out_think"]    # (layers, heads, out, think)
+
+        if attn_tt is None and attn_ot is None:
+            continue
+
+        # Use last saved layer, average across heads
+        # --- Token-level heatmaps ---
+
+        if attn_tt is not None:
+            # Last layer, mean over heads → (think_len, think_len)
+            tt = attn_tt[-1].mean(axis=0).astype(np.float32)
+            think_tokens = tokens[:think_boundary]
+
+            # Truncate labels if too many tokens
+            max_ticks = 80
+            fig_w = max(8, min(30, len(think_tokens) * 0.3))
+            fig_h = max(6, min(25, len(think_tokens) * 0.25))
+
+            fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+            im = ax.imshow(tt, aspect="auto", cmap="Blues")
+            ax.set_title(f"Think→Think Attention (sample {sample_idx}, "
+                         f"layer {layers_saved[-1] if layers_saved else '?'}, "
+                         f"head avg)")
+            ax.set_xlabel("Key (thinking tokens)")
+            ax.set_ylabel("Query (thinking tokens)")
+            if len(think_tokens) <= max_ticks:
+                ax.set_xticks(range(len(think_tokens)))
+                ax.set_xticklabels(think_tokens, rotation=90, fontsize=5)
+                ax.set_yticks(range(len(think_tokens)))
+                ax.set_yticklabels(think_tokens, fontsize=5)
+            plt.colorbar(im, ax=ax, shrink=0.8)
+            plt.tight_layout()
+            plt.savefig(os.path.join(attn_dir, f"sample_{sample_idx:03d}_think_think_tokens.png"),
+                        dpi=150)
+            plt.close()
+
+        if attn_ot is not None:
+            ot = attn_ot[-1].mean(axis=0).astype(np.float32)
+            think_tokens = tokens[:think_boundary]
+            out_tokens = tokens[think_boundary:]
+
+            fig_w = max(8, min(30, len(think_tokens) * 0.3))
+            fig_h = max(6, min(20, len(out_tokens) * 0.3))
+
+            fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+            im = ax.imshow(ot, aspect="auto", cmap="Oranges")
+            ax.set_title(f"Output→Think Attention (sample {sample_idx}, "
+                         f"layer {layers_saved[-1] if layers_saved else '?'}, "
+                         f"head avg)")
+            ax.set_xlabel("Key (thinking tokens)")
+            ax.set_ylabel("Query (output tokens)")
+            if len(think_tokens) <= max_ticks:
+                ax.set_xticks(range(len(think_tokens)))
+                ax.set_xticklabels(think_tokens, rotation=90, fontsize=5)
+            if len(out_tokens) <= max_ticks:
+                ax.set_yticks(range(len(out_tokens)))
+                ax.set_yticklabels(out_tokens, fontsize=5)
+            plt.colorbar(im, ax=ax, shrink=0.8)
+            plt.tight_layout()
+            plt.savefig(os.path.join(attn_dir, f"sample_{sample_idx:03d}_out_think_tokens.png"),
+                        dpi=150)
+            plt.close()
+
+        # --- Sentence-level heatmaps ---
+        segments = _segment_into_sentences(tokens, think_boundary)
+        if len(segments) < 2:
+            continue
+
+        labels = [s["label"] for s in segments]
+
+        if attn_tt is not None:
+            tt = attn_tt[-1].mean(axis=0).astype(np.float32)
+            sent_attn = _compute_sentence_attention(tt, segments,
+                                                    row_offset=0, col_offset=0)
+
+            fig_size = max(6, min(20, len(segments) * 0.5))
+            fig, ax = plt.subplots(figsize=(fig_size, fig_size))
+            im = ax.imshow(sent_attn, aspect="auto", cmap="Blues")
+            ax.set_title(f"Sentence-level Think→Think (sample {sample_idx})")
+            ax.set_xticks(range(len(labels)))
+            ax.set_xticklabels(labels, rotation=90, fontsize=6)
+            ax.set_yticks(range(len(labels)))
+            ax.set_yticklabels(labels, fontsize=6)
+            plt.colorbar(im, ax=ax, shrink=0.8)
+            plt.tight_layout()
+            plt.savefig(os.path.join(attn_dir, f"sample_{sample_idx:03d}_think_think_sentences.png"),
+                        dpi=150)
+            plt.close()
+
+        if attn_ot is not None:
+            ot = attn_ot[-1].mean(axis=0).astype(np.float32)
+            sent_attn = _compute_sentence_attention(ot, segments,
+                                                    row_offset=think_boundary,
+                                                    col_offset=0)
+
+            fig_size = max(6, min(20, len(segments) * 0.5))
+            fig, ax = plt.subplots(figsize=(fig_size, fig_size))
+            im = ax.imshow(sent_attn, aspect="auto", cmap="Oranges")
+            ax.set_title(f"Sentence-level Output→Think (sample {sample_idx})")
+            ax.set_xticks(range(len(labels)))
+            ax.set_xticklabels(labels, rotation=90, fontsize=6)
+            ax.set_yticks(range(len(labels)))
+            ax.set_yticklabels(labels, fontsize=6)
+            plt.colorbar(im, ax=ax, shrink=0.8)
+            plt.tight_layout()
+            plt.savefig(os.path.join(attn_dir, f"sample_{sample_idx:03d}_out_think_sentences.png"),
+                        dpi=150)
+            plt.close()
+
+    print(f"  Saved attention heatmaps ({len(samples)} samples) to {attn_dir}/")
 
 
 # ---------------------------------------------------------------------------
@@ -845,6 +1177,9 @@ def main():
                         help="Output directory for plots and HTML files")
     parser.add_argument("--no_plots", action="store_true",
                         help="Skip generating statistical plots (useful if matplotlib not available)")
+    parser.add_argument("--internals_dir", type=str, default=None,
+                        help="Directory containing .npz files from attention extraction "
+                             "(e.g. reasoning_analysis/outputs/internals)")
     args = parser.parse_args()
 
     print(f"Loading results from {args.input_path} ...")
@@ -879,6 +1214,14 @@ def main():
 
     print("Generating entropy HTML ...")
     generate_entropy_html(results, os.path.join(args.output_dir, "entropy.html"))
+
+    # Generate attention heatmaps if internals_dir provided
+    if args.internals_dir:
+        print("Generating attention heatmaps ...")
+        try:
+            generate_attention_heatmaps(args.internals_dir, args.output_dir)
+        except ImportError as e:
+            print(f"  WARNING: Attention heatmaps skipped ({e})")
 
     print(f"\nAll outputs saved to {args.output_dir}/")
     print("Files generated:")
