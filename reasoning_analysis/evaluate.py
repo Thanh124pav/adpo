@@ -289,12 +289,13 @@ def compute_exact_entropy_forward_pass(
         prompt = prompts[prompt_idx]
 
         # Build the full sequence: prompt + response
-        if isinstance(prompt, list):
+        if isinstance(prompt, (list, np.ndarray)):
             prompt_text = tokenizer.apply_chat_template(
-                prompt, tokenize=False, add_generation_prompt=True
+                list(prompt) if isinstance(prompt, np.ndarray) else prompt,
+                tokenize=False, add_generation_prompt=True,
             )
         else:
-            prompt_text = prompt
+            prompt_text = str(prompt)
 
         # Tokenize prompt to know where response starts
         prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
