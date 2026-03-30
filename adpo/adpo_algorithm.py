@@ -806,14 +806,8 @@ def compute_phase_advantages(
     )
     # global_stds: (batch,) -- sigma^global per response (same within a group)
 
-    # Adaptive lambda = sigma^global / (sigma^global + sigma_i^local + eps)
-    # Both are (batch,), broadcast to (batch, max_K) via unsqueeze
-    lam = global_stds / (global_stds + local_stds + eps)  # (batch,)
-    lam = lam.unsqueeze(1).expand_as(phase_rewards)       # (batch, max_K)
-
-    # Adaptive weighted mean
-    phase_advantages = lam * local_adv + (1 - lam) * global_adv
-    phase_advantages = phase_advantages * phase_mask
+    # Phase advantage = local + global (additive, not weighted)
+    phase_advantages = (local_adv + global_adv) * phase_mask
 
     return phase_advantages
 
