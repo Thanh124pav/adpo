@@ -8,9 +8,20 @@ The key insight: attention weights are computed from hidden states via
 
 So given the hidden state INPUT to a layer + the layer's weights,
 we can reconstruct the exact attention matrix without a full forward pass.
+
+Architecture differences handled:
+    - GQA (num_kv_heads < num_heads): Qwen2.5, Qwen3, Llama3
+    - QK-Norm (q_norm, k_norm):       Qwen3 only
+    - RoPE (rotary position embed):   All (standard rotate-half)
+    - rotary_emb location:            self_attn or model level
+    - scaling attribute:              Optional per-architecture
+    - Sliding window attention:       Qwen2.5 (some variants)
+    - rotary_emb API:                 Old (seq_len) and new (position_ids)
+    - head_dim override:              DeepSeek / some Qwen configs
 """
 
 import math
+import inspect
 
 import torch
 import torch.nn.functional as F
@@ -27,17 +38,32 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    """Apply rotary position embeddings to Q and K."""
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
+def apply_rotary_pos_emb(q, k, cos, sin):
+    """Apply rotary position embeddings to Q and K.
+
+    Handles varying cos/sin shapes from different transformers versions:
+        - (batch, seq, head_dim)     → unsqueeze(1) for head dim
+        - (1, 1, seq, head_dim)      → already broadcast-ready
+        - (seq, head_dim)            → unsqueeze(0).unsqueeze(0)
+    """
+    # Ensure cos/sin have shape (batch, 1, seq, head_dim) for broadcasting
+    # with Q/K shape (batch, num_heads, seq, head_dim)
+    while cos.dim() < q.dim():
+        cos = cos.unsqueeze(0 if cos.dim() == 0 else 1)
+        sin = sin.unsqueeze(0 if sin.dim() == 0 else 1)
+
+    # If cos has shape (batch, seq, head_dim), insert head dim
+    if cos.dim() == q.dim() - 1:
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
 
 # ---------------------------------------------------------------------------
-# Core reconstruction
+# Architecture-aware helpers
 # ---------------------------------------------------------------------------
 
 def get_rotary_emb(model, attn_module):
@@ -51,6 +77,48 @@ def get_rotary_emb(model, attn_module):
         "This architecture may not be supported."
     )
 
+
+def call_rotary_emb(rotary_emb_module, x, position_ids, seq_len):
+    """Call rotary_emb with the correct API (old or new transformers).
+
+    Old API (transformers < 4.38): rotary_emb(x, seq_len=seq_len)
+    New API (transformers >= 4.38): rotary_emb(x, position_ids)
+    """
+    sig = inspect.signature(rotary_emb_module.forward)
+    params = list(sig.parameters.keys())
+
+    if "position_ids" in params:
+        return rotary_emb_module(x, position_ids)
+    elif "seq_len" in params:
+        return rotary_emb_module(x, seq_len=seq_len)
+    else:
+        # Try new API first, fall back to old
+        try:
+            return rotary_emb_module(x, position_ids)
+        except TypeError:
+            return rotary_emb_module(x, seq_len=seq_len)
+
+
+def get_head_dim(config):
+    """Get head_dim, handling explicit head_dim configs (DeepSeek, some Qwen)."""
+    if hasattr(config, "head_dim") and config.head_dim is not None:
+        return config.head_dim
+    return config.hidden_size // config.num_attention_heads
+
+
+def get_sliding_window(config):
+    """Get sliding window size if configured, else None."""
+    sw = getattr(config, "sliding_window", None)
+    if sw is not None and sw > 0:
+        return sw
+    # Some models store it differently
+    sw = getattr(config, "max_window_layers", None)
+    return None  # max_window_layers is layer count, not window size
+
+
+# ---------------------------------------------------------------------------
+# Core reconstruction
+# ---------------------------------------------------------------------------
 
 def reconstruct_attention(
     model,
@@ -77,7 +145,7 @@ def reconstruct_attention(
 
     num_heads = config.num_attention_heads
     num_kv_heads = getattr(config, "num_key_value_heads", num_heads)
-    head_dim = config.hidden_size // num_heads
+    head_dim = get_head_dim(config)
 
     seq_len = hidden_state.shape[1]
     device = hidden_state.device
@@ -90,6 +158,7 @@ def reconstruct_attention(
     h = layer.input_layernorm(hidden_state)
 
     # Step 2: Q, K linear projection
+    # Works for both with/without bias (handled by nn.Linear)
     Q = attn.q_proj(h)  # (1, seq, num_heads * head_dim)
     K = attn.k_proj(h)  # (1, seq, num_kv_heads * head_dim)
 
@@ -104,8 +173,8 @@ def reconstruct_attention(
         K = attn.k_norm(K)
 
     # Step 5: RoPE — rotate Q and K based on position
-    rotary_emb = get_rotary_emb(model, attn)
-    cos, sin = rotary_emb(K, position_ids)
+    rotary_emb_module = get_rotary_emb(model, attn)
+    cos, sin = call_rotary_emb(rotary_emb_module, K, position_ids, seq_len)
     Q, K = apply_rotary_pos_emb(Q, K, cos, sin)
 
     # Step 6: GQA — repeat KV heads to match Q heads
@@ -121,11 +190,29 @@ def reconstruct_attention(
 
     attn_weights = torch.matmul(Q, K.transpose(-2, -1)) * scale
 
-    # Step 8: Causal mask (lower triangular)
+    # Step 8: Causal mask + optional sliding window
     causal_mask = torch.triu(
         torch.full((seq_len, seq_len), float("-inf"), device=device, dtype=dtype),
         diagonal=1,
     )
+
+    # Sliding window: some Qwen2.5 variants use it for certain layers
+    sliding_window = get_sliding_window(config)
+    # max_window_layers: only layers below this index use sliding window (Qwen2.5)
+    max_window_layers = getattr(config, "max_window_layers", None)
+    use_sliding = (
+        sliding_window is not None
+        and max_window_layers is not None
+        and layer_idx < max_window_layers
+    )
+    if use_sliding:
+        # Mask out positions beyond sliding window
+        window_mask = torch.tril(
+            torch.full((seq_len, seq_len), float("-inf"), device=device, dtype=dtype),
+            diagonal=-(sliding_window + 1),
+        )
+        causal_mask = causal_mask + window_mask
+
     attn_weights = attn_weights + causal_mask
 
     # Step 9: Softmax (in float32 for numerical stability)

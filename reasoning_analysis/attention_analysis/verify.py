@@ -21,7 +21,7 @@ import torch
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from attention_analysis.reconstruct import reconstruct_attention
+from attention_analysis.reconstruct import reconstruct_attention, get_head_dim
 
 
 # ---------------------------------------------------------------------------
@@ -122,12 +122,26 @@ def verify_model(model_path: str, num_samples: int, device: str = "auto"):
     num_heads = config.num_attention_heads
     num_kv_heads = getattr(config, "num_key_value_heads", num_heads)
 
+    head_dim = get_head_dim(config)
+    sliding_window = getattr(config, "sliding_window", None)
+    max_window_layers = getattr(config, "max_window_layers", None)
+
     print(f"  Architecture: {config.model_type}")
     print(f"  Layers: {n_layers}, Heads: {num_heads}, KV Heads: {num_kv_heads}")
-    print(f"  Hidden dim: {config.hidden_size}, Head dim: {config.hidden_size // num_heads}")
+    print(f"  Hidden dim: {config.hidden_size}, Head dim: {head_dim}")
     has_qk_norm = hasattr(model.model.layers[0].self_attn, "q_norm") and \
                   model.model.layers[0].self_attn.q_norm is not None
     print(f"  QK-Norm: {has_qk_norm}")
+    print(f"  Sliding window: {sliding_window} (max_window_layers={max_window_layers})")
+    has_scaling = hasattr(model.model.layers[0].self_attn, "scaling")
+    print(f"  attn.scaling attr: {has_scaling}")
+    # Check rotary_emb location
+    if hasattr(model.model.layers[0].self_attn, "rotary_emb"):
+        print(f"  rotary_emb: on self_attn")
+    elif hasattr(model.model, "rotary_emb"):
+        print(f"  rotary_emb: on model.model")
+    else:
+        print(f"  rotary_emb: NOT FOUND (may fail)")
     print()
 
     # Prepare test inputs
