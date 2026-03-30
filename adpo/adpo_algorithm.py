@@ -14,6 +14,7 @@ phase-level credit assignment.
 
 import torch
 import re
+import math
 import numpy as np
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
@@ -684,10 +685,7 @@ def compute_local_advantages(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute LOCAL advantages: phase k vs other phases within the SAME response.
 
-    A_{i,k}^local = r_{i,k} - mean(r_{i,1}, ..., r_{i,K})
-
-    This tells us: "Is phase k better or worse than the average phase
-    in this response?"
+    A_{i,k}^local = (r_{i,k} - mean(r_{i,*})) / (std(r_{i,*}) + eps)
 
     Returns:
         local_advantages: (batch, max_K)
@@ -695,18 +693,16 @@ def compute_local_advantages(
     """
     batch_size, max_K = phase_rewards.shape
 
-    # Mean reward per response (only over existing phases)
-    phase_count = phase_mask.sum(dim=1).clamp(min=1)  # (batch,)
-    mean_per_response = (phase_rewards * phase_mask).sum(dim=1) / phase_count  # (batch,)
+    phase_count = phase_mask.sum(dim=1).clamp(min=1)
+    mean_per_response = (phase_rewards * phase_mask).sum(dim=1) / phase_count
 
-    # Local advantage: r_{i,k} - mean_k(r_{i,k})
-    local_advantages = (phase_rewards - mean_per_response.unsqueeze(1)) * phase_mask
-
-    # Std per response (for adaptive lambda)
-    # sigma_i^local = std of phase rewards within response i
     sq_diff = ((phase_rewards - mean_per_response.unsqueeze(1)) ** 2) * phase_mask
     variance = sq_diff.sum(dim=1) / phase_count.clamp(min=1)
-    local_stds = torch.sqrt(variance + eps)  # (batch,)
+    local_stds = torch.sqrt(variance + eps)
+
+    # Normalize by std
+    local_advantages = ((phase_rewards - mean_per_response.unsqueeze(1))
+                        / (local_stds.unsqueeze(1) + eps)) * phase_mask
 
     return local_advantages, local_stds
 
@@ -721,13 +717,7 @@ def compute_global_advantages(
 
     Uses the MEAN of phase rewards as overall response score:
         score_i = mean(r_{i,1}, ..., r_{i,K})
-        A_{i,k}^global = score_i - mean_j(score_j)
-
-    This tells us: "Is this response overall better or worse than the
-    group average?" Applied uniformly to all phases.
-
-    NOTE: Does NOT divide by std (Dr.GRPO style) to avoid the
-    small-std amplification problem.
+        A_{i,k}^global = (score_i - mean_j(score_j)) / (std_j(score_j) + eps)
 
     Returns:
         global_advantages: (batch, max_K) -- same value per phase within a response.
@@ -736,13 +726,10 @@ def compute_global_advantages(
     batch_size, max_K = phase_rewards.shape
     device = phase_rewards.device
 
-    # Response-level score = mean of phase rewards
     phase_count = phase_mask.sum(dim=1).clamp(min=1)
-    response_scores = (phase_rewards * phase_mask).sum(dim=1) / phase_count  # (batch,)
+    response_scores = (phase_rewards * phase_mask).sum(dim=1) / phase_count
 
     global_advantages = torch.zeros_like(phase_rewards)
-    # sigma^global: std of response scores across G generations (one scalar per group)
-    # We store per-sample so each response knows its group's std
     global_stds = torch.zeros(batch_size, device=device)
 
     unique_indices = torch.unique(index)
@@ -753,12 +740,9 @@ def compute_global_advantages(
         group_mean = group_scores.mean()
         group_std = group_scores.std() if group_scores.numel() > 1 else torch.tensor(0.0, device=device)
 
-        # A_global = score_i - mean(scores) (Dr.GRPO: no division by std)
-        adv = group_scores - group_mean
-        # Broadcast same global advantage to all phases
+        # Normalize by std
+        adv = (group_scores - group_mean) / (group_std + eps)
         global_advantages[group_mask] = adv.unsqueeze(1) * phase_mask[group_mask]
-
-        # sigma^global = std of response scores in this group
         global_stds[group_mask] = group_std
 
     return global_advantages, global_stds
@@ -805,14 +789,8 @@ def compute_phase_advantages(
     )
     # global_stds: (batch,) -- sigma^global per response (same within a group)
 
-    # Adaptive lambda = sigma^global / (sigma^global + sigma_i^local + eps)
-    # Both are (batch,), broadcast to (batch, max_K) via unsqueeze
-    lam = global_stds / (global_stds + local_stds + eps)  # (batch,)
-    lam = lam.unsqueeze(1).expand_as(phase_rewards)       # (batch, max_K)
-
-    # Adaptive weighted mean
-    phase_advantages = lam * local_adv + (1 - lam) * global_adv
-    phase_advantages = phase_advantages * phase_mask
+    # Phase advantage = local + global (additive, not weighted)
+    phase_advantages = (local_adv + global_adv) * phase_mask
 
     return phase_advantages
 
@@ -863,10 +841,10 @@ def _assign_with_decay(
     """In-phase advantage decreasing: earlier tokens get more credit.
 
     For each phase with advantage A and T tokens:
-        c       = A / (2 * T)       (constant baseline per token)
-        a'_1    = A * (1 - gamma) * T / (9 * gamma)  (initial decay value)
-        a_i     = c + a'_i          (token i gets baseline + decayed part)
-        a'_{i+1}= a'_i * gamma      (geometric decay)
+        c       = A / 3                  (constant baseline per token)
+        a'_1    = A / 2                  (initial decay value)
+        a_i     = c + a'_i              (token i gets baseline + decayed part)
+        a'_{i+1}= a'_i * gamma          (geometric decay)
     """
     batch_size, seq_len = phase_ids.shape
     device = phase_ids.device
@@ -888,8 +866,8 @@ def _assign_with_decay(
                 continue
 
             A = phase_advantages[b, k].item()
-            c = A / (2.0 * T)
-            a_prime = A * (1 - gamma) * T / (9 * gamma)  # a'_1
+            c = A / 3.0
+            a_prime = A / 2.0  # a'_1
             for i in range(T):
                 token_advantages[b, start + i] = c + a_prime
                 a_prime *= gamma
