@@ -289,12 +289,13 @@ def compute_exact_entropy_forward_pass(
         prompt = prompts[prompt_idx]
 
         # Build the full sequence: prompt + response
-        if isinstance(prompt, list):
+        if isinstance(prompt, (list, np.ndarray)):
             prompt_text = tokenizer.apply_chat_template(
-                prompt, tokenize=False, add_generation_prompt=True
+                list(prompt) if isinstance(prompt, np.ndarray) else prompt,
+                tokenize=False, add_generation_prompt=True,
             )
         else:
-            prompt_text = prompt
+            prompt_text = str(prompt)
 
         # Tokenize prompt to know where response starts
         prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
@@ -430,12 +431,20 @@ def extract_attention_hidden_states(
         model_path,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
+        attn_implementation="eager",
         device_map=device,
     )
     model.eval()
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+
+    # Default: only save the last half of layers (saves time + memory)
+    if layers is None:
+        n_total_layers = model.config.num_hidden_layers
+        layers = list(range(n_total_layers // 2, n_total_layers))
+        print(f"  Saving attention for last {len(layers)}/{n_total_layers} layers: "
+              f"[{layers[0]}..{layers[-1]}]")
 
     os.makedirs(output_dir, exist_ok=True)
 
