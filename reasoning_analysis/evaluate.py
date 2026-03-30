@@ -402,15 +402,12 @@ def extract_attention_hidden_states(
     prompts: list,
     output_dir: str,
     device: str = "auto",
-    layers: list | None = None,
+    attn_impl: str = "flash_attention_2",
 ):
-    """Extract attention sub-matrices and hidden states via forward pass.
+    """Extract hidden states via forward pass.
 
-    For attention: extracts only thinking→thinking and output→thinking
-    sub-matrices per head per layer, discarding output→output.
-    Boundary is detected by the </think> token.
-
-    For hidden states: saves all layers at response token positions.
+    Attention matrices are NOT saved — they will be reconstructed
+    from hidden states + model weights at visualization time.
 
     Saves one .npz file per response in output_dir.
 
@@ -420,31 +417,25 @@ def extract_attention_hidden_states(
         prompts: Original prompts (chat format or string).
         output_dir: Directory to save .npz files.
         device: Device for model.
-        layers: List of layer indices to save attention for.
-                None = all layers.
+        attn_impl: Attention implementation ('flash_attention_2' or 'eager').
+                   flash_attention_2 is default and faster since we only need
+                   hidden states, not attention weights.
     """
     from transformers import AutoTokenizer, AutoModelForCausalLM
 
-    print("Loading model for attention & hidden states extraction ...")
+    print(f"Loading model for hidden states extraction (attn={attn_impl}) ...")
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
-        attn_implementation="eager",
+        attn_implementation=attn_impl,
         device_map=device,
     )
     model.eval()
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-
-    # Default: only save the last half of layers (saves time + memory)
-    if layers is None:
-        n_total_layers = model.config.num_hidden_layers
-        layers = list(range(n_total_layers // 2, n_total_layers))
-        print(f"  Saving attention for last {len(layers)}/{n_total_layers} layers: "
-              f"[{layers[0]}..{layers[-1]}]")
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -471,11 +462,11 @@ def extract_attention_hidden_states(
         full_ids = prompt_ids + gen_token_ids
         input_ids = torch.tensor([full_ids], dtype=torch.long).to(model.device)
 
-        # Forward pass with attention + hidden states
+        # Forward pass — only need hidden states (no attention needed)
         with torch.no_grad():
             outputs = model(
                 input_ids,
-                output_attentions=True,
+                output_attentions=False,
                 output_hidden_states=True,
             )
 
@@ -486,47 +477,15 @@ def extract_attention_hidden_states(
         gen_end = len(full_ids)
 
         if think_boundary is not None:
-            think_start_abs = gen_start
-            think_end_abs = gen_start + think_boundary
-            out_start_abs = think_end_abs
-            out_end_abs = gen_end
+            think_len = think_boundary
+            out_len = (gen_end - gen_start) - think_boundary
         else:
-            # No </think> found — entire response is "output", no thinking phase
-            think_start_abs = gen_start
-            think_end_abs = gen_start
-            out_start_abs = gen_start
-            out_end_abs = gen_end
-
-        think_len = think_end_abs - think_start_abs
-        out_len = out_end_abs - out_start_abs
-
-        # --- Extract attention sub-matrices ---
-        n_layers = len(outputs.attentions)
-        layer_indices = layers if layers is not None else list(range(n_layers))
-
-        attn_think_think_list = []
-        attn_out_think_list = []
-
-        for layer_idx in layer_indices:
-            # Shape: (1, num_heads, seq_len, seq_len)
-            attn = outputs.attentions[layer_idx][0]  # (num_heads, seq, seq)
-
-            if think_len > 0:
-                # thinking tokens attending to thinking tokens
-                # (num_heads, think_len, think_len)
-                tt = attn[:, think_start_abs:think_end_abs,
-                          think_start_abs:think_end_abs]
-                attn_think_think_list.append(tt.cpu().to(torch.float16).numpy())
-
-            if out_len > 0 and think_len > 0:
-                # output tokens attending to thinking tokens
-                # (num_heads, out_len, think_len)
-                ot = attn[:, out_start_abs:out_end_abs,
-                          think_start_abs:think_end_abs]
-                attn_out_think_list.append(ot.cpu().to(torch.float16).numpy())
+            think_len = 0
+            out_len = gen_end - gen_start
 
         # --- Extract hidden states ---
         # outputs.hidden_states: tuple of (1, seq_len, hidden_dim) per layer + embedding
+        # hidden_states[i] = input to layer i (i=0 is embedding output)
         hidden_list = []
         for layer_idx in range(len(outputs.hidden_states)):
             hs = outputs.hidden_states[layer_idx][0]  # (seq_len, hidden_dim)
@@ -535,17 +494,10 @@ def extract_attention_hidden_states(
             hidden_list.append(hs_response)
 
         # --- Save to .npz ---
-        npz_data = {}
-
-        if attn_think_think_list:
-            # (selected_layers, num_heads, think_len, think_len)
-            npz_data["attn_think_think"] = np.stack(attn_think_think_list)
-        if attn_out_think_list:
-            # (selected_layers, num_heads, out_len, think_len)
-            npz_data["attn_out_think"] = np.stack(attn_out_think_list)
-
-        # (all_layers+1, response_len, hidden_dim) in float16
-        npz_data["hidden_states"] = np.stack(hidden_list)
+        npz_data = {
+            # (all_layers+1, response_len, hidden_dim) in float16
+            "hidden_states": np.stack(hidden_list),
+        }
 
         # Metadata
         metadata = {
@@ -556,9 +508,10 @@ def extract_attention_hidden_states(
             "think_boundary": think_boundary,
             "think_len": think_len,
             "out_len": out_len,
-            "n_model_layers": n_layers,
-            "num_heads": outputs.attentions[0].shape[1],
-            "attn_layers_saved": layer_indices,
+            "n_model_layers": model.config.num_hidden_layers,
+            "num_heads": model.config.num_attention_heads,
+            "num_kv_heads": getattr(model.config, "num_key_value_heads",
+                                     model.config.num_attention_heads),
             "correct": result.get("correct"),
             "score": result.get("score"),
         }
@@ -575,6 +528,9 @@ def extract_attention_hidden_states(
         del outputs
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+        if (i + 1) % 10 == 0 or i == len(results) - 1:
+            print(f"  [{i+1}/{len(results)}] Saved {npz_path}")
 
         size_kb = os.path.getsize(npz_path) / 1024
         print(f"  [{i+1}/{len(results)}] {npz_path} ({size_kb:.0f} KB) "
@@ -795,9 +751,9 @@ def run_analysis(args):
 
     print(f"Saved {len(results)} results to {args.output_path}")
 
-    # Extract attention matrices & hidden states
+    # Extract hidden states (attention reconstructed later from these)
     if args.extract_internals:
-        print("\nExtracting attention matrices & hidden states ...")
+        print("\nExtracting hidden states ...")
         internals_dir = os.path.join(
             os.path.dirname(args.output_path) or ".", "internals"
         )
@@ -808,6 +764,7 @@ def run_analysis(args):
             prompts=prompts,
             output_dir=internals_dir,
             device=args.device,
+            attn_impl=args.attn_impl,
         )
         elapsed3 = time.time() - start_time3
         print(f"Extraction done in {elapsed3:.1f}s")
@@ -867,9 +824,14 @@ def main():
     parser.add_argument("--device", type=str, default="auto",
                         help="Device for HF model in exact_entropy mode (default: auto)")
     parser.add_argument("--extract_internals", action="store_true",
-                        help="Extract attention matrices (thinking→thinking, output→thinking) "
-                             "and hidden states via forward pass. Saves .npz files per response. "
-                             "Boundary between thinking/output detected by </think> token.")
+                        help="Extract hidden states via forward pass. Saves .npz files per response. "
+                             "Attention matrices are reconstructed at visualization time from "
+                             "hidden states + model weights (no need to store them).")
+    parser.add_argument("--attn_impl", type=str, default="flash_attention_2",
+                        choices=["flash_attention_2", "eager"],
+                        help="Attention implementation for hidden states extraction. "
+                             "flash_attention_2 (default) is faster; eager is slower but "
+                             "compatible with all GPUs.")
     args = parser.parse_args()
     run_analysis(args)
 

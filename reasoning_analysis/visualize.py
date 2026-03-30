@@ -893,7 +893,7 @@ def generate_entropy_html(results: list, output_path: str, max_samples: int = 50
 
 
 def _load_npz_samples(internals_dir: str, max_samples: int = 50) -> list:
-    """Load .npz attention files, randomly sampling up to max_samples."""
+    """Load .npz hidden-state files, randomly sampling up to max_samples."""
     import glob as glob_mod
     import random
 
@@ -911,16 +911,13 @@ def _load_npz_samples(internals_dir: str, max_samples: int = 50) -> list:
         data = np.load(path, allow_pickle=True)
         meta = json.loads(str(data["metadata"]))
         tokens = list(data["tokens"])
-
-        attn_tt = data["attn_think_think"] if "attn_think_think" in data else None
-        attn_ot = data["attn_out_think"] if "attn_out_think" in data else None
+        hidden_states = data["hidden_states"]  # (n_layers+1, response_len, hidden_dim)
 
         samples.append({
             "path": path,
             "meta": meta,
             "tokens": tokens,
-            "attn_think_think": attn_tt,
-            "attn_out_think": attn_ot,
+            "hidden_states": hidden_states,
         })
     return samples
 
@@ -1030,17 +1027,76 @@ def _compute_sentence_attention(attn_matrix: np.ndarray, segments: list,
     return sent_attn
 
 
-def generate_attention_heatmaps(internals_dir: str, output_dir: str,
-                                max_samples: int = 50):
-    """Generate per-token and per-sentence attention heatmap PNGs."""
+def _reconstruct_attention_for_sample(model, sample: dict, layer_idx: int):
+    """Reconstruct full-sequence attention for one sample at one layer.
+
+    Uses hidden states stored in the .npz + model weights to reconstruct
+    attention via the reconstruct module (RoPE, GQA, QK-Norm handled).
+
+    Returns: (num_heads, response_len, response_len) attention matrix.
+    """
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from attention_analysis.reconstruct import reconstruct_attention
+    import torch
+
+    meta = sample["meta"]
+    prompt_len = meta["prompt_len"]
+    hidden_states = sample["hidden_states"]  # (n_layers+1, response_len, hidden_dim)
+
+    # hidden_states[layer_idx] = input to layer layer_idx
+    # But we only saved response tokens (from gen_start onward),
+    # so we need to account for prompt_len in position_ids.
+    response_len = hidden_states.shape[1]
+
+    # Build full hidden state: need to pass through model's layer
+    hs = torch.from_numpy(hidden_states[layer_idx]).unsqueeze(0)  # (1, resp_len, hidden)
+    hs = hs.to(dtype=torch.bfloat16, device=next(model.parameters()).device)
+
+    # Position IDs: response tokens start at prompt_len
+    position_ids = torch.arange(
+        prompt_len, prompt_len + response_len,
+        device=hs.device
+    ).unsqueeze(0)
+
+    with torch.no_grad():
+        attn = reconstruct_attention(model, layer_idx, hs, position_ids)
+
+    return attn.cpu().numpy()  # (num_heads, response_len, response_len)
+
+
+def generate_attention_heatmaps(model_path: str, internals_dir: str,
+                                output_dir: str, max_samples: int = 50,
+                                attn_impl: str = "eager"):
+    """Generate per-token and per-sentence attention heatmap PNGs.
+
+    Reconstructs attention matrices from hidden states + model weights.
+    No pre-computed attention matrices needed.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from matplotlib.colors import LogNorm
+    import torch
+    from transformers import AutoModelForCausalLM
 
     samples = _load_npz_samples(internals_dir, max_samples)
     if not samples:
         return
+
+    # Load model (only weights needed, no inference)
+    print(f"  Loading model for attention reconstruction (attn={attn_impl}) ...")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+        attn_implementation=attn_impl,
+        device_map="auto",
+    )
+    model.eval()
+
+    n_layers = model.config.num_hidden_layers
+    # Use last layer for visualization
+    viz_layer = n_layers - 1
 
     attn_dir = os.path.join(output_dir, "attention_heatmaps")
     os.makedirs(attn_dir, exist_ok=True)
@@ -1049,32 +1105,39 @@ def generate_attention_heatmaps(internals_dir: str, output_dir: str,
         meta = sample["meta"]
         tokens = sample["tokens"]
         think_boundary = meta["think_boundary"]
-        layers_saved = meta.get("attn_layers_saved", [])
+        think_len = meta["think_len"]
+        out_len = meta["out_len"]
 
-        attn_tt = sample["attn_think_think"]  # (layers, heads, think, think)
-        attn_ot = sample["attn_out_think"]    # (layers, heads, out, think)
-
-        if attn_tt is None and attn_ot is None:
+        if think_len == 0 and out_len == 0:
             continue
 
-        # Use last saved layer, average across heads
+        # Reconstruct attention from hidden states
+        # (num_heads, response_len, response_len)
+        try:
+            attn_full = _reconstruct_attention_for_sample(model, sample, viz_layer)
+        except Exception as e:
+            print(f"  WARNING: Failed to reconstruct sample {sample_idx}: {e}")
+            continue
+
+        # Average across heads → (response_len, response_len)
+        attn_avg = attn_full.mean(axis=0).astype(np.float32)
+
+        max_ticks = 80
+
         # --- Token-level heatmaps ---
 
-        if attn_tt is not None:
-            # Last layer, mean over heads → (think_len, think_len)
-            tt = attn_tt[-1].mean(axis=0).astype(np.float32)
+        # Think→Think sub-matrix
+        if think_boundary is not None and think_len > 0:
+            tt = attn_avg[:think_boundary, :think_boundary]
             think_tokens = tokens[:think_boundary]
 
-            # Truncate labels if too many tokens
-            max_ticks = 80
             fig_w = max(8, min(30, len(think_tokens) * 0.3))
             fig_h = max(6, min(25, len(think_tokens) * 0.25))
 
             fig, ax = plt.subplots(figsize=(fig_w, fig_h))
             im = ax.imshow(tt, aspect="auto", cmap="Blues")
             ax.set_title(f"Think→Think Attention (sample {sample_idx}, "
-                         f"layer {layers_saved[-1] if layers_saved else '?'}, "
-                         f"head avg)")
+                         f"layer {viz_layer}, head avg)")
             ax.set_xlabel("Key (thinking tokens)")
             ax.set_ylabel("Query (thinking tokens)")
             if len(think_tokens) <= max_ticks:
@@ -1088,8 +1151,9 @@ def generate_attention_heatmaps(internals_dir: str, output_dir: str,
                         dpi=150)
             plt.close()
 
-        if attn_ot is not None:
-            ot = attn_ot[-1].mean(axis=0).astype(np.float32)
+        # Output→Think sub-matrix
+        if think_boundary is not None and think_len > 0 and out_len > 0:
+            ot = attn_avg[think_boundary:, :think_boundary]
             think_tokens = tokens[:think_boundary]
             out_tokens = tokens[think_boundary:]
 
@@ -1099,8 +1163,7 @@ def generate_attention_heatmaps(internals_dir: str, output_dir: str,
             fig, ax = plt.subplots(figsize=(fig_w, fig_h))
             im = ax.imshow(ot, aspect="auto", cmap="Oranges")
             ax.set_title(f"Output→Think Attention (sample {sample_idx}, "
-                         f"layer {layers_saved[-1] if layers_saved else '?'}, "
-                         f"head avg)")
+                         f"layer {viz_layer}, head avg)")
             ax.set_xlabel("Key (thinking tokens)")
             ax.set_ylabel("Query (output tokens)")
             if len(think_tokens) <= max_ticks:
@@ -1116,50 +1179,38 @@ def generate_attention_heatmaps(internals_dir: str, output_dir: str,
             plt.close()
 
         # --- Sentence-level heatmaps ---
-        segments = _segment_into_sentences(tokens, think_boundary)
+        boundary = think_boundary if think_boundary is not None else 0
+        segments = _segment_into_sentences(tokens, boundary)
         if len(segments) < 2:
             continue
 
         labels = [s["label"] for s in segments]
 
-        if attn_tt is not None:
-            tt = attn_tt[-1].mean(axis=0).astype(np.float32)
-            sent_attn = _compute_sentence_attention(tt, segments,
-                                                    row_offset=0, col_offset=0)
+        # Sentence-level from full response attention
+        sent_attn = _compute_sentence_attention(attn_avg, segments,
+                                                row_offset=0, col_offset=0)
 
-            fig_size = max(6, min(20, len(segments) * 0.5))
-            fig, ax = plt.subplots(figsize=(fig_size, fig_size))
-            im = ax.imshow(sent_attn, aspect="auto", cmap="Blues")
-            ax.set_title(f"Sentence-level Think→Think (sample {sample_idx})")
-            ax.set_xticks(range(len(labels)))
-            ax.set_xticklabels(labels, rotation=90, fontsize=6)
-            ax.set_yticks(range(len(labels)))
-            ax.set_yticklabels(labels, fontsize=6)
-            plt.colorbar(im, ax=ax, shrink=0.8)
-            plt.tight_layout()
-            plt.savefig(os.path.join(attn_dir, f"sample_{sample_idx:03d}_think_think_sentences.png"),
-                        dpi=150)
-            plt.close()
+        fig_size = max(6, min(20, len(segments) * 0.5))
+        fig, ax = plt.subplots(figsize=(fig_size, fig_size))
+        im = ax.imshow(sent_attn, aspect="auto", cmap="Blues")
+        ax.set_title(f"Sentence-level Attention (sample {sample_idx}, layer {viz_layer})")
+        ax.set_xticks(range(len(labels)))
+        ax.set_xticklabels(labels, rotation=90, fontsize=6)
+        ax.set_yticks(range(len(labels)))
+        ax.set_yticklabels(labels, fontsize=6)
+        plt.colorbar(im, ax=ax, shrink=0.8)
+        plt.tight_layout()
+        plt.savefig(os.path.join(attn_dir, f"sample_{sample_idx:03d}_sentences.png"),
+                    dpi=150)
+        plt.close()
 
-        if attn_ot is not None:
-            ot = attn_ot[-1].mean(axis=0).astype(np.float32)
-            sent_attn = _compute_sentence_attention(ot, segments,
-                                                    row_offset=think_boundary,
-                                                    col_offset=0)
+        if (sample_idx + 1) % 10 == 0:
+            print(f"    [{sample_idx+1}/{len(samples)}] heatmaps generated")
 
-            fig_size = max(6, min(20, len(segments) * 0.5))
-            fig, ax = plt.subplots(figsize=(fig_size, fig_size))
-            im = ax.imshow(sent_attn, aspect="auto", cmap="Oranges")
-            ax.set_title(f"Sentence-level Output→Think (sample {sample_idx})")
-            ax.set_xticks(range(len(labels)))
-            ax.set_xticklabels(labels, rotation=90, fontsize=6)
-            ax.set_yticks(range(len(labels)))
-            ax.set_yticklabels(labels, fontsize=6)
-            plt.colorbar(im, ax=ax, shrink=0.8)
-            plt.tight_layout()
-            plt.savefig(os.path.join(attn_dir, f"sample_{sample_idx:03d}_out_think_sentences.png"),
-                        dpi=150)
-            plt.close()
+    # Free model
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     print(f"  Saved attention heatmaps ({len(samples)} samples) to {attn_dir}/")
 
@@ -1178,8 +1229,15 @@ def main():
     parser.add_argument("--no_plots", action="store_true",
                         help="Skip generating statistical plots (useful if matplotlib not available)")
     parser.add_argument("--internals_dir", type=str, default=None,
-                        help="Directory containing .npz files from attention extraction "
+                        help="Directory containing .npz files with hidden states "
                              "(e.g. reasoning_analysis/outputs/internals)")
+    parser.add_argument("--model_path", type=str, default=None,
+                        help="Model path for attention reconstruction from hidden states. "
+                             "Required if --internals_dir is provided.")
+    parser.add_argument("--attn_impl", type=str, default="eager",
+                        choices=["flash_attention_2", "eager"],
+                        help="Attention implementation for model loading during "
+                             "reconstruction (default: eager)")
     args = parser.parse_args()
 
     print(f"Loading results from {args.input_path} ...")
@@ -1217,11 +1275,19 @@ def main():
 
     # Generate attention heatmaps if internals_dir provided
     if args.internals_dir:
-        print("Generating attention heatmaps ...")
-        try:
-            generate_attention_heatmaps(args.internals_dir, args.output_dir)
-        except ImportError as e:
-            print(f"  WARNING: Attention heatmaps skipped ({e})")
+        if not args.model_path:
+            print("WARNING: --model_path required for attention heatmaps. Skipping.")
+        else:
+            print("Generating attention heatmaps (reconstructing from hidden states) ...")
+            try:
+                generate_attention_heatmaps(
+                    model_path=args.model_path,
+                    internals_dir=args.internals_dir,
+                    output_dir=args.output_dir,
+                    attn_impl=args.attn_impl,
+                )
+            except ImportError as e:
+                print(f"  WARNING: Attention heatmaps skipped ({e})")
 
     print(f"\nAll outputs saved to {args.output_dir}/")
     print("Files generated:")

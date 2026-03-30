@@ -31,6 +31,7 @@ TOP_LOGPROBS="${TOP_LOGPROBS:-20}"
 TP_SIZE="${TP_SIZE:-1}"                  # tensor_parallel_size for vLLM
 DEVICE="${DEVICE:-auto}"                 # Device for HF forward pass
 EXACT_ENTROPY="${EXACT_ENTROPY:-0}"      # Set 1 to enable exact entropy
+ATTN_IMPL="${ATTN_IMPL:-flash_attention_2}"  # flash_attention_2 (default) or eager
 
 # Derived paths
 ANALYSIS_FILE="$OUTPUT_DIR/analysis.jsonl"
@@ -92,8 +93,9 @@ fi
 # ---------------------------------------------------------------------------
 # Step 1: Inference + log_prob/entropy + attention extraction
 # ---------------------------------------------------------------------------
-echo "=== Step 1: Inference + Attention Extraction ==="
-echo "  This runs vLLM generation, then HF forward pass for attention matrices."
+echo "=== Step 1: Inference + Hidden States Extraction ==="
+echo "  This runs vLLM generation, then HF forward pass for hidden states."
+echo "  (Attention matrices will be reconstructed at visualization time)"
 echo ""
 
 python reasoning_analysis/evaluate.py \
@@ -110,6 +112,7 @@ python reasoning_analysis/evaluate.py \
     --tensor_parallel_size "$TP_SIZE" \
     --device "$DEVICE" \
     --extract_internals \
+    --attn_impl "$ATTN_IMPL" \
     $EXTRA_FLAGS
 
 echo ""
@@ -127,6 +130,8 @@ echo ""
 python reasoning_analysis/visualize.py \
     --input_path "$ANALYSIS_FILE" \
     --internals_dir "$INTERNALS_DIR" \
+    --model_path "$MODEL" \
+    --attn_impl "$ATTN_IMPL" \
     --output_dir "$VIZ_DIR"
 
 # ---------------------------------------------------------------------------
