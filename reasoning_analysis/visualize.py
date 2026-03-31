@@ -1304,7 +1304,7 @@ document.querySelector('.heatmap-wrap').addEventListener('mouseleave', function(
 def generate_attention_heatmaps(model_path: str, internals_dir: str,
                                 output_dir: str, max_samples: int = 50,
                                 attn_impl: str = "eager",
-                                layer: int | None = None):
+                                layers: list[int] | None = None):
     """Generate attention heatmaps as interactive HTML files + PNG fallbacks.
 
     Reconstructs attention matrices from hidden states + model weights.
@@ -1312,12 +1312,13 @@ def generate_attention_heatmaps(model_path: str, internals_dir: str,
     normalized to ensure visible contrast even with sparse attention.
 
     Args:
-        layer: Layer index to visualize (0-based). None = last layer.
+        layers: List of layer indices (0-based) to visualize.
+                None = last layer only.
+                Each layer gets its own subdirectory: attention_heatmaps/layer_XX/
     """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from matplotlib.colors import Normalize
     import torch
     from transformers import AutoModelForCausalLM
 
@@ -1337,163 +1338,181 @@ def generate_attention_heatmaps(model_path: str, internals_dir: str,
     model.eval()
 
     n_layers = model.config.num_hidden_layers
-    if layer is not None:
-        if layer < 0 or layer >= n_layers:
-            print(f"  WARNING: layer {layer} out of range [0, {n_layers-1}], using last layer")
-            viz_layer = n_layers - 1
-        else:
-            viz_layer = layer
+
+    # Resolve layer list
+    if layers is not None and len(layers) > 0:
+        viz_layers = []
+        for l in layers:
+            if l < 0 or l >= n_layers:
+                print(f"  WARNING: layer {l} out of range [0, {n_layers-1}], skipping")
+            else:
+                viz_layers.append(l)
+        if not viz_layers:
+            print(f"  No valid layers specified, using last layer")
+            viz_layers = [n_layers - 1]
     else:
-        viz_layer = n_layers - 1
-    print(f"  Visualizing layer {viz_layer}/{n_layers-1}")
+        viz_layers = [n_layers - 1]
 
-    attn_dir = os.path.join(output_dir, "attention_heatmaps")
-    os.makedirs(attn_dir, exist_ok=True)
+    print(f"  Visualizing {len(viz_layers)} layer(s): {viz_layers} (total: {n_layers})")
 
-    for sample_idx, sample in enumerate(samples):
-        meta = sample["meta"]
-        tokens = sample["tokens"]
-        think_boundary = meta["think_boundary"]
-        think_len = meta["think_len"]
-        out_len = meta["out_len"]
-
-        if think_len == 0 and out_len == 0:
-            continue
-
-        # Reconstruct attention from hidden states
-        # (num_heads, response_len, response_len)
-        try:
-            attn_full = _reconstruct_attention_for_sample(model, sample, viz_layer)
-        except Exception as e:
-            print(f"  WARNING: Failed to reconstruct sample {sample_idx}: {e}")
-            continue
-
-        # Average across heads → (response_len, response_len)
-        attn_avg = attn_full.mean(axis=0).astype(np.float32)
-
-        # Debug: report value stats for diagnostics
-        nonzero_vals = attn_avg[attn_avg > 0]
-        if len(nonzero_vals) > 0:
-            print(f"    sample {sample_idx}: attn nonzero={len(nonzero_vals)}/{attn_avg.size}, "
-                  f"range=[{nonzero_vals.min():.6f}, {nonzero_vals.max():.6f}], "
-                  f"median={np.median(nonzero_vals):.6f}")
+    for viz_layer in viz_layers:
+        # Each layer gets its own subdirectory
+        if len(viz_layers) == 1:
+            attn_dir = os.path.join(output_dir, "attention_heatmaps")
         else:
-            print(f"    sample {sample_idx}: WARNING attn all zeros!")
+            attn_dir = os.path.join(output_dir, "attention_heatmaps", f"layer_{viz_layer:02d}")
+        os.makedirs(attn_dir, exist_ok=True)
 
-        # --- Token-level heatmaps (HTML + PNG) ---
+        print(f"\n  --- Layer {viz_layer}/{n_layers-1} → {attn_dir}/ ---")
 
-        # Think→Think sub-matrix
-        if think_boundary is not None and think_len > 0:
-            tt = attn_avg[:think_boundary, :think_boundary]
-            think_tokens = tokens[:think_boundary]
-            title = (f"Think→Think Attention (sample {sample_idx}, "
-                     f"layer {viz_layer}, head avg, {len(think_tokens)} tokens)")
+        for sample_idx, sample in enumerate(samples):
+            meta = sample["meta"]
+            tokens = sample["tokens"]
+            think_boundary = meta["think_boundary"]
+            think_len = meta["think_len"]
+            out_len = meta["out_len"]
 
-            # HTML (primary — always full detail)
-            _render_attention_heatmap_html(
-                tt, think_tokens, think_tokens, title,
-                os.path.join(attn_dir, f"sample_{sample_idx:03d}_think_think.html"),
-                cmap_name="Blues",
-            )
+            if think_len == 0 and out_len == 0:
+                continue
 
-            # PNG (with percentile normalization + all tokens shown)
-            normed_tt = _normalize_attention_for_viz(tt)
-            fig_w = max(10, len(think_tokens) * 0.35)
-            fig_h = max(8, len(think_tokens) * 0.30)
-            fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-            im = ax.imshow(normed_tt, aspect="auto", cmap="Blues", vmin=0, vmax=1)
-            ax.set_title(title, fontsize=10)
-            ax.set_xlabel("Key (thinking tokens)")
-            ax.set_ylabel("Query (thinking tokens)")
-            ax.set_xticks(range(len(think_tokens)))
-            ax.set_xticklabels(think_tokens, rotation=90, fontsize=max(4, min(7, 500 // len(think_tokens))))
-            ax.set_yticks(range(len(think_tokens)))
-            ax.set_yticklabels(think_tokens, fontsize=max(4, min(7, 500 // len(think_tokens))))
-            plt.colorbar(im, ax=ax, shrink=0.8, label="attention (normalized)")
-            plt.tight_layout()
-            plt.savefig(os.path.join(attn_dir, f"sample_{sample_idx:03d}_think_think_tokens.png"),
-                        dpi=150, bbox_inches="tight")
-            plt.close()
+            # Reconstruct attention from hidden states
+            # (num_heads, response_len, response_len)
+            try:
+                attn_full = _reconstruct_attention_for_sample(model, sample, viz_layer)
+            except Exception as e:
+                print(f"  WARNING: Failed to reconstruct sample {sample_idx} layer {viz_layer}: {e}")
+                continue
 
-        # Output→Think sub-matrix
-        if think_boundary is not None and think_len > 0 and out_len > 0:
-            ot = attn_avg[think_boundary:, :think_boundary]
-            think_tokens = tokens[:think_boundary]
-            out_tokens = tokens[think_boundary:]
-            title = (f"Output→Think Attention (sample {sample_idx}, "
-                     f"layer {viz_layer}, head avg, {len(out_tokens)}x{len(think_tokens)})")
+            # Average across heads → (response_len, response_len)
+            attn_avg = attn_full.mean(axis=0).astype(np.float32)
+
+            # Debug: report value stats for diagnostics
+            nonzero_vals = attn_avg[attn_avg > 0]
+            if len(nonzero_vals) > 0:
+                print(f"    sample {sample_idx} L{viz_layer}: nonzero={len(nonzero_vals)}/{attn_avg.size}, "
+                      f"range=[{nonzero_vals.min():.6f}, {nonzero_vals.max():.6f}], "
+                      f"median={np.median(nonzero_vals):.6f}")
+            else:
+                print(f"    sample {sample_idx} L{viz_layer}: WARNING attn all zeros!")
+
+            layer_tag = f"L{viz_layer}"
+
+            # --- Token-level heatmaps (HTML + PNG) ---
+
+            # Think→Think sub-matrix
+            if think_boundary is not None and think_len > 0:
+                tt = attn_avg[:think_boundary, :think_boundary]
+                think_tokens = tokens[:think_boundary]
+                title = (f"Think→Think Attention (sample {sample_idx}, "
+                         f"layer {viz_layer}, head avg, {len(think_tokens)} tokens)")
+
+                # HTML (primary — always full detail)
+                _render_attention_heatmap_html(
+                    tt, think_tokens, think_tokens, title,
+                    os.path.join(attn_dir, f"sample_{sample_idx:03d}_think_think.html"),
+                    cmap_name="Blues",
+                )
+
+                # PNG (with percentile normalization + all tokens shown)
+                normed_tt = _normalize_attention_for_viz(tt)
+                fig_w = max(10, len(think_tokens) * 0.35)
+                fig_h = max(8, len(think_tokens) * 0.30)
+                fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+                im = ax.imshow(normed_tt, aspect="auto", cmap="Blues", vmin=0, vmax=1)
+                ax.set_title(title, fontsize=10)
+                ax.set_xlabel("Key (thinking tokens)")
+                ax.set_ylabel("Query (thinking tokens)")
+                ax.set_xticks(range(len(think_tokens)))
+                ax.set_xticklabels(think_tokens, rotation=90, fontsize=max(4, min(7, 500 // len(think_tokens))))
+                ax.set_yticks(range(len(think_tokens)))
+                ax.set_yticklabels(think_tokens, fontsize=max(4, min(7, 500 // len(think_tokens))))
+                plt.colorbar(im, ax=ax, shrink=0.8, label="attention (normalized)")
+                plt.tight_layout()
+                plt.savefig(os.path.join(attn_dir, f"sample_{sample_idx:03d}_think_think_tokens.png"),
+                            dpi=150, bbox_inches="tight")
+                plt.close()
+
+            # Output→Think sub-matrix
+            if think_boundary is not None and think_len > 0 and out_len > 0:
+                ot = attn_avg[think_boundary:, :think_boundary]
+                think_tokens = tokens[:think_boundary]
+                out_tokens = tokens[think_boundary:]
+                title = (f"Output→Think Attention (sample {sample_idx}, "
+                         f"layer {viz_layer}, head avg, {len(out_tokens)}x{len(think_tokens)})")
+
+                # HTML
+                _render_attention_heatmap_html(
+                    ot, out_tokens, think_tokens, title,
+                    os.path.join(attn_dir, f"sample_{sample_idx:03d}_out_think.html"),
+                    cmap_name="Oranges",
+                )
+
+                # PNG
+                normed_ot = _normalize_attention_for_viz(ot)
+                fig_w = max(10, len(think_tokens) * 0.35)
+                fig_h = max(6, len(out_tokens) * 0.35)
+                fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+                im = ax.imshow(normed_ot, aspect="auto", cmap="Oranges", vmin=0, vmax=1)
+                ax.set_title(title, fontsize=10)
+                ax.set_xlabel("Key (thinking tokens)")
+                ax.set_ylabel("Query (output tokens)")
+                ax.set_xticks(range(len(think_tokens)))
+                ax.set_xticklabels(think_tokens, rotation=90, fontsize=max(4, min(7, 500 // len(think_tokens))))
+                ax.set_yticks(range(len(out_tokens)))
+                ax.set_yticklabels(out_tokens, fontsize=max(4, min(7, 500 // len(out_tokens))))
+                plt.colorbar(im, ax=ax, shrink=0.8, label="attention (normalized)")
+                plt.tight_layout()
+                plt.savefig(os.path.join(attn_dir, f"sample_{sample_idx:03d}_out_think_tokens.png"),
+                            dpi=150, bbox_inches="tight")
+                plt.close()
+
+            # --- Sentence-level heatmaps ---
+            boundary = think_boundary if think_boundary is not None else 0
+            segments = _segment_into_sentences(tokens, boundary)
+            if len(segments) < 2:
+                continue
+
+            labels = [s["label"] for s in segments]
+
+            # Sentence-level from full response attention
+            sent_attn = _compute_sentence_attention(attn_avg, segments,
+                                                    row_offset=0, col_offset=0)
 
             # HTML
             _render_attention_heatmap_html(
-                ot, out_tokens, think_tokens, title,
-                os.path.join(attn_dir, f"sample_{sample_idx:03d}_out_think.html"),
-                cmap_name="Oranges",
+                sent_attn, labels, labels,
+                f"Sentence-level Attention (sample {sample_idx}, layer {viz_layer})",
+                os.path.join(attn_dir, f"sample_{sample_idx:03d}_sentences.html"),
+                cmap_name="Blues",
             )
 
             # PNG
-            normed_ot = _normalize_attention_for_viz(ot)
-            fig_w = max(10, len(think_tokens) * 0.35)
-            fig_h = max(6, len(out_tokens) * 0.35)
-            fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-            im = ax.imshow(normed_ot, aspect="auto", cmap="Oranges", vmin=0, vmax=1)
-            ax.set_title(title, fontsize=10)
-            ax.set_xlabel("Key (thinking tokens)")
-            ax.set_ylabel("Query (output tokens)")
-            ax.set_xticks(range(len(think_tokens)))
-            ax.set_xticklabels(think_tokens, rotation=90, fontsize=max(4, min(7, 500 // len(think_tokens))))
-            ax.set_yticks(range(len(out_tokens)))
-            ax.set_yticklabels(out_tokens, fontsize=max(4, min(7, 500 // len(out_tokens))))
+            normed_sent = _normalize_attention_for_viz(sent_attn)
+            fig_size = max(8, len(segments) * 0.6)
+            fig, ax = plt.subplots(figsize=(fig_size, fig_size))
+            im = ax.imshow(normed_sent, aspect="auto", cmap="Blues", vmin=0, vmax=1)
+            ax.set_title(f"Sentence-level Attention (sample {sample_idx}, layer {viz_layer})")
+            ax.set_xticks(range(len(labels)))
+            ax.set_xticklabels(labels, rotation=90, fontsize=7)
+            ax.set_yticks(range(len(labels)))
+            ax.set_yticklabels(labels, fontsize=7)
             plt.colorbar(im, ax=ax, shrink=0.8, label="attention (normalized)")
             plt.tight_layout()
-            plt.savefig(os.path.join(attn_dir, f"sample_{sample_idx:03d}_out_think_tokens.png"),
+            plt.savefig(os.path.join(attn_dir, f"sample_{sample_idx:03d}_sentences.png"),
                         dpi=150, bbox_inches="tight")
             plt.close()
 
-        # --- Sentence-level heatmaps ---
-        boundary = think_boundary if think_boundary is not None else 0
-        segments = _segment_into_sentences(tokens, boundary)
-        if len(segments) < 2:
-            continue
+            if (sample_idx + 1) % 10 == 0:
+                print(f"    [{sample_idx+1}/{len(samples)}] heatmaps generated")
 
-        labels = [s["label"] for s in segments]
-
-        # Sentence-level from full response attention
-        sent_attn = _compute_sentence_attention(attn_avg, segments,
-                                                row_offset=0, col_offset=0)
-
-        # HTML
-        _render_attention_heatmap_html(
-            sent_attn, labels, labels,
-            f"Sentence-level Attention (sample {sample_idx}, layer {viz_layer})",
-            os.path.join(attn_dir, f"sample_{sample_idx:03d}_sentences.html"),
-            cmap_name="Blues",
-        )
-
-        # PNG
-        normed_sent = _normalize_attention_for_viz(sent_attn)
-        fig_size = max(8, len(segments) * 0.6)
-        fig, ax = plt.subplots(figsize=(fig_size, fig_size))
-        im = ax.imshow(normed_sent, aspect="auto", cmap="Blues", vmin=0, vmax=1)
-        ax.set_title(f"Sentence-level Attention (sample {sample_idx}, layer {viz_layer})")
-        ax.set_xticks(range(len(labels)))
-        ax.set_xticklabels(labels, rotation=90, fontsize=7)
-        ax.set_yticks(range(len(labels)))
-        ax.set_yticklabels(labels, fontsize=7)
-        plt.colorbar(im, ax=ax, shrink=0.8, label="attention (normalized)")
-        plt.tight_layout()
-        plt.savefig(os.path.join(attn_dir, f"sample_{sample_idx:03d}_sentences.png"),
-                    dpi=150, bbox_inches="tight")
-        plt.close()
-
-        if (sample_idx + 1) % 10 == 0:
-            print(f"    [{sample_idx+1}/{len(samples)}] heatmaps generated")
+        print(f"  Layer {viz_layer}: done ({len(samples)} samples)")
 
     # Free model
     del model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    print(f"  Saved attention heatmaps ({len(samples)} samples) to {attn_dir}/")
+    print(f"  Saved attention heatmaps ({len(samples)} samples x {len(viz_layers)} layers)")
 
 
 # ---------------------------------------------------------------------------
@@ -1519,9 +1538,10 @@ def main():
                         choices=["flash_attention_2", "eager"],
                         help="Attention implementation for model loading during "
                              "reconstruction (default: eager)")
-    parser.add_argument("--layer", type=int, default=None,
-                        help="Layer index (0-based) for attention heatmaps. "
-                             "Default: last layer.")
+    parser.add_argument("--layers", type=int, nargs="+", default=None,
+                        help="Layer indices (0-based) for attention heatmaps. "
+                             "Accepts one or more values, e.g. --layers 0 12 27. "
+                             "Default: last layer only.")
     args = parser.parse_args()
 
     print(f"Loading results from {args.input_path} ...")
@@ -1569,7 +1589,7 @@ def main():
                     internals_dir=args.internals_dir,
                     output_dir=args.output_dir,
                     attn_impl=args.attn_impl,
-                    layer=args.layer,
+                    layers=args.layers,
                 )
             except ImportError as e:
                 print(f"  WARNING: Attention heatmaps skipped ({e})")
