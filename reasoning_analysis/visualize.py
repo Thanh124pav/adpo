@@ -1303,12 +1303,16 @@ document.querySelector('.heatmap-wrap').addEventListener('mouseleave', function(
 
 def generate_attention_heatmaps(model_path: str, internals_dir: str,
                                 output_dir: str, max_samples: int = 50,
-                                attn_impl: str = "eager"):
+                                attn_impl: str = "eager",
+                                layer: int | None = None):
     """Generate attention heatmaps as interactive HTML files + PNG fallbacks.
 
     Reconstructs attention matrices from hidden states + model weights.
     All tokens are shown on axes (no truncation). Color is percentile-
     normalized to ensure visible contrast even with sparse attention.
+
+    Args:
+        layer: Layer index to visualize (0-based). None = last layer.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -1333,8 +1337,15 @@ def generate_attention_heatmaps(model_path: str, internals_dir: str,
     model.eval()
 
     n_layers = model.config.num_hidden_layers
-    # Use last layer for visualization
-    viz_layer = n_layers - 1
+    if layer is not None:
+        if layer < 0 or layer >= n_layers:
+            print(f"  WARNING: layer {layer} out of range [0, {n_layers-1}], using last layer")
+            viz_layer = n_layers - 1
+        else:
+            viz_layer = layer
+    else:
+        viz_layer = n_layers - 1
+    print(f"  Visualizing layer {viz_layer}/{n_layers-1}")
 
     attn_dir = os.path.join(output_dir, "attention_heatmaps")
     os.makedirs(attn_dir, exist_ok=True)
@@ -1508,6 +1519,9 @@ def main():
                         choices=["flash_attention_2", "eager"],
                         help="Attention implementation for model loading during "
                              "reconstruction (default: eager)")
+    parser.add_argument("--layer", type=int, default=None,
+                        help="Layer index (0-based) for attention heatmaps. "
+                             "Default: last layer.")
     args = parser.parse_args()
 
     print(f"Loading results from {args.input_path} ...")
@@ -1555,6 +1569,7 @@ def main():
                     internals_dir=args.internals_dir,
                     output_dir=args.output_dir,
                     attn_impl=args.attn_impl,
+                    layer=args.layer,
                 )
             except ImportError as e:
                 print(f"  WARNING: Attention heatmaps skipped ({e})")
