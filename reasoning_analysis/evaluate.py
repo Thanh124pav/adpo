@@ -211,6 +211,13 @@ def generate_with_logprobs(
             }
             all_results.append(result)
 
+    # Free vLLM GPU memory so subsequent HF model loads don't OOM
+    del llm
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    import gc
+    gc.collect()
+
     return all_results
 
 
@@ -678,6 +685,12 @@ def run_analysis(args):
 
     elapsed = time.time() - start_time
     print(f"Generation complete in {elapsed:.1f}s")
+
+    # Ensure vLLM GPU memory is fully released before loading HF models
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    import gc
+    gc.collect()
 
     # Exact entropy via forward pass (overrides approximate values from vLLM top-k)
     if args.exact_entropy:
