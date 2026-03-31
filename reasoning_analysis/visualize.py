@@ -25,6 +25,16 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 
 
+def _configure_matplotlib():
+    """Disable mathtext parsing so token labels with '$' don't crash plots."""
+    import matplotlib
+    try:
+        matplotlib.rcParams["text.parse_math"] = False
+    except Exception:
+        # Older matplotlib versions may not expose this rcParam.
+        pass
+
+
 def load_results(input_path: str) -> list:
     """Load analysis results from JSON or JSONL."""
     if input_path.endswith(".json"):
@@ -1304,8 +1314,9 @@ document.querySelector('.heatmap-wrap').addEventListener('mouseleave', function(
 def generate_attention_heatmaps(model_path: str, internals_dir: str,
                                 output_dir: str, max_samples: int = 50,
                                 attn_impl: str = "eager",
-                                layers: list[int] | None = None):
-    """Generate attention heatmaps as interactive HTML files + PNG fallbacks.
+                                layers: list[int] | None = None,
+                                no_png: bool = False):
+    """Generate attention heatmaps as interactive HTML files + optional PNG.
 
     Reconstructs attention matrices from hidden states + model weights.
     All tokens are shown on axes (no truncation). Color is percentile-
@@ -1315,10 +1326,14 @@ def generate_attention_heatmaps(model_path: str, internals_dir: str,
         layers: List of layer indices (0-based) to visualize.
                 None = last layer only.
                 Each layer gets its own subdirectory: attention_heatmaps/layer_XX/
+        no_png: If True, skip PNG generation (saves significant RAM for
+                large token counts where matplotlib figures become huge).
     """
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    if not no_png:
+        import matplotlib
+        matplotlib.use("Agg")
+        _configure_matplotlib()
+        import matplotlib.pyplot as plt
     import torch
     from transformers import AutoModelForCausalLM
 
@@ -1414,23 +1429,24 @@ def generate_attention_heatmaps(model_path: str, internals_dir: str,
                 )
 
                 # PNG (with percentile normalization + all tokens shown)
-                normed_tt = _normalize_attention_for_viz(tt)
-                fig_w = max(10, len(think_tokens) * 0.35)
-                fig_h = max(8, len(think_tokens) * 0.30)
-                fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-                im = ax.imshow(normed_tt, aspect="auto", cmap="Blues", vmin=0, vmax=1)
-                ax.set_title(title, fontsize=10)
-                ax.set_xlabel("Key (thinking tokens)")
-                ax.set_ylabel("Query (thinking tokens)")
-                ax.set_xticks(range(len(think_tokens)))
-                ax.set_xticklabels(think_tokens, rotation=90, fontsize=max(4, min(7, 500 // len(think_tokens))))
-                ax.set_yticks(range(len(think_tokens)))
-                ax.set_yticklabels(think_tokens, fontsize=max(4, min(7, 500 // len(think_tokens))))
-                plt.colorbar(im, ax=ax, shrink=0.8, label="attention (normalized)")
-                plt.tight_layout()
-                plt.savefig(os.path.join(attn_dir, f"sample_{sample_idx:03d}_think_think_tokens.png"),
-                            dpi=150, bbox_inches="tight")
-                plt.close()
+                if not no_png:
+                    normed_tt = _normalize_attention_for_viz(tt)
+                    fig_w = max(10, len(think_tokens) * 0.35)
+                    fig_h = max(8, len(think_tokens) * 0.30)
+                    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+                    im = ax.imshow(normed_tt, aspect="auto", cmap="Blues", vmin=0, vmax=1)
+                    ax.set_title(title, fontsize=10)
+                    ax.set_xlabel("Key (thinking tokens)")
+                    ax.set_ylabel("Query (thinking tokens)")
+                    ax.set_xticks(range(len(think_tokens)))
+                    ax.set_xticklabels(think_tokens, rotation=90, fontsize=max(4, min(7, 500 // len(think_tokens))))
+                    ax.set_yticks(range(len(think_tokens)))
+                    ax.set_yticklabels(think_tokens, fontsize=max(4, min(7, 500 // len(think_tokens))))
+                    plt.colorbar(im, ax=ax, shrink=0.8, label="attention (normalized)")
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(attn_dir, f"sample_{sample_idx:03d}_think_think_tokens.png"),
+                                dpi=150, bbox_inches="tight")
+                    plt.close()
 
             # Output→Think sub-matrix
             if think_boundary is not None and think_len > 0 and out_len > 0:
@@ -1448,23 +1464,24 @@ def generate_attention_heatmaps(model_path: str, internals_dir: str,
                 )
 
                 # PNG
-                normed_ot = _normalize_attention_for_viz(ot)
-                fig_w = max(10, len(think_tokens) * 0.35)
-                fig_h = max(6, len(out_tokens) * 0.35)
-                fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-                im = ax.imshow(normed_ot, aspect="auto", cmap="Oranges", vmin=0, vmax=1)
-                ax.set_title(title, fontsize=10)
-                ax.set_xlabel("Key (thinking tokens)")
-                ax.set_ylabel("Query (output tokens)")
-                ax.set_xticks(range(len(think_tokens)))
-                ax.set_xticklabels(think_tokens, rotation=90, fontsize=max(4, min(7, 500 // len(think_tokens))))
-                ax.set_yticks(range(len(out_tokens)))
-                ax.set_yticklabels(out_tokens, fontsize=max(4, min(7, 500 // len(out_tokens))))
-                plt.colorbar(im, ax=ax, shrink=0.8, label="attention (normalized)")
-                plt.tight_layout()
-                plt.savefig(os.path.join(attn_dir, f"sample_{sample_idx:03d}_out_think_tokens.png"),
-                            dpi=150, bbox_inches="tight")
-                plt.close()
+                if not no_png:
+                    normed_ot = _normalize_attention_for_viz(ot)
+                    fig_w = max(10, len(think_tokens) * 0.35)
+                    fig_h = max(6, len(out_tokens) * 0.35)
+                    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+                    im = ax.imshow(normed_ot, aspect="auto", cmap="Oranges", vmin=0, vmax=1)
+                    ax.set_title(title, fontsize=10)
+                    ax.set_xlabel("Key (thinking tokens)")
+                    ax.set_ylabel("Query (output tokens)")
+                    ax.set_xticks(range(len(think_tokens)))
+                    ax.set_xticklabels(think_tokens, rotation=90, fontsize=max(4, min(7, 500 // len(think_tokens))))
+                    ax.set_yticks(range(len(out_tokens)))
+                    ax.set_yticklabels(out_tokens, fontsize=max(4, min(7, 500 // len(out_tokens))))
+                    plt.colorbar(im, ax=ax, shrink=0.8, label="attention (normalized)")
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(attn_dir, f"sample_{sample_idx:03d}_out_think_tokens.png"),
+                                dpi=150, bbox_inches="tight")
+                    plt.close()
 
             # --- Sentence-level heatmaps ---
             boundary = think_boundary if think_boundary is not None else 0
@@ -1487,20 +1504,21 @@ def generate_attention_heatmaps(model_path: str, internals_dir: str,
             )
 
             # PNG
-            normed_sent = _normalize_attention_for_viz(sent_attn)
-            fig_size = max(8, len(segments) * 0.6)
-            fig, ax = plt.subplots(figsize=(fig_size, fig_size))
-            im = ax.imshow(normed_sent, aspect="auto", cmap="Blues", vmin=0, vmax=1)
-            ax.set_title(f"Sentence-level Attention (sample {sample_idx}, layer {viz_layer})")
-            ax.set_xticks(range(len(labels)))
-            ax.set_xticklabels(labels, rotation=90, fontsize=7)
-            ax.set_yticks(range(len(labels)))
-            ax.set_yticklabels(labels, fontsize=7)
-            plt.colorbar(im, ax=ax, shrink=0.8, label="attention (normalized)")
-            plt.tight_layout()
-            plt.savefig(os.path.join(attn_dir, f"sample_{sample_idx:03d}_sentences.png"),
-                        dpi=150, bbox_inches="tight")
-            plt.close()
+            if not no_png:
+                normed_sent = _normalize_attention_for_viz(sent_attn)
+                fig_size = max(8, len(segments) * 0.6)
+                fig, ax = plt.subplots(figsize=(fig_size, fig_size))
+                im = ax.imshow(normed_sent, aspect="auto", cmap="Blues", vmin=0, vmax=1)
+                ax.set_title(f"Sentence-level Attention (sample {sample_idx}, layer {viz_layer})")
+                ax.set_xticks(range(len(labels)))
+                ax.set_xticklabels(labels, rotation=90, fontsize=7)
+                ax.set_yticks(range(len(labels)))
+                ax.set_yticklabels(labels, fontsize=7)
+                plt.colorbar(im, ax=ax, shrink=0.8, label="attention (normalized)")
+                plt.tight_layout()
+                plt.savefig(os.path.join(attn_dir, f"sample_{sample_idx:03d}_sentences.png"),
+                            dpi=150, bbox_inches="tight")
+                plt.close()
 
             if (sample_idx + 1) % 10 == 0:
                 print(f"    [{sample_idx+1}/{len(samples)}] heatmaps generated")
@@ -1542,6 +1560,9 @@ def main():
                         help="Layer indices (0-based) for attention heatmaps. "
                              "Accepts one or more values, e.g. --layers 0 12 27. "
                              "Default: last layer only.")
+    parser.add_argument("--no_png", action="store_true",
+                        help="Skip PNG heatmap generation to save RAM. "
+                             "Only HTML heatmaps will be produced.")
     args = parser.parse_args()
 
     print(f"Loading results from {args.input_path} ...")
@@ -1590,6 +1611,7 @@ def main():
                     output_dir=args.output_dir,
                     attn_impl=args.attn_impl,
                     layers=args.layers,
+                    no_png=args.no_png,
                 )
             except ImportError as e:
                 print(f"  WARNING: Attention heatmaps skipped ({e})")

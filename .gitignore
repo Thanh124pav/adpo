@@ -11,3 +11,4 @@ outputs/
 .hydra/
 *.log
 .env
+*/outputs
