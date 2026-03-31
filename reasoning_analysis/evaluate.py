@@ -120,6 +120,9 @@ def generate_with_logprobs(
     top_p: float = 0.95,
     tensor_parallel_size: int = 1,
     top_logprobs: int = 20,
+    gpu_memory_utilization: float = 0.9,
+    max_model_len: int | None = None,
+    enforce_eager: bool = False,
 ):
     """Generate responses with per-token log probabilities using vLLM.
 
@@ -129,11 +132,18 @@ def generate_with_logprobs(
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    llm = LLM(
+
+    llm_kwargs = dict(
         model=model_path,
         tensor_parallel_size=tensor_parallel_size,
         trust_remote_code=True,
+        gpu_memory_utilization=gpu_memory_utilization,
+        enforce_eager=enforce_eager,
     )
+    if max_model_len is not None:
+        llm_kwargs["max_model_len"] = max_model_len
+
+    llm = LLM(**llm_kwargs)
 
     formatted_prompts = []
     for p in prompts:
@@ -672,6 +682,9 @@ def run_analysis(args):
             top_p=args.top_p,
             tensor_parallel_size=args.tensor_parallel_size,
             top_logprobs=args.top_logprobs,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            max_model_len=args.max_model_len,
+            enforce_eager=args.enforce_eager,
         )
     else:
         results = generate_with_logprobs_hf(
@@ -845,6 +858,15 @@ def main():
                         help="Attention implementation for hidden states extraction. "
                              "flash_attention_2 (default) is faster; eager is slower but "
                              "compatible with all GPUs.")
+    parser.add_argument("--gpu_memory_utilization", type=float, default=0.9,
+                        help="Fraction of GPU memory for vLLM (0.0-1.0). "
+                             "Lower this if you get CUDA OOM during vLLM init. (default: 0.9)")
+    parser.add_argument("--max_model_len", type=int, default=None,
+                        help="Max sequence length for vLLM KV cache. "
+                             "Lower this to reduce VRAM usage (e.g. 2048, 4096). "
+                             "Default: model's max from config.")
+    parser.add_argument("--enforce_eager", action="store_true",
+                        help="Disable vLLM CUDA graph capture. Saves VRAM at the cost of speed.")
     args = parser.parse_args()
     run_analysis(args)
 
