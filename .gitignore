@@ -7,7 +7,6 @@ data/processed/
 checkpoints/
 results/
 wandb/
-outputs/
 .hydra/
 *.log
 .env

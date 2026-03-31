@@ -1104,17 +1104,27 @@ def _render_attention_heatmap_html(
     title: str,
     output_path: str,
     cmap_name: str = "Blues",
+    normalize_per_row: bool = False,
 ):
     """Render an attention heatmap as a fully interactive HTML file.
 
     Every token is shown on both axes. Cells are colored by attention weight
     with enhanced contrast (percentile normalization). Supports zoom/scroll
     for large matrices. Hover shows exact value.
+
+    Args:
+        normalize_per_row: If True, normalize each row independently instead
+                          of the whole matrix. Useful for per-layer entropy.
     """
     n_rows, n_cols = matrix.shape
 
     # Normalize for color mapping
-    normed = _normalize_attention_for_viz(matrix)
+    if normalize_per_row:
+        normed = np.zeros_like(matrix, dtype=np.float64)
+        for i in range(n_rows):
+            normed[i] = _normalize_attention_for_viz(matrix[i:i+1]).flatten()
+    else:
+        normed = _normalize_attention_for_viz(matrix)
 
     # Generate color for each cell
     # Blues-like: 0 → white (255,255,255), 1 → dark blue (8,48,107)
@@ -1148,12 +1158,40 @@ def _render_attention_heatmap_html(
 body {{ font-family: monospace; margin: 20px; background: #fafafa; }}
 h1 {{ font-size: 18px; color: #2c3e50; }}
 .info {{ font-size: 13px; color: #555; margin-bottom: 10px; }}
+.zoom-controls {{
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 10px 0;
+    font-size: 13px;
+    user-select: none;
+}}
+.zoom-controls button {{
+    width: 32px;
+    height: 32px;
+    font-size: 18px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    background: #fff;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}}
+.zoom-controls button:hover {{ background: #e8e8e8; }}
+#zoom-label {{ min-width: 50px; text-align: center; }}
 .heatmap-wrap {{
-    overflow: auto;
+    overflow: hidden;
     max-width: 95vw;
-    max-height: 90vh;
+    max-height: 85vh;
     border: 1px solid #ccc;
     position: relative;
+    cursor: grab;
+}}
+.heatmap-wrap.dragging {{ cursor: grabbing; }}
+.heatmap-inner {{
+    transform-origin: 0 0;
+    will-change: transform;
 }}
 table {{
     border-collapse: collapse;
@@ -1171,8 +1209,6 @@ td, th {{
 }}
 th {{
     background: #f8f8f8;
-    position: sticky;
-    z-index: 2;
     font-weight: normal;
     font-size: 9px;
     white-space: nowrap;
@@ -1182,15 +1218,13 @@ th {{
     padding: 2px;
 }}
 th.col-header {{
-    top: 0;
     writing-mode: vertical-rl;
     text-orientation: mixed;
     height: 80px;
     max-height: 80px;
-    vertical-align: bottom;
+    vertical-align: top;
 }}
 th.row-header {{
-    left: 0;
     text-align: right;
     padding-right: 4px;
     max-width: 120px;
@@ -1198,10 +1232,10 @@ th.row-header {{
     min-width: 120px;
 }}
 th.corner {{
-    top: 0; left: 0; z-index: 3;
     background: #f0f0f0;
     width: 120px; min-width: 120px;
     height: 80px;
+    z-index: 3;
 }}
 td:hover {{
     outline: 2px solid #333;
@@ -1249,20 +1283,21 @@ td:hover {{
     else:
         grad = "linear-gradient(to right, rgb(255,255,255), rgb(8,48,107))"
     html_parts.append(f"""<div class="legend">
-  <span>Low attention</span>
+  <span>Low</span>
   <div class="legend-bar" style="background: {grad}"></div>
-  <span>High attention</span>
+  <span>High</span>
   <span style="color:#888">(percentile-normalized for contrast)</span>
+</div>
+<div class="zoom-controls">
+  <button id="zoom-out" title="Zoom out">−</button>
+  <span id="zoom-label">100%</span>
+  <button id="zoom-in" title="Zoom in">+</button>
+  <button id="zoom-reset" title="Reset zoom">↺</button>
+  <span style="color:#888; font-size:11px">Scroll to zoom · Drag to pan</span>
 </div>
 """)
 
-    html_parts.append('<div class="heatmap-wrap">\n<table>\n')
-
-    # Header row with column tokens
-    html_parts.append('<tr><th class="corner">Query \\ Key</th>')
-    for j, tok in enumerate(col_tokens):
-        html_parts.append(f'<th class="col-header" title="col {j}: {esc(tok)}">{esc(tok)}</th>')
-    html_parts.append('</tr>\n')
+    html_parts.append('<div class="heatmap-wrap" id="heatmap-wrap">\n<div class="heatmap-inner" id="heatmap-inner">\n<table>\n')
 
     # Data rows
     for i in range(n_rows):
@@ -1278,32 +1313,105 @@ td:hover {{
             )
         html_parts.append('</tr>\n')
 
-    html_parts.append('</table>\n</div>\n')
+    # Column token labels at the bottom
+    html_parts.append('<tr><th class="corner"></th>')
+    for j, tok in enumerate(col_tokens):
+        html_parts.append(f'<th class="col-header" title="col {j}: {esc(tok)}">{esc(tok)}</th>')
+    html_parts.append('</tr>\n')
 
-    # Tooltip + hover script
+    html_parts.append('</table>\n</div>\n</div>\n')
+
+    # Tooltip + zoom/pan script
     html_parts.append("""
 <div class="tooltip" id="tooltip"></div>
 <script>
-const tip = document.getElementById('tooltip');
-document.querySelector('.heatmap-wrap').addEventListener('mousemove', function(e) {
-    const td = e.target.closest('td[data-v]');
-    if (td) {
-        const r = td.dataset.r, c = td.dataset.c, v = td.dataset.v;
-        const rt = document.querySelectorAll('th.row-header')[r];
-        const ct = document.querySelectorAll('th.col-header')[c];
-        const rn = rt ? rt.textContent : r;
-        const cn = ct ? ct.textContent : c;
-        tip.innerHTML = `Query[${r}]: ${rn}\\nKey[${c}]: ${cn}\\nAttention: ${v}`;
-        tip.style.display = 'block';
-        tip.style.left = (e.clientX + 14) + 'px';
-        tip.style.top = (e.clientY + 14) + 'px';
-    } else {
-        tip.style.display = 'none';
+(function() {
+    const wrap = document.getElementById('heatmap-wrap');
+    const inner = document.getElementById('heatmap-inner');
+    const tip = document.getElementById('tooltip');
+    const zoomLabel = document.getElementById('zoom-label');
+
+    let scale = 1, panX = 0, panY = 0;
+    let dragging = false, startX = 0, startY = 0, startPanX = 0, startPanY = 0;
+    const MIN_SCALE = 0.1, MAX_SCALE = 5;
+
+    function applyTransform() {
+        inner.style.transform = `translate(${panX}px, ${panY}px) scale(${scale})`;
+        zoomLabel.textContent = Math.round(scale * 100) + '%';
     }
-});
-document.querySelector('.heatmap-wrap').addEventListener('mouseleave', function() {
-    tip.style.display = 'none';
-});
+
+    function zoomAt(cx, cy, factor) {
+        const rect = wrap.getBoundingClientRect();
+        const mx = cx - rect.left;
+        const my = cy - rect.top;
+        const newScale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, scale * factor));
+        const ratio = newScale / scale;
+        panX = mx - ratio * (mx - panX);
+        panY = my - ratio * (my - panY);
+        scale = newScale;
+        applyTransform();
+    }
+
+    // Wheel zoom
+    wrap.addEventListener('wheel', function(e) {
+        e.preventDefault();
+        const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+        zoomAt(e.clientX, e.clientY, factor);
+    }, {passive: false});
+
+    // Button zoom
+    document.getElementById('zoom-in').addEventListener('click', function() {
+        const rect = wrap.getBoundingClientRect();
+        zoomAt(rect.left + rect.width/2, rect.top + rect.height/2, 1.3);
+    });
+    document.getElementById('zoom-out').addEventListener('click', function() {
+        const rect = wrap.getBoundingClientRect();
+        zoomAt(rect.left + rect.width/2, rect.top + rect.height/2, 1/1.3);
+    });
+    document.getElementById('zoom-reset').addEventListener('click', function() {
+        scale = 1; panX = 0; panY = 0;
+        applyTransform();
+    });
+
+    // Drag to pan
+    wrap.addEventListener('mousedown', function(e) {
+        if (e.button !== 0) return;
+        dragging = true;
+        startX = e.clientX; startY = e.clientY;
+        startPanX = panX; startPanY = panY;
+        wrap.classList.add('dragging');
+        e.preventDefault();
+    });
+    window.addEventListener('mousemove', function(e) {
+        if (dragging) {
+            panX = startPanX + (e.clientX - startX);
+            panY = startPanY + (e.clientY - startY);
+            applyTransform();
+        }
+        // Tooltip
+        const td = e.target.closest('td[data-v]');
+        if (td) {
+            const r = td.dataset.r, c = td.dataset.c, v = td.dataset.v;
+            const rt = document.querySelectorAll('th.row-header')[r];
+            const ct = document.querySelectorAll('th.col-header')[c];
+            const rn = rt ? rt.textContent : r;
+            const cn = ct ? ct.textContent : c;
+            tip.innerHTML = `Row[${r}]: ${rn}\\nCol[${c}]: ${cn}\\nValue: ${v}`;
+            tip.style.display = 'block';
+            tip.style.left = (e.clientX + 14) + 'px';
+            tip.style.top = (e.clientY + 14) + 'px';
+        } else {
+            tip.style.display = 'none';
+        }
+    });
+    window.addEventListener('mouseup', function() {
+        dragging = false;
+        wrap.classList.remove('dragging');
+    });
+    wrap.addEventListener('mouseleave', function() {
+        tip.style.display = 'none';
+    });
+})();
 </script>
 </body></html>""")
 
@@ -1311,9 +1419,33 @@ document.querySelector('.heatmap-wrap').addEventListener('mouseleave', function(
         f.write("".join(html_parts))
 
 
-def generate_attention_heatmaps(model_path: str, internals_dir: str,
+def _load_model(model_path: str, attn_impl: str = "eager"):
+    """Load a HuggingFace causal LM for attention reconstruction / logit lens."""
+    import torch
+    from transformers import AutoModelForCausalLM
+
+    print(f"  Loading model: {model_path} (attn={attn_impl}) ...")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+        attn_implementation=attn_impl,
+        device_map="auto",
+    )
+    model.eval()
+    return model
+
+
+def _free_model(model):
+    """Delete model and free GPU memory."""
+    import torch
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def generate_attention_heatmaps(model, internals_dir: str,
                                 output_dir: str, max_samples: int = 50,
-                                attn_impl: str = "eager",
                                 layers: list[int] | None = None,
                                 no_png: bool = False):
     """Generate attention heatmaps as interactive HTML files + optional PNG.
@@ -1323,6 +1455,7 @@ def generate_attention_heatmaps(model_path: str, internals_dir: str,
     normalized to ensure visible contrast even with sparse attention.
 
     Args:
+        model: Pre-loaded HuggingFace causal LM.
         layers: List of layer indices (0-based) to visualize.
                 None = last layer only.
                 Each layer gets its own subdirectory: attention_heatmaps/layer_XX/
@@ -1334,23 +1467,10 @@ def generate_attention_heatmaps(model_path: str, internals_dir: str,
         matplotlib.use("Agg")
         _configure_matplotlib()
         import matplotlib.pyplot as plt
-    import torch
-    from transformers import AutoModelForCausalLM
 
     samples = _load_npz_samples(internals_dir, max_samples)
     if not samples:
         return
-
-    # Load model (only weights needed, no inference)
-    print(f"  Loading model for attention reconstruction (attn={attn_impl}) ...")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        trust_remote_code=True,
-        torch_dtype=torch.bfloat16,
-        attn_implementation=attn_impl,
-        device_map="auto",
-    )
-    model.eval()
 
     n_layers = model.config.num_hidden_layers
 
@@ -1525,12 +1645,356 @@ def generate_attention_heatmaps(model_path: str, internals_dir: str,
 
         print(f"  Layer {viz_layer}: done ({len(samples)} samples)")
 
-    # Free model
-    del model
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
     print(f"  Saved attention heatmaps ({len(samples)} samples x {len(viz_layers)} layers)")
+
+
+# ---------------------------------------------------------------------------
+# Per-Layer Entropy (Logit Lens)
+# ---------------------------------------------------------------------------
+
+
+def _compute_layer_entropy(model, hidden_states: np.ndarray) -> np.ndarray:
+    """Compute entropy at each layer by projecting hidden states through lm_head.
+
+    Args:
+        model: HuggingFace causal LM with model.model.norm and model.lm_head.
+        hidden_states: (n_layers+1, response_len, hidden_dim) float16 array.
+
+    Returns:
+        (n_layers+1, response_len) entropy array.
+    """
+    import torch
+
+    n_layers_plus1, response_len, hidden_dim = hidden_states.shape
+    device = next(model.parameters()).device
+    entropies = np.zeros((n_layers_plus1, response_len), dtype=np.float32)
+
+    final_norm = model.model.norm
+    lm_head = model.lm_head
+
+    for layer_idx in range(n_layers_plus1):
+        hs = torch.from_numpy(hidden_states[layer_idx]).unsqueeze(0)  # (1, seq, dim)
+        hs = hs.to(dtype=torch.bfloat16, device=device)
+
+        with torch.no_grad():
+            normed = final_norm(hs)
+            logits = lm_head(normed)  # (1, seq, vocab)
+            log_probs = torch.log_softmax(logits, dim=-1)
+            probs = torch.exp(log_probs)
+            ent = -(probs * log_probs).sum(dim=-1)  # (1, seq)
+            entropies[layer_idx] = ent[0].float().cpu().numpy()
+
+    return entropies
+
+
+def generate_layer_entropy_html(model, internals_dir: str,
+                                output_dir: str, max_samples: int = 50):
+    """Generate per-layer entropy visualization using logit lens.
+
+    For each sample, projects hidden states at every layer through the final
+    norm + lm_head to get logits, then computes entropy. Produces an HTML
+    heatmap showing how entropy evolves across layers for each token.
+
+    Args:
+        model: Pre-loaded HuggingFace causal LM.
+    """
+    samples = _load_npz_samples(internals_dir, max_samples)
+    if not samples:
+        return
+
+    n_layers = model.config.num_hidden_layers
+    ent_dir = os.path.join(output_dir, "layer_entropy")
+    os.makedirs(ent_dir, exist_ok=True)
+
+    # Process each sample
+    all_sample_data = []
+    for sample_idx, sample in enumerate(samples):
+        meta = sample["meta"]
+        tokens = sample["tokens"]
+        hidden_states = sample["hidden_states"]  # (n_layers+1, resp_len, dim)
+
+        try:
+            entropies = _compute_layer_entropy(model, hidden_states)
+        except Exception as e:
+            print(f"  WARNING: Failed sample {sample_idx}: {e}")
+            continue
+
+        think_boundary = meta.get("think_boundary")
+        all_sample_data.append({
+            "sample_idx": sample_idx,
+            "meta": meta,
+            "tokens": tokens,
+            "entropies": entropies,  # (n_layers+1, resp_len)
+            "think_boundary": think_boundary,
+        })
+
+        # Per-sample HTML heatmap: layers (rows) x tokens (cols)
+        layer_labels = ["emb"] + [f"L{i}" for i in range(n_layers)]
+        sample_title = (f"Layer Entropy — sample {sample_idx} "
+                        f"(prompt {meta['prompt_idx']}, {len(tokens)} tokens)")
+
+        # Global normalization (across all layers)
+        _render_attention_heatmap_html(
+            entropies, layer_labels, list(tokens),
+            sample_title + " [global norm]",
+            os.path.join(ent_dir, f"sample_{sample_idx:03d}_layer_entropy.html"),
+            cmap_name="Blues",
+        )
+
+        # Per-layer normalization (each layer independently)
+        _render_attention_heatmap_html(
+            entropies, layer_labels, list(tokens),
+            sample_title + " [per-layer norm]",
+            os.path.join(ent_dir, f"sample_{sample_idx:03d}_layer_entropy_perlayer.html"),
+            cmap_name="Blues",
+            normalize_per_row=True,
+        )
+
+        if (sample_idx + 1) % 10 == 0:
+            print(f"    [{sample_idx+1}/{len(samples)}] layer entropy computed")
+
+    if not all_sample_data:
+        print("  No samples processed for layer entropy.")
+        return
+
+    # Summary HTML: mean entropy per layer across all samples
+    _generate_layer_entropy_summary(all_sample_data, n_layers, ent_dir)
+
+    print(f"  Saved layer entropy ({len(all_sample_data)} samples) to {ent_dir}/")
+
+
+def _generate_layer_entropy_summary(all_sample_data: list, n_layers: int,
+                                    ent_dir: str):
+    """Generate summary HTML showing mean entropy curve across layers."""
+    layer_labels = ["emb"] + [f"L{i}" for i in range(n_layers)]
+    n_layers_plus1 = n_layers + 1
+
+    # Compute per-layer mean entropy (averaged over tokens and samples)
+    layer_means = np.zeros(n_layers_plus1)
+    layer_stds = np.zeros(n_layers_plus1)
+    all_per_layer = [[] for _ in range(n_layers_plus1)]
+
+    # Also split by thinking vs output
+    think_per_layer = [[] for _ in range(n_layers_plus1)]
+    output_per_layer = [[] for _ in range(n_layers_plus1)]
+
+    for sd in all_sample_data:
+        ent = sd["entropies"]  # (n_layers+1, resp_len)
+        tb = sd["think_boundary"]
+        for l in range(n_layers_plus1):
+            mean_ent = float(np.mean(ent[l]))
+            all_per_layer[l].append(mean_ent)
+            if tb is not None and tb > 0:
+                think_per_layer[l].append(float(np.mean(ent[l, :tb])))
+                if tb < ent.shape[1]:
+                    output_per_layer[l].append(float(np.mean(ent[l, tb:])))
+
+    for l in range(n_layers_plus1):
+        vals = all_per_layer[l]
+        layer_means[l] = np.mean(vals)
+        layer_stds[l] = np.std(vals)
+
+    # Build summary HTML
+    html_parts = []
+    html_parts.append(f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Layer Entropy Summary (Logit Lens)</title>
+<style>
+body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 20px; background: #fafafa; color: #333; }}
+h1 {{ color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 10px; }}
+h2 {{ color: #34495e; margin-top: 30px; }}
+.chart-container {{ background: white; border: 1px solid #ddd; border-radius: 8px; padding: 20px; margin: 20px 0; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }}
+table {{ border-collapse: collapse; width: 100%; margin: 15px 0; }}
+th, td {{ padding: 8px 12px; text-align: left; border-bottom: 1px solid #eee; }}
+th {{ background: #f8f9fa; font-weight: 600; }}
+.bar {{ display: inline-block; height: 18px; border-radius: 3px; }}
+.sample-links {{ margin: 15px 0; }}
+.sample-links a {{ margin: 0 4px; text-decoration: none; color: #3498db; }}
+svg {{ overflow: visible; }}
+.line {{ fill: none; stroke-width: 2; }}
+.area {{ opacity: 0.15; }}
+.axis text {{ font-size: 11px; }}
+.grid line {{ stroke: #e0e0e0; stroke-dasharray: 2,2; }}
+.legend-item {{ font-size: 12px; }}
+</style>
+</head>
+<body>
+<h1>Layer Entropy Summary (Logit Lens)</h1>
+<p>Mean entropy at each layer, computed by projecting hidden states through final norm + LM head.</p>
+<p>Samples: {len(all_sample_data)}, Layers: {n_layers_plus1} (embedding + {n_layers} transformer layers)</p>
+""")
+
+    # SVG line chart
+    chart_w, chart_h = 800, 400
+    margin = {"top": 30, "right": 150, "bottom": 60, "left": 60}
+    w = chart_w - margin["left"] - margin["right"]
+    h = chart_h - margin["top"] - margin["bottom"]
+
+    y_max = float(np.max(layer_means + layer_stds)) * 1.1
+    y_min = max(0, float(np.min(layer_means - layer_stds)) * 0.9)
+
+    def sx(i):
+        return margin["left"] + i * w / max(n_layers_plus1 - 1, 1)
+
+    def sy(v):
+        if y_max <= y_min:
+            return margin["top"] + h / 2
+        return margin["top"] + h - (v - y_min) / (y_max - y_min) * h
+
+    html_parts.append(f'<div class="chart-container">')
+    html_parts.append(f'<h2>Mean Entropy by Layer</h2>')
+    html_parts.append(f'<svg width="{chart_w}" height="{chart_h}">')
+
+    # Grid lines
+    n_grid = 5
+    for gi in range(n_grid + 1):
+        gy = y_min + (y_max - y_min) * gi / n_grid
+        py = sy(gy)
+        html_parts.append(f'<line x1="{margin["left"]}" y1="{py:.1f}" '
+                          f'x2="{margin["left"]+w}" y2="{py:.1f}" '
+                          f'stroke="#e0e0e0" stroke-dasharray="2,2"/>')
+        html_parts.append(f'<text x="{margin["left"]-8}" y="{py:.1f}" '
+                          f'text-anchor="end" dominant-baseline="middle" '
+                          f'font-size="11">{gy:.2f}</text>')
+
+    # Helper to draw a line series
+    def draw_line(values, color, label, dash=""):
+        if not values or not any(v for v in values):
+            return
+        points = " ".join(f"{sx(i):.1f},{sy(v):.1f}" for i, v in enumerate(values))
+        style = f'stroke-dasharray="{dash}"' if dash else ""
+        html_parts.append(f'<polyline points="{points}" class="line" '
+                          f'stroke="{color}" {style}/>')
+
+    # Std deviation area (all)
+    area_points_top = " ".join(f"{sx(i):.1f},{sy(layer_means[i]+layer_stds[i]):.1f}"
+                               for i in range(n_layers_plus1))
+    area_points_bot = " ".join(f"{sx(i):.1f},{sy(layer_means[i]-layer_stds[i]):.1f}"
+                               for i in range(n_layers_plus1 - 1, -1, -1))
+    html_parts.append(f'<polygon points="{area_points_top} {area_points_bot}" '
+                      f'fill="#3498db" class="area"/>')
+
+    # Mean line (all)
+    draw_line(layer_means.tolist(), "#3498db", "All")
+
+    # Think / Output lines
+    think_means = [np.mean(think_per_layer[l]) if think_per_layer[l] else None
+                   for l in range(n_layers_plus1)]
+    output_means = [np.mean(output_per_layer[l]) if output_per_layer[l] else None
+                    for l in range(n_layers_plus1)]
+
+    has_think = any(v is not None for v in think_means)
+    has_output = any(v is not None for v in output_means)
+
+    if has_think:
+        pts = [(i, v) for i, v in enumerate(think_means) if v is not None]
+        points_str = " ".join(f"{sx(i):.1f},{sy(v):.1f}" for i, v in pts)
+        html_parts.append(f'<polyline points="{points_str}" class="line" '
+                          f'stroke="#e74c3c" stroke-dasharray="6,3"/>')
+
+    if has_output:
+        pts = [(i, v) for i, v in enumerate(output_means) if v is not None]
+        points_str = " ".join(f"{sx(i):.1f},{sy(v):.1f}" for i, v in pts)
+        html_parts.append(f'<polyline points="{points_str}" class="line" '
+                          f'stroke="#2ecc71" stroke-dasharray="6,3"/>')
+
+    # X-axis labels
+    step = max(1, n_layers_plus1 // 20)
+    for i in range(0, n_layers_plus1, step):
+        px = sx(i)
+        html_parts.append(f'<text x="{px:.1f}" y="{margin["top"]+h+20}" '
+                          f'text-anchor="middle" font-size="10">{layer_labels[i]}</text>')
+
+    # Axis labels
+    html_parts.append(f'<text x="{margin["left"]+w//2}" y="{chart_h-5}" '
+                      f'text-anchor="middle" font-size="12">Layer</text>')
+    html_parts.append(f'<text x="15" y="{margin["top"]+h//2}" '
+                      f'text-anchor="middle" font-size="12" '
+                      f'transform="rotate(-90,15,{margin["top"]+h//2})">Entropy (nats)</text>')
+
+    # Legend
+    lx = margin["left"] + w + 15
+    ly = margin["top"] + 10
+    for color, label, dash in [("#3498db", "All (mean±std)", ""),
+                                ("#e74c3c", "Thinking", "6,3"),
+                                ("#2ecc71", "Output", "6,3")]:
+        html_parts.append(f'<line x1="{lx}" y1="{ly}" x2="{lx+25}" y2="{ly}" '
+                          f'stroke="{color}" stroke-width="2" '
+                          f'stroke-dasharray="{dash}"/>')
+        html_parts.append(f'<text x="{lx+30}" y="{ly+4}" font-size="12">{label}</text>')
+        ly += 22
+
+    html_parts.append('</svg>')
+    html_parts.append('</div>')
+
+    # Stats table
+    html_parts.append('<div class="chart-container">')
+    html_parts.append('<h2>Per-Layer Statistics</h2>')
+    html_parts.append('<table><tr><th>Layer</th><th>Mean Entropy</th>'
+                      '<th>Std</th><th>Bar</th></tr>')
+    bar_max = float(np.max(layer_means)) if np.max(layer_means) > 0 else 1
+    for l in range(n_layers_plus1):
+        bar_w = int(layer_means[l] / bar_max * 300)
+        # Color: high entropy = red, low = green
+        ratio = layer_means[l] / bar_max
+        r = int(255 * ratio)
+        g = int(180 * (1 - ratio))
+        color = f"rgb({r},{g},50)"
+        html_parts.append(
+            f'<tr><td>{layer_labels[l]}</td>'
+            f'<td>{layer_means[l]:.4f}</td>'
+            f'<td>{layer_stds[l]:.4f}</td>'
+            f'<td><span class="bar" style="width:{bar_w}px;background:{color}"></span></td>'
+            f'</tr>')
+    html_parts.append('</table>')
+    html_parts.append('</div>')
+
+    # Links to per-sample heatmaps
+    html_parts.append('<div class="chart-container">')
+    html_parts.append('<h2>Per-Sample Heatmaps</h2>')
+    html_parts.append('<p><strong>Global norm:</strong> colors normalized across all layers '
+                      '(compare absolute entropy between layers)</p>')
+    html_parts.append('<div class="sample-links">')
+    for sd in all_sample_data:
+        idx = sd["sample_idx"]
+        n_tok = len(sd["tokens"])
+        html_parts.append(f'<a href="sample_{idx:03d}_layer_entropy.html">'
+                          f'Sample {idx} ({n_tok} tok)</a>')
+    html_parts.append('</div>')
+    html_parts.append('<p style="margin-top:12px"><strong>Per-layer norm:</strong> '
+                      'colors normalized within each layer '
+                      '(see relative patterns within each layer)</p>')
+    html_parts.append('<div class="sample-links">')
+    for sd in all_sample_data:
+        idx = sd["sample_idx"]
+        n_tok = len(sd["tokens"])
+        html_parts.append(f'<a href="sample_{idx:03d}_layer_entropy_perlayer.html">'
+                          f'Sample {idx} ({n_tok} tok)</a>')
+    html_parts.append('</div></div>')
+
+    # Save summary stats JSON
+    summary = {
+        "n_samples": len(all_sample_data),
+        "n_layers": n_layers_plus1,
+        "per_layer": {
+            layer_labels[l]: {
+                "mean": float(layer_means[l]),
+                "std": float(layer_stds[l]),
+            }
+            for l in range(n_layers_plus1)
+        },
+    }
+    with open(os.path.join(ent_dir, "layer_entropy_stats.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+
+    html_parts.append('</body></html>')
+
+    with open(os.path.join(ent_dir, "summary.html"), "w") as f:
+        f.write("".join(html_parts))
+
+    print(f"  Saved layer entropy summary to {ent_dir}/summary.html")
 
 
 # ---------------------------------------------------------------------------
@@ -1598,23 +2062,36 @@ def main():
     print("Generating entropy HTML ...")
     generate_entropy_html(results, os.path.join(args.output_dir, "entropy.html"))
 
-    # Generate attention heatmaps if internals_dir provided
+    # Generate attention heatmaps and layer entropy if internals_dir provided
     if args.internals_dir:
         if not args.model_path:
-            print("WARNING: --model_path required for attention heatmaps. Skipping.")
+            print("WARNING: --model_path required for attention heatmaps / layer entropy. Skipping.")
         else:
+            model = _load_model(args.model_path, args.attn_impl)
+
             print("Generating attention heatmaps (reconstructing from hidden states) ...")
             try:
                 generate_attention_heatmaps(
-                    model_path=args.model_path,
+                    model=model,
                     internals_dir=args.internals_dir,
                     output_dir=args.output_dir,
-                    attn_impl=args.attn_impl,
                     layers=args.layers,
                     no_png=args.no_png,
                 )
             except ImportError as e:
                 print(f"  WARNING: Attention heatmaps skipped ({e})")
+
+            print("Generating per-layer entropy (logit lens) ...")
+            try:
+                generate_layer_entropy_html(
+                    model=model,
+                    internals_dir=args.internals_dir,
+                    output_dir=args.output_dir,
+                )
+            except ImportError as e:
+                print(f"  WARNING: Layer entropy skipped ({e})")
+
+            _free_model(model)
 
     print(f"\nAll outputs saved to {args.output_dir}/")
     print("Files generated:")
