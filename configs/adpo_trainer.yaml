@@ -54,6 +54,7 @@ actor_rollout_ref:
     tensor_model_parallel_size: 1
     gpu_memory_utilization: 0.4
     enforce_eager: true
+    repetition_penalty: 1.05    # penalize repeated tokens (1.0 = off)
   ref:
     fsdp_config:
       param_offload: true
