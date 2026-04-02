@@ -464,6 +464,9 @@ def generate_with_logprobs_hf(
 
     all_results = []
 
+    total_samples = len(prompts) * n_samples
+    current = 0
+
     for prompt_idx, prompt in enumerate(prompts):
         if isinstance(prompt, (list, np.ndarray)):
             prompt_list = list(prompt) if isinstance(prompt, np.ndarray) else prompt
@@ -474,6 +477,10 @@ def generate_with_logprobs_hf(
         input_ids = tokenizer.encode(text, return_tensors="pt").to(model.device)
 
         for sample_idx in range(n_samples):
+            current += 1
+            print(f"  [{current}/{total_samples}] Generating prompt {prompt_idx}, "
+                  f"sample {sample_idx} ({input_ids.shape[1]} prompt tokens, "
+                  f"max {max_tokens} new tokens) ...", flush=True)
             with torch.no_grad():
                 output = model.generate(
                     input_ids,
@@ -528,8 +535,7 @@ def generate_with_logprobs_hf(
                 "num_tokens": len(tokens_data),
                 "tokens": tokens_data,
             })
-
-        print(f"  [{prompt_idx+1}/{len(prompts)}] Generated {n_samples} sample(s)")
+            print(f"    → {len(tokens_data)} tokens generated", flush=True)
 
     return all_results
 
