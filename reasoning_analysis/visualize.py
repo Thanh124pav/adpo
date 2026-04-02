@@ -1234,7 +1234,42 @@ def _render_attention_heatmap_html(
     n_rows, n_cols = matrix.shape
 
     # Normalize for color mapping
-    if normalize_per_row:
+    # When causal: exclude diagonal values (self-attention is typically very
+    # large and dominates the color scale, washing out off-diagonal patterns)
+    if is_causal and n_rows == n_cols:
+        # Build mask: True for off-diagonal, lower-triangle cells only
+        off_diag_mask = np.zeros_like(matrix, dtype=bool)
+        for i in range(n_rows):
+            off_diag_mask[i, :i] = True  # j < i only
+
+        if normalize_per_row:
+            normed = np.zeros_like(matrix, dtype=np.float64)
+            for i in range(n_rows):
+                row_vals = matrix[i, :i]  # exclude diagonal and future
+                if len(row_vals) == 0 or np.all(row_vals == 0):
+                    normed[i] = 0.0
+                    continue
+                nonzero = row_vals[row_vals > 0]
+                if len(nonzero) == 0:
+                    normed[i] = 0.0
+                    continue
+                vmin = np.percentile(nonzero, 2)
+                vmax = np.percentile(nonzero, 98)
+                if vmax <= vmin:
+                    vmax = vmin + 1e-8
+                normed[i] = np.clip((matrix[i] - vmin) / (vmax - vmin), 0.0, 1.0)
+        else:
+            off_diag_vals = matrix[off_diag_mask]
+            nonzero = off_diag_vals[off_diag_vals > 0]
+            if len(nonzero) == 0:
+                normed = np.zeros_like(matrix, dtype=np.float64)
+            else:
+                vmin = np.percentile(nonzero, 2)
+                vmax = np.percentile(nonzero, 98)
+                if vmax <= vmin:
+                    vmax = vmin + 1e-8
+                normed = np.clip((matrix - vmin) / (vmax - vmin), 0.0, 1.0)
+    elif normalize_per_row:
         normed = np.zeros_like(matrix, dtype=np.float64)
         for i in range(n_rows):
             normed[i] = _normalize_attention_for_viz(matrix[i:i+1]).flatten()
@@ -1397,7 +1432,7 @@ td:hover {{
     causal_legend = ('<span style="display:inline-block;width:16px;height:16px;'
                      'background:#e8e8e8;border:1px solid #ccc;vertical-align:middle;'
                      'margin-left:12px"></span> '
-                     '<span style="color:#888">= causal mask (future)</span>'
+                     '<span style="color:#888">= masked (self + future)</span>'
                      if is_causal else "")
     if "Orange" in cmap_name:
         grad = "linear-gradient(to right, rgb(255,255,255), rgb(255,65,30))"
@@ -1425,8 +1460,8 @@ td:hover {{
     for i in range(n_rows):
         html_parts.append(f'<tr><th class="row-header" title="row {i}: {esc(row_tokens[i])}">{esc(row_tokens[i])}</th>')
         for j in range(n_cols):
-            # Causal mask: gray out cells above diagonal (future positions)
-            if is_causal and j > i:
+            # Causal mask: gray out diagonal and above (self + future)
+            if is_causal and n_rows == n_cols and j >= i:
                 html_parts.append(
                     f'<td style="background:#e8e8e8" '
                     f'data-r="{i}" data-c="{j}" data-v="masked">'
