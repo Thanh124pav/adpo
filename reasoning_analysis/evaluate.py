@@ -465,10 +465,11 @@ def generate_with_logprobs_hf(
     all_results = []
 
     for prompt_idx, prompt in enumerate(prompts):
-        if isinstance(prompt, list):
-            text = tokenizer.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
+        if isinstance(prompt, (list, np.ndarray)):
+            prompt_list = list(prompt) if isinstance(prompt, np.ndarray) else prompt
+            text = tokenizer.apply_chat_template(prompt_list, tokenize=False, add_generation_prompt=True)
         else:
-            text = prompt
+            text = str(prompt)
 
         input_ids = tokenizer.encode(text, return_tensors="pt").to(model.device)
 
