@@ -1215,6 +1215,7 @@ def _render_attention_heatmap_html(
     output_path: str,
     cmap_name: str = "Blues",
     normalize_per_row: bool = False,
+    is_causal: bool = False,
 ):
     """Render an attention heatmap as a fully interactive HTML file.
 
@@ -1224,7 +1225,11 @@ def _render_attention_heatmap_html(
 
     Args:
         normalize_per_row: If True, normalize each row independently instead
-                          of the whole matrix. Useful for per-layer entropy.
+                          of the whole matrix. Better for attention (shows
+                          per-query distribution) and per-layer entropy.
+        is_causal: If True, cells above the diagonal (j > i) are masked
+                   with a distinct gray color to indicate future positions
+                   that the model cannot attend to.
     """
     n_rows, n_cols = matrix.shape
 
@@ -1388,6 +1393,12 @@ td:hover {{
 """)
 
     # Legend
+    norm_label = "per-row normalized" if normalize_per_row else "global percentile-normalized"
+    causal_legend = ('<span style="display:inline-block;width:16px;height:16px;'
+                     'background:#e8e8e8;border:1px solid #ccc;vertical-align:middle;'
+                     'margin-left:12px"></span> '
+                     '<span style="color:#888">= causal mask (future)</span>'
+                     if is_causal else "")
     if "Orange" in cmap_name:
         grad = "linear-gradient(to right, rgb(255,255,255), rgb(255,65,30))"
     else:
@@ -1396,7 +1407,8 @@ td:hover {{
   <span>Low</span>
   <div class="legend-bar" style="background: {grad}"></div>
   <span>High</span>
-  <span style="color:#888">(percentile-normalized for contrast)</span>
+  <span style="color:#888">({norm_label})</span>
+  {causal_legend}
 </div>
 <div class="zoom-controls">
   <button id="zoom-out" title="Zoom out">−</button>
@@ -1413,6 +1425,13 @@ td:hover {{
     for i in range(n_rows):
         html_parts.append(f'<tr><th class="row-header" title="row {i}: {esc(row_tokens[i])}">{esc(row_tokens[i])}</th>')
         for j in range(n_cols):
+            # Causal mask: gray out cells above diagonal (future positions)
+            if is_causal and j > i:
+                html_parts.append(
+                    f'<td style="background:#e8e8e8" '
+                    f'data-r="{i}" data-c="{j}" data-v="masked">'
+                    f'</td>')
+                continue
             raw_val = matrix[i, j]
             norm_val = normed[i, j]
             color = val_to_rgb(float(norm_val))
@@ -1677,6 +1696,8 @@ def generate_attention_heatmaps(model, internals_dir: str,
                     tt, think_tokens, think_tokens, title,
                     os.path.join(attn_dir, f"sample_{sample_idx:03d}_think_think.html"),
                     cmap_name="Blues",
+                    normalize_per_row=True,
+                    is_causal=True,
                 )
 
             # Output→Think sub-matrix
@@ -1690,6 +1711,7 @@ def generate_attention_heatmaps(model, internals_dir: str,
                     ot, out_tokens, think_tokens, title,
                     os.path.join(attn_dir, f"sample_{sample_idx:03d}_out_think.html"),
                     cmap_name="Oranges",
+                    normalize_per_row=True,
                 )
 
             # --- Sentence-level heatmaps ---
@@ -1704,6 +1726,8 @@ def generate_attention_heatmaps(model, internals_dir: str,
                     f"Sentence-level Attention (sample {sample_idx}, layer {viz_layer})",
                     os.path.join(attn_dir, f"sample_{sample_idx:03d}_sentences.html"),
                     cmap_name="Blues",
+                    normalize_per_row=True,
+                    is_causal=True,
                 )
 
             # --- Phase-level heatmaps (ADPO algorithm) ---
@@ -1724,6 +1748,8 @@ def generate_attention_heatmaps(model, internals_dir: str,
                         os.path.join(attn_dir,
                                      f"sample_{sample_idx:03d}_phases.html"),
                         cmap_name="Blues",
+                        normalize_per_row=True,
+                        is_causal=True,
                     )
 
             if (sample_idx + 1) % 10 == 0:
