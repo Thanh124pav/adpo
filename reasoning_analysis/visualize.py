@@ -1394,14 +1394,16 @@ td:hover {{
 .tooltip {{
     display: none;
     position: fixed;
-    background: rgba(0,0,0,0.85);
+    background: rgba(0,0,0,0.9);
     color: #fff;
-    padding: 6px 10px;
-    border-radius: 4px;
+    padding: 8px 12px;
+    border-radius: 6px;
     font-size: 12px;
     pointer-events: none;
     z-index: 999;
-    white-space: pre;
+    white-space: pre-wrap;
+    max-width: 500px;
+    line-height: 1.5;
 }}
 .legend {{
     margin: 10px 0;
@@ -1485,26 +1487,34 @@ td:hover {{
 
     html_parts.append('</table>\n</div>\n</div>\n')
 
+    # Embed full token/label text as JSON for tooltip lookup
+    import json as _json
+    row_tokens_json = _json.dumps(row_tokens, ensure_ascii=False)
+    col_tokens_json = _json.dumps(col_tokens, ensure_ascii=False)
+
     # Tooltip + zoom/pan script
-    html_parts.append("""
+    html_parts.append(f"""
 <div class="tooltip" id="tooltip"></div>
 <script>
-(function() {
+(function() {{
     const wrap = document.getElementById('heatmap-wrap');
     const inner = document.getElementById('heatmap-inner');
     const tip = document.getElementById('tooltip');
     const zoomLabel = document.getElementById('zoom-label');
 
+    const ROW_LABELS = {row_tokens_json};
+    const COL_LABELS = {col_tokens_json};
+
     let scale = 1, panX = 0, panY = 0;
     let dragging = false, startX = 0, startY = 0, startPanX = 0, startPanY = 0;
     const MIN_SCALE = 0.1, MAX_SCALE = 5;
 
-    function applyTransform() {
-        inner.style.transform = `translate(${panX}px, ${panY}px) scale(${scale})`;
+    function applyTransform() {{
+        inner.style.transform = `translate(${{panX}}px, ${{panY}}px) scale(${{scale}})`;
         zoomLabel.textContent = Math.round(scale * 100) + '%';
-    }
+    }}
 
-    function zoomAt(cx, cy, factor) {
+    function zoomAt(cx, cy, factor) {{
         const rect = wrap.getBoundingClientRect();
         const mx = cx - rect.left;
         const my = cy - rect.top;
@@ -1514,68 +1524,68 @@ td:hover {{
         panY = my - ratio * (my - panY);
         scale = newScale;
         applyTransform();
-    }
+    }}
 
     // Wheel zoom
-    wrap.addEventListener('wheel', function(e) {
+    wrap.addEventListener('wheel', function(e) {{
         e.preventDefault();
         const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
         zoomAt(e.clientX, e.clientY, factor);
-    }, {passive: false});
+    }}, {{passive: false}});
 
     // Button zoom
-    document.getElementById('zoom-in').addEventListener('click', function() {
+    document.getElementById('zoom-in').addEventListener('click', function() {{
         const rect = wrap.getBoundingClientRect();
         zoomAt(rect.left + rect.width/2, rect.top + rect.height/2, 1.3);
-    });
-    document.getElementById('zoom-out').addEventListener('click', function() {
+    }});
+    document.getElementById('zoom-out').addEventListener('click', function() {{
         const rect = wrap.getBoundingClientRect();
         zoomAt(rect.left + rect.width/2, rect.top + rect.height/2, 1/1.3);
-    });
-    document.getElementById('zoom-reset').addEventListener('click', function() {
+    }});
+    document.getElementById('zoom-reset').addEventListener('click', function() {{
         scale = 1; panX = 0; panY = 0;
         applyTransform();
-    });
+    }});
 
     // Drag to pan
-    wrap.addEventListener('mousedown', function(e) {
+    wrap.addEventListener('mousedown', function(e) {{
         if (e.button !== 0) return;
         dragging = true;
         startX = e.clientX; startY = e.clientY;
         startPanX = panX; startPanY = panY;
         wrap.classList.add('dragging');
         e.preventDefault();
-    });
-    window.addEventListener('mousemove', function(e) {
-        if (dragging) {
+    }});
+    window.addEventListener('mousemove', function(e) {{
+        if (dragging) {{
             panX = startPanX + (e.clientX - startX);
             panY = startPanY + (e.clientY - startY);
             applyTransform();
-        }
+        }}
         // Tooltip
         const td = e.target.closest('td[data-v]');
-        if (td) {
-            const r = td.dataset.r, c = td.dataset.c, v = td.dataset.v;
-            const rt = document.querySelectorAll('th.row-header')[r];
-            const ct = document.querySelectorAll('th.col-header')[c];
-            const rn = rt ? rt.textContent : r;
-            const cn = ct ? ct.textContent : c;
-            tip.innerHTML = `Row[${r}]: ${rn}\\nCol[${c}]: ${cn}\\nValue: ${v}`;
+        if (td) {{
+            const r = parseInt(td.dataset.r);
+            const c = parseInt(td.dataset.c);
+            const v = td.dataset.v;
+            const rn = ROW_LABELS[r] || r;
+            const cn = COL_LABELS[c] || c;
+            tip.innerHTML = `<b>Row[${{r}}]:</b> ${{rn}}\\n<b>Col[${{c}}]:</b> ${{cn}}\\n<b>Value:</b> ${{v}}`;
             tip.style.display = 'block';
             tip.style.left = (e.clientX + 14) + 'px';
             tip.style.top = (e.clientY + 14) + 'px';
-        } else {
+        }} else {{
             tip.style.display = 'none';
-        }
-    });
-    window.addEventListener('mouseup', function() {
+        }}
+    }});
+    window.addEventListener('mouseup', function() {{
         dragging = false;
         wrap.classList.remove('dragging');
-    });
-    wrap.addEventListener('mouseleave', function() {
+    }});
+    wrap.addEventListener('mouseleave', function() {{
         tip.style.display = 'none';
-    });
-})();
+    }});
+}})();
 </script>
 </body></html>""")
 
@@ -1951,14 +1961,16 @@ td:hover {{
 .tooltip {{
     display: none;
     position: fixed;
-    background: rgba(0,0,0,0.85);
+    background: rgba(0,0,0,0.9);
     color: #fff;
-    padding: 6px 10px;
-    border-radius: 4px;
+    padding: 8px 12px;
+    border-radius: 6px;
     font-size: 12px;
     pointer-events: none;
     z-index: 999;
-    white-space: pre;
+    white-space: pre-wrap;
+    max-width: 500px;
+    line-height: 1.5;
 }}
 .phase-nav {{ margin: 10px 0; }}
 .phase-nav a {{ margin: 0 6px; text-decoration: none; color: #3498db; }}
@@ -2040,25 +2052,35 @@ td:hover {{
 
         html_parts.append('</table>\n</div>\n</div>\n')
 
-    # Tooltip script
-    html_parts.append("""
+    # Embed data for tooltip
+    import json as _json
+    layer_labels_json = _json.dumps(layer_labels, ensure_ascii=False)
+    all_tokens_json = _json.dumps(tokens, ensure_ascii=False)
+
+    html_parts.append(f"""
 <div class="tooltip" id="tooltip"></div>
 <script>
-(function() {
+(function() {{
     const tip = document.getElementById('tooltip');
-    document.addEventListener('mousemove', function(e) {
+    const LAYERS = {layer_labels_json};
+    const TOKENS = {all_tokens_json};
+    document.addEventListener('mousemove', function(e) {{
         const td = e.target.closest('td[data-v]');
-        if (td) {
-            const r = td.dataset.r, c = td.dataset.c, v = td.dataset.v;
-            tip.innerHTML = `Layer: ${r}, Token pos: ${c}\\nEntropy: ${v}`;
+        if (td) {{
+            const r = parseInt(td.dataset.r);
+            const c = parseInt(td.dataset.c);
+            const v = td.dataset.v;
+            const layerName = LAYERS[r] || r;
+            const tokenText = TOKENS[c] || ('pos ' + c);
+            tip.innerHTML = `<b>Layer:</b> ${{layerName}}\\n<b>Token[${{c}}]:</b> ${{tokenText}}\\n<b>Entropy:</b> ${{v}}`;
             tip.style.display = 'block';
             tip.style.left = (e.clientX + 14) + 'px';
             tip.style.top = (e.clientY + 14) + 'px';
-        } else {
+        }} else {{
             tip.style.display = 'none';
-        }
-    });
-})();
+        }}
+    }});
+}})();
 </script>
 </body></html>""")
 
