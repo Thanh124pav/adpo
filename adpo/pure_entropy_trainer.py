@@ -39,42 +39,69 @@ from adpo.reward_functions import compute_score
 logger = logging.getLogger(__name__)
 
 
+def _pick_best_gpu() -> torch.device:
+    """Pick the GPU with the most free memory.
+
+    This avoids loading the HF model on the same GPU as actor/rollout
+    (which typically uses most of GPU 0's memory).
+
+    If only 1 GPU is available, uses it anyway (will share memory).
+    """
+    n_gpus = torch.cuda.device_count()
+    if n_gpus == 0:
+        return torch.device("cpu")
+
+    best_gpu = 0
+    best_free = 0
+
+    for i in range(n_gpus):
+        free, total = torch.cuda.mem_get_info(i)
+        used = total - free
+        print(
+            f"[PureEntropy] GPU {i}: {torch.cuda.get_device_name(i)}, "
+            f"free={free / 1e9:.1f}GB, used={used / 1e9:.1f}GB, total={total / 1e9:.1f}GB",
+            flush=True,
+        )
+        if free > best_free:
+            best_free = free
+            best_gpu = i
+
+    device = torch.device(f"cuda:{best_gpu}")
+    print(f"[PureEntropy] Selected GPU {best_gpu} (most free: {best_free / 1e9:.1f}GB)", flush=True)
+    return device
+
+
 def _load_hf_model(model_path: str):
     """Load HuggingFace model for hidden state extraction + attention reconstruction.
 
-    Uses flash_attention_2 for fast partial forward. This is safe because
-    reconstruct_attention() computes attention directly from model weights
-    (q_proj, k_proj, layernorm, RoPE) -- it never calls the model's own
-    attention implementation.
+    Automatically selects the GPU with the most free memory to avoid OOM
+    when sharing with actor/rollout. Falls back to CPU if no GPU available.
 
     Cached after first load.
     """
     from transformers import AutoModelForCausalLM
-    logger.info(f"[PureEntropy] Loading HF model from {model_path} for attention reconstruction...")
-    print(f"[PureEntropy] Loading HF model from {model_path} for attention reconstruction...", flush=True)
+    import os
+
+    logger.info(f"[PureEntropy] Loading HF model from {model_path}...")
+    print(f"[PureEntropy] Loading HF model from {model_path}...", flush=True)
 
     # Force CUDA visibility even if Ray didn't allocate a GPU to this worker.
-    # The TaskRunner runs with num_cpus=1 (no GPU) to avoid stealing GPUs from
-    # actor/rollout, but we still need CUDA for the HF model forward pass.
-    import os
     if not torch.cuda.is_available():
-        # Ray may have set CUDA_VISIBLE_DEVICES="" — override it
         visible = os.environ.get("CUDA_VISIBLE_DEVICES", "not set")
         print(f"[PureEntropy] CUDA not available (CUDA_VISIBLE_DEVICES={visible}), "
               "resetting to make all GPUs visible", flush=True)
         if "CUDA_VISIBLE_DEVICES" in os.environ:
             del os.environ["CUDA_VISIBLE_DEVICES"]
-        # Re-init CUDA
         torch.cuda.init()
 
     if torch.cuda.is_available():
-        device = torch.device("cuda")
+        # Pick the GPU with the most free memory (avoid the one used by actor/rollout)
+        device = _pick_best_gpu()
         attn_impls = ["flash_attention_2", "eager"]
-        print(f"[PureEntropy] CUDA available: {torch.cuda.get_device_name()}", flush=True)
     else:
         device = torch.device("cpu")
         attn_impls = ["eager"]
-        print("[PureEntropy] WARNING: CUDA still not available after reset, using CPU", flush=True)
+        print("[PureEntropy] WARNING: No CUDA available, using CPU", flush=True)
 
     # Try flash_attention_2 first (fastest), fall back to eager
     for attn_impl in attn_impls:
