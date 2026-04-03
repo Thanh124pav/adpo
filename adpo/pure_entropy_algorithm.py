@@ -330,18 +330,24 @@ def build_influence_matrix_A(
 ) -> np.ndarray:
     """Build the influence matrix A from the full phase attention matrix.
 
-    A is (m-1) x (m-1), lower triangular with zero diagonal.
-    A[i][j] = phase_attn[i+1][j] (attention from phase i+1 to phase j),
+    A is (m-1) x (m-1), lower triangular (including diagonal).
+    A[i][j] = phase_attn[i+1][j] (attention from phase (i+1) to phase j),
     representing the influence of phase j on phase (i+1).
 
+    Key insight on the diagonal:
+        A[i][i] = phase_attn[i+1][i] = attention from phase (i+1) to phase i.
+        This is CROSS-phase attention (not self-attention), so it is kept.
+        Self-attention (phase_attn[k][k]) is naturally excluded because
+        A only uses rows 1..m-1 paired with cols 0..m-2.
+
     The equation: A * r[0:m-2] = r[1:m-1]
-    Row i: sum_j A[i][j] * r_j = r_{i+1}
+    Row i: sum_{j<=i} A[i][j] * r_j = r_{i+1}
 
     Args:
         phase_attn: (m, m) full phase attention matrix.
 
     Returns:
-        A: (m-1, m-1) lower triangular matrix with zero diagonal.
+        A: (m-1, m-1) lower triangular matrix (diagonal included).
     """
     m = phase_attn.shape[0]
     if m < 2:
@@ -354,9 +360,9 @@ def build_influence_matrix_A(
         for j in range(n):
             A[i][j] = phase_attn[i + 1][j]
 
-    # Enforce lower triangular with zero diagonal
+    # Enforce lower triangular only (causal: phase i+1 can only attend to phases 0..i)
+    # Diagonal A[i][i] = phase_attn[i+1][i] is valid cross-phase attention, keep it.
     for i in range(n):
-        A[i][i] = 0.0  # zero diagonal
         for j in range(i + 1, n):
             A[i][j] = 0.0  # zero upper triangle
 
@@ -375,17 +381,22 @@ def solve_phase_rewards(
     """Solve for phase rewards using the system A * r[0:m-2] = r[1:m-1].
 
     Given:
-        A: (m-1, m-1) lower triangular matrix, zero diagonal.
+        A: (m-1, m-1) lower triangular matrix (diagonal included).
         r_last: reward of the last phase (r_{m-1}), from exact matching.
         n_phases: m, total number of phases.
 
-    The system:
-        Row i (i=0..m-3): sum_j A[i][j]*r_j - r_{i+1} = 0
-        Row m-2: sum_j A[m-2][j]*r_j = r_{m-1}
+    The system (0-indexed, x = [r_0, ..., r_{m-2}]):
+        Row i (i=0..m-3): sum_{j<=i} A[i][j]*r_j = r_{i+1}  →  A[i]*x - r_{i+1} = 0
+        Row m-2:          sum_{j<=m-2} A[m-2][j]*r_j = r_{m-1} (known)
 
-    We rearrange into B*x = c:
+    Rearrange into B*x = c:
         B = A, but B[i][i+1] -= 1 for i = 0..m-3
         c = [0, ..., 0, r_{m-1}]
+
+    Example (m=4 phases, A is 3x3):
+        Row 0: A[0][0]*r_0 = r_1             →  A[0][0]*r_0 - r_1 = 0
+        Row 1: A[1][0]*r_0 + A[1][1]*r_1 = r_2  →  ... - r_2 = 0
+        Row 2: A[2][0]*r_0 + A[2][1]*r_1 + A[2][2]*r_2 = r_3 (known)
 
     Returns:
         rewards: (m,) array of phase rewards [r_0, r_1, ..., r_{m-1}].
