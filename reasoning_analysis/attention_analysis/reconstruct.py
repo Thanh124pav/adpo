@@ -126,6 +126,7 @@ def reconstruct_attention(
     hidden_state: torch.Tensor,
     position_ids: torch.Tensor | None = None,
     output_dtype: torch.dtype | None = None,
+    matmul_on_cpu: bool = False,
 ) -> torch.Tensor:
     """Reconstruct attention weights for one layer from its input hidden state.
 
@@ -139,6 +140,11 @@ def reconstruct_attention(
         output_dtype: dtype for the output attention matrix.
                       Defaults to torch.float32.  Use torch.bfloat16 or
                       torch.float16 to halve peak GPU memory.
+        matmul_on_cpu: If True, move Q/K to CPU before the attention matmul.
+                       Steps 1-5 (LayerNorm, projection, QK-Norm, RoPE) still
+                       run on GPU using model weights; only the large
+                       (num_heads, seq, seq) matmul + softmax run on CPU.
+                       This keeps GPU memory usage independent of seq_len².
 
     Returns:
         attn_weights: (num_heads, seq_len, seq_len) attention matrix.
@@ -168,6 +174,8 @@ def reconstruct_attention(
     Q = attn.q_proj(h)  # (1, seq, num_heads * head_dim)
     K = attn.k_proj(h)  # (1, seq, num_kv_heads * head_dim)
 
+    del h  # free GPU memory early
+
     # Step 3: Reshape to (batch, num_heads, seq, head_dim)
     Q = Q.view(1, seq_len, num_heads, head_dim).transpose(1, 2)
     K = K.view(1, seq_len, num_kv_heads, head_dim).transpose(1, 2)
@@ -188,6 +196,18 @@ def reconstruct_attention(
         n_rep = num_heads // num_kv_heads
         K = K.repeat_interleave(n_rep, dim=1)
 
+    # --- Move Q, K to CPU if requested (before the large matmul) ---
+    # Q, K are small: (1, num_heads, seq, head_dim) ≈ a few MiB.
+    # The matmul result (1, num_heads, seq, seq) can be hundreds of MiB.
+    if matmul_on_cpu:
+        Q = Q.float().cpu()
+        K = K.float().cpu()
+        compute_device = torch.device("cpu")
+        compute_dtype = torch.float32
+    else:
+        compute_device = device
+        compute_dtype = dtype
+
     # Step 7: Scaled dot-product attention scores
     if hasattr(attn, "scaling"):
         scale = attn.scaling
@@ -196,9 +216,12 @@ def reconstruct_attention(
 
     attn_weights = torch.matmul(Q, K.transpose(-2, -1)) * scale
 
+    del Q, K  # free memory before allocating causal_mask
+
     # Step 8: Causal mask + optional sliding window
     causal_mask = torch.triu(
-        torch.full((seq_len, seq_len), float("-inf"), device=device, dtype=dtype),
+        torch.full((seq_len, seq_len), float("-inf"),
+                   device=compute_device, dtype=compute_dtype),
         diagonal=1,
     )
 
@@ -214,17 +237,19 @@ def reconstruct_attention(
     if use_sliding:
         # Mask out positions beyond sliding window
         window_mask = torch.tril(
-            torch.full((seq_len, seq_len), float("-inf"), device=device, dtype=dtype),
+            torch.full((seq_len, seq_len), float("-inf"),
+                       device=compute_device, dtype=compute_dtype),
             diagonal=-(sliding_window + 1),
         )
         causal_mask = causal_mask + window_mask
 
     attn_weights = attn_weights + causal_mask
 
+    del causal_mask
+
     # Step 9: Softmax
-    # Use float32 for intermediate softmax numerics, then cast to output_dtype.
-    # When output_dtype is float16/bfloat16 this halves peak memory of the
-    # returned tensor (e.g. 128 MiB vs 256 MiB for 16 heads × 2048² tokens).
+    # When on CPU (matmul_on_cpu), already in float32 — softmax directly.
+    # When on GPU, compute softmax in float32 then cast to output_dtype.
     attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
     if output_dtype != torch.float32:
         attn_weights = attn_weights.to(output_dtype)

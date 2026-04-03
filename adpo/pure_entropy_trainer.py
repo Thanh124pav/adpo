@@ -453,16 +453,18 @@ def patch_verl_grpo_with_pure_entropy(
                 del hs_full, sub_ids
 
                 # --- Reconstruct attention (response tokens only) ---
-                # Use bfloat16 output to halve GPU memory for the attention
-                # matrix: 128 MiB vs 256 MiB for 16 heads × 2048² tokens.
+                # matmul_on_cpu=True: Steps 1-5 (LayerNorm, Q/K proj, RoPE)
+                # run on GPU, then Q/K move to CPU for the large matmul.
+                # GPU never allocates the O(num_heads × resp_len²) tensor.
                 try:
                     attn_weights = reconstruct_attention_at_layer(
                         model=hf_model,
                         layer_idx=layer_L,
                         hidden_state=hs_resp,
                         position_ids=pos_resp,
-                        output_dtype=torch.bfloat16,
-                    )  # (num_heads, resp_len, resp_len) bfloat16
+                        output_dtype=torch.float32,
+                        matmul_on_cpu=True,
+                    )  # (num_heads, resp_len, resp_len) float32, on CPU
                 except Exception as e:
                     logger.error(f"[PureEntropy] Attention reconstruction failed for b={b}: {e}")
                     print(f"[PureEntropy] ERROR: Attention reconstruction failed for b={b}: {e}", flush=True)
@@ -480,11 +482,9 @@ def patch_verl_grpo_with_pure_entropy(
             boundaries_relative = [bd - resp_start for bd in boundaries_batch[b]]
             resp_end_relative = resp_end - resp_start
 
-            # Move to CPU before phase averaging to free GPU immediately.
-            # .float() ensures numpy gets float32 precision for the small
-            # (m × m) phase matrix even though token-level was bfloat16.
+            # attn_weights is already on CPU (matmul_on_cpu=True)
             phase_attn = build_phase_attention_matrix(
-                attn_weights=attn_weights.cpu(),
+                attn_weights=attn_weights,
                 boundaries=boundaries_relative,
                 resp_end=resp_end_relative,
             )
