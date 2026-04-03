@@ -272,17 +272,28 @@ def _partial_forward(
     # Step 1: Embedding
     hidden_states = base.embed_tokens(input_ids)
 
-    # Step 2: Forward through layers 0 .. target_layer-1
+    # Step 2: Compute RoPE position embeddings (cos, sin) once
+    # New transformers (Qwen2, Llama3, etc.) compute rotary embeddings
+    # at the model level and pass them to each layer as `position_embeddings`.
+    position_embeddings = None
+    if hasattr(base, "rotary_emb"):
+        position_embeddings = base.rotary_emb(hidden_states, position_ids)
+
+    # Step 3: Forward through layers 0 .. target_layer-1
     # hidden_states[layer_idx] = input to layer layer_idx = output of layer layer_idx-1
     # So to get input to target_layer, we run layers 0..target_layer-1
     for i in range(target_layer):
         layer = base.layers[i]
-        # Most HF models support this interface
-        layer_outputs = layer(
-            hidden_states,
-            position_ids=position_ids,
-            use_cache=False,
-        )
+
+        # Build kwargs — different transformers versions accept different args
+        kwargs = {"use_cache": False}
+        if position_embeddings is not None:
+            kwargs["position_embeddings"] = position_embeddings
+        else:
+            kwargs["position_ids"] = position_ids
+
+        layer_outputs = layer(hidden_states, **kwargs)
+
         # layer_outputs can be a tuple (hidden_states, ...) or BaseModelOutput
         if isinstance(layer_outputs, tuple):
             hidden_states = layer_outputs[0]
