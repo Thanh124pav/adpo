@@ -32,6 +32,7 @@ ENTROPY_PERCENTILE=${ENTROPY_PERCENTILE:-75.0}     # percentile threshold
 PHASE_MIN_LEN=${PHASE_MIN_LEN:-10}                 # minimum tokens per phase
 PHASE_MAX_K=${PHASE_MAX_K:-10}                      # maximum phases per response
 ATTENTION_LAYER=${ATTENTION_LAYER:--1}              # layer L for attention (-1 = auto: 3/4 depth)
+ATTENTION_NORM_MODE=${ATTENTION_NORM_MODE:-"row"}  # normalization for A: "none", "row", "col", "matrix"
 
 # Reward parameters
 CORRECT_REWARD=${CORRECT_REWARD:-1.0}
@@ -56,6 +57,7 @@ echo " Batch size:      $BATCH_SIZE (x${GROUP_SIZE} rollouts)"
 echo " Entropy window:  $ENTROPY_WINDOW_SIZE"
 echo " Entropy pct:     $ENTROPY_PERCENTILE"
 echo " Attention layer: $ATTENTION_LAYER"
+echo " Attn norm mode: $ATTENTION_NORM_MODE"
 echo " Output:          $OUTPUT_DIR"
 echo "============================================="
 
@@ -83,6 +85,7 @@ python -m adpo.main_pure_entropy \
     algorithm.phase_min_len="$PHASE_MIN_LEN" \
     algorithm.phase_max_K="$PHASE_MAX_K" \
     algorithm.attention_layer="$ATTENTION_LAYER" \
+    algorithm.attention_norm_mode="$ATTENTION_NORM_MODE" \
     algorithm.correct_reward="$CORRECT_REWARD" \
     algorithm.incorrect_reward="$INCORRECT_REWARD" \
     algorithm.partial_reward="$PARTIAL_REWARD" \

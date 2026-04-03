@@ -82,6 +82,7 @@ def patch_verl_grpo_with_pure_entropy(
     phase_max_K: int = 10,
     # Attention reconstruction params
     attention_layer: int = -1,  # Which layer L to reconstruct attention at (-1 = auto)
+    attention_norm_mode: str = "row",  # Normalization for A: "none", "row", "col", "matrix"
     # Reward params
     correct_reward: float = 1.0,
     incorrect_reward: float = 0.0,
@@ -98,6 +99,11 @@ def patch_verl_grpo_with_pure_entropy(
         phase_max_K: Maximum phases per response.
         attention_layer: Layer index L for attention reconstruction.
             -1 = auto (3/4 of total layers).
+        attention_norm_mode: Normalization for influence matrix A.
+            "none" - raw attention values.
+            "row"  - each row sums to 1 (r_{i+1} = weighted avg of earlier r).
+            "col"  - each column sums to 1 (each source phase's total influence = 1).
+            "matrix" - entire matrix sums to 1.
         correct_reward: Reward for last phase when answer is correct.
         incorrect_reward: Reward for last phase when answer is wrong.
         partial_reward: Reward for last phase on partial match.
@@ -400,7 +406,7 @@ def patch_verl_grpo_with_pure_entropy(
                 )
 
             # Build influence matrix A (m-1 x m-1)
-            A = build_influence_matrix_A(phase_attn)
+            A = build_influence_matrix_A(phase_attn, norm_mode=attention_norm_mode)
 
             if b == 0:
                 print(
@@ -514,6 +520,7 @@ class PureEntropyTaskRunner:
             phase_max_K=algo.get("phase_max_K", 10),
             # Attention reconstruction
             attention_layer=algo.get("attention_layer", -1),
+            attention_norm_mode=algo.get("attention_norm_mode", "row"),
             # Reward
             correct_reward=algo.get("correct_reward", 1.0),
             incorrect_reward=algo.get("incorrect_reward", 0.0),

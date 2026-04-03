@@ -327,6 +327,7 @@ def build_phase_attention_matrix(
 
 def build_influence_matrix_A(
     phase_attn: np.ndarray,
+    norm_mode: str = "row",
 ) -> np.ndarray:
     """Build the influence matrix A from the full phase attention matrix.
 
@@ -345,6 +346,14 @@ def build_influence_matrix_A(
 
     Args:
         phase_attn: (m, m) full phase attention matrix.
+        norm_mode: Normalization mode for A after construction.
+            "none" - No normalization (raw attention values).
+            "row"  - Normalize each row to sum to 1.
+                     r_{i+1} = weighted average of r_0..r_i.
+            "col"  - Normalize each column to sum to 1.
+                     Each source phase's total influence sums to 1.
+            "matrix" - Normalize entire matrix to sum to 1.
+                       Global normalization across all entries.
 
     Returns:
         A: (m-1, m-1) lower triangular matrix (diagonal included).
@@ -365,6 +374,41 @@ def build_influence_matrix_A(
     for i in range(n):
         for j in range(i + 1, n):
             A[i][j] = 0.0  # zero upper triangle
+
+    # Log raw A before normalization
+    logger.info(
+        f"[PureEntropy A raw] norm_mode={norm_mode}, "
+        f"A (before norm):\n{np.array2string(A, precision=6, suppress_small=True)}"
+    )
+    print(
+        f"[PureEntropy A raw] norm_mode={norm_mode}, "
+        f"A (before norm):\n{np.array2string(A, precision=6, suppress_small=True)}",
+        flush=True,
+    )
+
+    # Normalize
+    eps = 1e-12
+    if norm_mode == "row":
+        for i in range(n):
+            row_sum = A[i].sum()
+            if row_sum > eps:
+                A[i] /= row_sum
+    elif norm_mode == "col":
+        for j in range(n):
+            col_sum = A[:, j].sum()
+            if col_sum > eps:
+                A[:, j] /= col_sum
+    elif norm_mode == "matrix":
+        mat_sum = A.sum()
+        if mat_sum > eps:
+            A /= mat_sum
+    elif norm_mode == "none":
+        pass
+    else:
+        raise ValueError(
+            f"Unknown norm_mode={norm_mode!r}. "
+            f"Expected one of: 'none', 'row', 'col', 'matrix'"
+        )
 
     return A
 

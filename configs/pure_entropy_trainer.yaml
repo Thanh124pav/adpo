@@ -26,6 +26,7 @@ algorithm:
 
   # Attention reconstruction
   attention_layer: -1            # Layer L for attention reconstruction (-1 = auto: 3/4 depth)
+  attention_norm_mode: row       # Normalization for matrix A: "none", "row", "col", "matrix"
 
   # Reward for last phase (from exact matching)
   correct_reward: 1.0            # Last phase reward when answer is correct
