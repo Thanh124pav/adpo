@@ -294,11 +294,14 @@ def _partial_forward(
 
         layer_outputs = layer(hidden_states, **kwargs)
 
-        # layer_outputs can be a tuple (hidden_states, ...) or BaseModelOutput
-        if isinstance(layer_outputs, tuple):
+        # layer_outputs: tuple (hidden_states, ...) or bare tensor
+        if isinstance(layer_outputs, (tuple, list)):
             hidden_states = layer_outputs[0]
+        elif isinstance(layer_outputs, torch.Tensor):
+            hidden_states = layer_outputs
         else:
-            hidden_states = layer_outputs.last_hidden_state
+            # BaseModelOutput or similar
+            hidden_states = layer_outputs[0]
 
     return hidden_states
 
