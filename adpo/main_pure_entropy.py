@@ -31,10 +31,10 @@ def main(config: DictConfig):
     config = migrate_legacy_reward_impl(config)
     print(OmegaConf.to_yaml(config))
 
-    # PureEntropy needs GPU for HF model forward (hidden states + attention reconstruction).
-    # Use fractional GPU so TaskRunner shares GPU with actor/rollout workers
-    # (the HF model forward runs between rollout and update, so no contention).
-    task_runner_cls = ray.remote(num_cpus=1, num_gpus=0.1)(PureEntropyTaskRunner)
+    # PureEntropy needs GPU access for HF model forward (hidden states + attention).
+    # Don't request GPU from Ray (it would reduce GPUs available for actor/rollout).
+    # Instead, the HF model is loaded with explicit CUDA device inside the worker.
+    task_runner_cls = ray.remote(num_cpus=1)(PureEntropyTaskRunner)
     run_ppo(config, task_runner_class=task_runner_cls)
 
 

@@ -53,7 +53,20 @@ def _load_hf_model(model_path: str):
     logger.info(f"[PureEntropy] Loading HF model from {model_path} for attention reconstruction...")
     print(f"[PureEntropy] Loading HF model from {model_path} for attention reconstruction...", flush=True)
 
-    # Ensure CUDA is available before trying flash_attention_2
+    # Force CUDA visibility even if Ray didn't allocate a GPU to this worker.
+    # The TaskRunner runs with num_cpus=1 (no GPU) to avoid stealing GPUs from
+    # actor/rollout, but we still need CUDA for the HF model forward pass.
+    import os
+    if not torch.cuda.is_available():
+        # Ray may have set CUDA_VISIBLE_DEVICES="" — override it
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES", "not set")
+        print(f"[PureEntropy] CUDA not available (CUDA_VISIBLE_DEVICES={visible}), "
+              "resetting to make all GPUs visible", flush=True)
+        if "CUDA_VISIBLE_DEVICES" in os.environ:
+            del os.environ["CUDA_VISIBLE_DEVICES"]
+        # Re-init CUDA
+        torch.cuda.init()
+
     if torch.cuda.is_available():
         device = torch.device("cuda")
         attn_impls = ["flash_attention_2", "eager"]
@@ -61,7 +74,7 @@ def _load_hf_model(model_path: str):
     else:
         device = torch.device("cpu")
         attn_impls = ["eager"]
-        print("[PureEntropy] WARNING: CUDA not available, using CPU", flush=True)
+        print("[PureEntropy] WARNING: CUDA still not available after reset, using CPU", flush=True)
 
     # Try flash_attention_2 first (fastest), fall back to eager
     for attn_impl in attn_impls:
