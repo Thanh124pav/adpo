@@ -181,6 +181,9 @@ def extract_hidden_states_hf(
     device = next(model.parameters()).device
     batch_size, seq_len = input_ids.shape
 
+    import time
+    t0 = time.time()
+
     logger.info(
         f"[PureEntropy HiddenStates] Extracting hidden states at layer {layer_idx}, "
         f"batch_size={batch_size}, seq_len={seq_len}"
@@ -203,38 +206,90 @@ def extract_hidden_states_hf(
         pos_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(end_b - start_b, -1)
 
         with torch.no_grad():
-            outputs = model(
-                input_ids=sub_ids,
-                position_ids=pos_ids,
-                output_hidden_states=True,
-                use_cache=False,
-            )
+            # Partial forward: only run embedding + layers 0..layer_idx
+            # instead of full model forward with output_hidden_states=True
+            # (avoids computing layers layer_idx+1..n_layers and lm_head)
+            hs = _partial_forward(model, sub_ids, pos_ids, layer_idx)
+            # hs: (sub_batch, seq_len, hidden_dim)
 
-        # outputs.hidden_states is a tuple of (n_layers+1) tensors
-        # Index 0 = embedding output, index i = output of layer i-1
-        # So hidden_states[layer_idx] = input to layer layer_idx
-        hs = outputs.hidden_states[layer_idx]  # (sub_batch, seq_len, hidden_dim)
         all_hidden_states.append(hs.cpu())
 
         # Free memory
-        del outputs, hs
+        del hs
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+        print(
+            f"[PureEntropy HiddenStates] Sub-batch {start_b}-{end_b}/{batch_size} done "
+            f"({time.time() - t0:.1f}s elapsed)",
+            flush=True,
+        )
 
     hidden_states = torch.cat(all_hidden_states, dim=0)  # (batch, seq_len, hidden_dim)
     position_ids = torch.arange(seq_len, device='cpu').unsqueeze(0).expand(batch_size, -1)
 
+    elapsed = time.time() - t0
     logger.info(
         f"[PureEntropy HiddenStates] Extracted: shape={list(hidden_states.shape)}, "
-        f"dtype={hidden_states.dtype}"
+        f"dtype={hidden_states.dtype}, time={elapsed:.1f}s"
     )
     print(
         f"[PureEntropy HiddenStates] Extracted: shape={list(hidden_states.shape)}, "
-        f"dtype={hidden_states.dtype}",
+        f"dtype={hidden_states.dtype}, time={elapsed:.1f}s",
         flush=True,
     )
 
     return hidden_states, position_ids
+
+
+def _partial_forward(
+    model,
+    input_ids: torch.Tensor,
+    position_ids: torch.Tensor,
+    target_layer: int,
+) -> torch.Tensor:
+    """Run embedding + layers 0..target_layer only (skip later layers + lm_head).
+
+    This is much faster than a full forward with output_hidden_states=True
+    because:
+    1. We don't compute layers target_layer+1 .. n_layers-1
+    2. We don't compute lm_head (vocab projection)
+    3. We don't store hidden states for all layers
+
+    Args:
+        model: HuggingFace AutoModelForCausalLM.
+        input_ids: (batch, seq_len) token IDs.
+        position_ids: (batch, seq_len) position IDs.
+        target_layer: Layer index (0-based). We need the INPUT to this layer,
+                      which is the OUTPUT of layer target_layer-1.
+
+    Returns:
+        hidden_states: (batch, seq_len, hidden_dim) at the target layer.
+    """
+    # Access the base model (model.model for CausalLM wrappers)
+    base = model.model if hasattr(model, "model") else model
+
+    # Step 1: Embedding
+    hidden_states = base.embed_tokens(input_ids)
+
+    # Step 2: Forward through layers 0 .. target_layer-1
+    # hidden_states[layer_idx] = input to layer layer_idx = output of layer layer_idx-1
+    # So to get input to target_layer, we run layers 0..target_layer-1
+    for i in range(target_layer):
+        layer = base.layers[i]
+        # Most HF models support this interface
+        layer_outputs = layer(
+            hidden_states,
+            position_ids=position_ids,
+            use_cache=False,
+        )
+        # layer_outputs can be a tuple (hidden_states, ...) or BaseModelOutput
+        if isinstance(layer_outputs, tuple):
+            hidden_states = layer_outputs[0]
+        else:
+            hidden_states = layer_outputs.last_hidden_state
+
+    return hidden_states
 
 
 # ---------------------------------------------------------------------------
