@@ -266,44 +266,41 @@ def _partial_forward(
     Returns:
         hidden_states: (batch, seq_len, hidden_dim) at the target layer.
     """
-    # Access the base model (model.model for CausalLM wrappers)
+    # Use a forward hook to capture hidden states at the target layer,
+    # then abort the forward pass early. This guarantees correctness
+    # (causal mask, RoPE, etc. are all handled by the model itself)
+    # while still saving compute on layers after target_layer.
     base = model.model if hasattr(model, "model") else model
+    target_module = base.layers[target_layer]
 
-    # Step 1: Embedding
-    hidden_states = base.embed_tokens(input_ids)
+    captured = {}
 
-    # Step 2: Compute RoPE position embeddings (cos, sin) once
-    # New transformers (Qwen2, Llama3, etc.) compute rotary embeddings
-    # at the model level and pass them to each layer as `position_embeddings`.
-    position_embeddings = None
-    if hasattr(base, "rotary_emb"):
-        position_embeddings = base.rotary_emb(hidden_states, position_ids)
+    def hook_fn(module, args, kwargs):
+        # Pre-forward hook: capture the input to this layer, then abort
+        # args[0] is hidden_states (the input to this layer)
+        captured["hidden_states"] = args[0].detach()
+        # Raise to abort forward pass early (skip remaining layers + lm_head)
+        raise _EarlyStopForward()
 
-    # Step 3: Forward through layers 0 .. target_layer-1
-    # hidden_states[layer_idx] = input to layer layer_idx = output of layer layer_idx-1
-    # So to get input to target_layer, we run layers 0..target_layer-1
-    for i in range(target_layer):
-        layer = base.layers[i]
+    handle = target_module.register_forward_pre_hook(hook_fn, with_kwargs=True)
+    try:
+        model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            output_hidden_states=False,
+            use_cache=False,
+        )
+    except _EarlyStopForward:
+        pass  # Expected: we aborted the forward early
+    finally:
+        handle.remove()
 
-        # Build kwargs — different transformers versions accept different args
-        kwargs = {"use_cache": False}
-        if position_embeddings is not None:
-            kwargs["position_embeddings"] = position_embeddings
-        else:
-            kwargs["position_ids"] = position_ids
+    return captured["hidden_states"]
 
-        layer_outputs = layer(hidden_states, **kwargs)
 
-        # layer_outputs: tuple (hidden_states, ...) or bare tensor
-        if isinstance(layer_outputs, (tuple, list)):
-            hidden_states = layer_outputs[0]
-        elif isinstance(layer_outputs, torch.Tensor):
-            hidden_states = layer_outputs
-        else:
-            # BaseModelOutput or similar
-            hidden_states = layer_outputs[0]
-
-    return hidden_states
+class _EarlyStopForward(Exception):
+    """Sentinel exception to abort forward pass after capturing hidden states."""
+    pass
 
 
 # ---------------------------------------------------------------------------
