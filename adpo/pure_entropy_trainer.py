@@ -53,17 +53,27 @@ def _load_hf_model(model_path: str):
     logger.info(f"[PureEntropy] Loading HF model from {model_path} for attention reconstruction...")
     print(f"[PureEntropy] Loading HF model from {model_path} for attention reconstruction...", flush=True)
 
+    # Ensure CUDA is available before trying flash_attention_2
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        attn_impls = ["flash_attention_2", "eager"]
+        print(f"[PureEntropy] CUDA available: {torch.cuda.get_device_name()}", flush=True)
+    else:
+        device = torch.device("cpu")
+        attn_impls = ["eager"]
+        print("[PureEntropy] WARNING: CUDA not available, using CPU", flush=True)
+
     # Try flash_attention_2 first (fastest), fall back to eager
-    for attn_impl in ["flash_attention_2", "eager"]:
+    for attn_impl in attn_impls:
         try:
             model = AutoModelForCausalLM.from_pretrained(
                 model_path,
                 trust_remote_code=True,
-                torch_dtype=torch.bfloat16,
+                dtype=torch.bfloat16,
                 attn_implementation=attn_impl,
-                device_map="auto",
+                device_map={"": device},
             )
-            print(f"[PureEntropy] Loaded with attn_implementation={attn_impl}", flush=True)
+            print(f"[PureEntropy] Loaded with attn_implementation={attn_impl}, device={device}", flush=True)
             break
         except Exception as e:
             if attn_impl == "flash_attention_2":
