@@ -125,6 +125,7 @@ def reconstruct_attention(
     layer_idx: int,
     hidden_state: torch.Tensor,
     position_ids: torch.Tensor | None = None,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Reconstruct attention weights for one layer from its input hidden state.
 
@@ -135,10 +136,15 @@ def reconstruct_attention(
                       This is outputs.hidden_states[layer_idx] from a forward pass.
         position_ids: (1, seq_len) — position IDs for RoPE.
                       Defaults to [0, 1, ..., seq_len-1].
+        output_dtype: dtype for the output attention matrix.
+                      Defaults to torch.float32.  Use torch.bfloat16 or
+                      torch.float16 to halve peak GPU memory.
 
     Returns:
-        attn_weights: (num_heads, seq_len, seq_len) float32 attention matrix.
+        attn_weights: (num_heads, seq_len, seq_len) attention matrix.
     """
+    if output_dtype is None:
+        output_dtype = torch.float32
     config = model.config
     layer = model.model.layers[layer_idx]
     attn = layer.self_attn
@@ -215,7 +221,12 @@ def reconstruct_attention(
 
     attn_weights = attn_weights + causal_mask
 
-    # Step 9: Softmax (in float32 for numerical stability)
+    # Step 9: Softmax
+    # Use float32 for intermediate softmax numerics, then cast to output_dtype.
+    # When output_dtype is float16/bfloat16 this halves peak memory of the
+    # returned tensor (e.g. 128 MiB vs 256 MiB for 16 heads × 2048² tokens).
     attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
+    if output_dtype != torch.float32:
+        attn_weights = attn_weights.to(output_dtype)
 
     return attn_weights[0]  # (num_heads, seq_len, seq_len)

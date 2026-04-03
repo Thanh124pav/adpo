@@ -1,0 +1,80 @@
+# Pure-Entropy Trainer Config
+# Inherits from verl's ppo_trainer.yaml, only overrides what's needed.
+#
+# Key differences from ADPO:
+# - No LLM-as-Judge: rewards from exact matching + attention propagation
+# - Phase boundaries from sliding-window entropy (not sentence-based)
+# - Reward assignment via attention influence matrix at layer L
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+# --- Pure-Entropy algorithm config ---
+algorithm:
+  adv_estimator: grpo
+
+  # Phase boundary detection (pure entropy, sliding window)
+  entropy_window_size: 10        # k: sliding window size for entropy averaging
+  entropy_percentile: 75.0       # Percentile threshold for window means
+  phase_min_len: 10              # Minimum tokens between phase boundaries
+  phase_max_K: 10                # Maximum number of phases per response
+
+  # Attention reconstruction
+  attention_layer: -1            # Layer L for attention reconstruction (-1 = auto: 3/4 depth)
+  attention_norm_mode: row       # Normalization for matrix A: "none", "row", "col", "matrix"
+
+  # Reward for last phase (from exact matching)
+  correct_reward: 1.0            # Last phase reward when answer is correct
+  incorrect_reward: 0.0          # Last phase reward when answer is wrong
+  partial_reward: 0.1            # Last phase reward on partial match (e.g. boxed but wrong)
+
+# --- Actor / Rollout / Ref overrides ---
+actor_rollout_ref:
+  model:
+    path: Qwen3-4B
+  actor:
+    ppo_mini_batch_size: 128
+    use_kl_loss: true
+    use_torch_compile: false
+    loss_agg_mode: seq-mean-token-sum-norm
+  rollout:
+    name: vllm
+    n: 8
+    tensor_model_parallel_size: 1
+    gpu_memory_utilization: 0.4
+    enforce_eager: true
+  ref:
+    fsdp_config:
+      param_offload: true
+
+# --- Data ---
+data:
+  train_files: data/processed/train/math.parquet
+  val_files: data/processed/eval/math500.parquet
+  train_batch_size: 128
+  max_prompt_length: 1024
+  max_response_length: 2048
+
+# --- Reward (exact matching only, no judge) ---
+reward:
+  custom_reward_function:
+    path: adpo/reward_functions.py
+    name: compute_score
+  reward_model:
+    enable: false
+
+# --- Trainer ---
+trainer:
+  total_epochs: 3
+  save_freq: 50
+  test_freq: 50
+  project_name: pure-entropy
+  experiment_name: pure-entropy-qwen-4b-math
+  logger:
+    - tensorboard
+  default_local_dir: checkpoints/
