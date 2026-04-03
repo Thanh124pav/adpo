@@ -454,7 +454,7 @@ def patch_verl_grpo_with_pure_entropy(
                 )
 
             # --- Solve for phase rewards ---
-            rewards = solve_phase_rewards(
+            rewards, residual = solve_phase_rewards(
                 A=A,
                 r_last=last_phase_rewards[b],
                 n_phases=n_phases,
@@ -462,9 +462,21 @@ def patch_verl_grpo_with_pure_entropy(
             phase_rewards_batch.append(rewards)
 
             if b == 0:
+                # Build B for logging
+                n = n_phases - 1
+                B_demo = A.copy()
+                for ii in range(n - 1):
+                    B_demo[ii][ii + 1] -= 1.0
+                det_B = np.linalg.det(B_demo)
+
                 print(
-                    f"[PureEntropy Rewards] resp=0: {n_phases} phases, "
-                    f"rewards={[f'{v:.4f}' for v in rewards]}",
+                    f"[PureEntropy Solve] resp=0: {n_phases} phases, "
+                    f"det(B)={det_B:.6e}, residual={residual:.6e}",
+                    flush=True,
+                )
+                print(
+                    f"[PureEntropy Solve] B matrix:\n"
+                    f"{np.array2string(B_demo, precision=6, suppress_small=True)}",
                     flush=True,
                 )
 
@@ -487,37 +499,131 @@ def patch_verl_grpo_with_pure_entropy(
         # =====================================================================
         # STEP 7: Phase rewards -> phase advantages -> token advantages
         # =====================================================================
-        token_advantages = compute_pure_entropy_advantages(
-            log_probs=log_probs,
-            response_mask=response_mask,
-            index=index,
-            boundaries_batch=boundaries_batch,
-            phase_rewards_batch=phase_rewards_batch,
-        )
+        token_advantages, phase_advantages, phase_rewards_t, phase_mask_t = \
+            compute_pure_entropy_advantages(
+                log_probs=log_probs,
+                response_mask=response_mask,
+                index=index,
+                boundaries_batch=boundaries_batch,
+                phase_rewards_batch=phase_rewards_batch,
+            )
 
         data.batch["advantages"] = token_advantages
         if "returns" not in data.batch.keys():
             data.batch["returns"] = torch.zeros_like(token_advantages)
 
         # =====================================================================
-        # Diagnostics
+        # DEMO: Response 0 — full text, phases, A, rewards, advantages
+        # (tham khảo adpo_trainer.py)
+        # =====================================================================
+        if batch_size > 0:
+            active0 = response_mask[0].nonzero(as_tuple=True)[0]
+            resp_start0 = active0[0].item() if len(active0) > 0 else 0
+            resp_end0 = active0[-1].item() + 1 if len(active0) > 0 else 0
+
+            # -- Full response text --
+            full_text_0 = tokenizer.decode(
+                token_ids[0][resp_start0:resp_end0].tolist(),
+                skip_special_tokens=True,
+            )
+            print(f"[PureEntropy Demo] ===== Response 0 =====", flush=True)
+            print(f"[PureEntropy Demo] Question: \"{questions[0][:200]}\"", flush=True)
+            print(f"[PureEntropy Demo] Golden answer: \"{golden_answers[0]}\"", flush=True)
+            print(f"[PureEntropy Demo] Outcome: {outcome_rewards[0]:.2f} "
+                  f"(last_phase_reward={last_phase_rewards[0]:.2f})", flush=True)
+            print(f"[PureEntropy Demo] Full response ({len(full_text_0)} chars):", flush=True)
+            print(full_text_0[:500], flush=True)
+            if len(full_text_0) > 500:
+                print("...(truncated)", flush=True)
+
+            # -- Phase boundaries & texts --
+            n_phases_0 = len(boundaries_batch[0])
+            demo_bounds = boundaries_batch[0]
+            print(f"[PureEntropy Demo] {n_phases_0} phases, boundaries={demo_bounds}", flush=True)
+
+            phases_0 = segment_response_into_phases(
+                boundaries=demo_bounds,
+                response_length=resp_end0,
+                token_ids=token_ids[0],
+                tokenizer=tokenizer,
+            )
+            for k, phase in enumerate(phases_0):
+                b_start = demo_bounds[k] if k < len(demo_bounds) else "?"
+                b_end = demo_bounds[k + 1] if k + 1 < len(demo_bounds) else "end"
+                preview = phase.text[:150].replace('\n', '\\n')
+                print(f"  phase {k} (tok {b_start}-{b_end}): \"{preview}\"", flush=True)
+
+            # -- Phase rewards (solved) --
+            r0 = phase_rewards_t[0][phase_mask_t[0] > 0]
+            print(
+                f"[PureEntropy Demo] Phase rewards: "
+                f"{[f'{v:.4f}' for v in r0.tolist()]}",
+                flush=True,
+            )
+
+            # -- Phase advantages --
+            a0 = phase_advantages[0][phase_mask_t[0] > 0]
+            print(
+                f"[PureEntropy Demo] Phase advantages: "
+                f"{[f'{v:.4f}' for v in a0.tolist()]}",
+                flush=True,
+            )
+
+            # -- Token advantage stats for resp 0 --
+            tok_adv_0 = token_advantages[0][response_mask[0] > 0]
+            if tok_adv_0.numel() > 0:
+                print(
+                    f"[PureEntropy Demo] Token adv resp=0: "
+                    f"mean={tok_adv_0.mean():.4f}, std={tok_adv_0.std():.4f}, "
+                    f"min={tok_adv_0.min():.4f}, max={tok_adv_0.max():.4f}",
+                    flush=True,
+                )
+
+            # -- Group info --
+            idx0 = index[0].item()
+            group0_mask = (index == idx0)
+            group0_outcomes = [outcome_rewards[i] for i in range(batch_size) if group0_mask[i]]
+            group0_correct = sum(1 for r in group0_outcomes if r >= 1.0)
+            print(
+                f"[PureEntropy Demo] Group uid={idx0}: "
+                f"{group0_correct}/{len(group0_outcomes)} correct",
+                flush=True,
+            )
+            print(f"[PureEntropy Demo] ===== End Response 0 =====", flush=True)
+
+        # =====================================================================
+        # Diagnostics (batch-level summary)
         # =====================================================================
         with torch.no_grad():
             avg_outcome = np.mean(outcome_rewards)
 
-            all_rewards = np.concatenate(phase_rewards_batch)
-            reward_mean = all_rewards.mean()
-            reward_std = all_rewards.std() if len(all_rewards) > 1 else 0.0
+            valid_rewards = phase_rewards_t[phase_mask_t > 0]
+            if valid_rewards.numel() > 0:
+                reward_mean = valid_rewards.mean().item()
+                reward_std = valid_rewards.std().item() if valid_rewards.numel() > 1 else 0.0
+                reward_min = valid_rewards.min().item()
+                reward_max = valid_rewards.max().item()
+            else:
+                reward_mean = reward_std = reward_min = reward_max = 0.0
 
-            adv_active = token_advantages[response_mask > 0]
-            adv_mean = adv_active.mean().item() if adv_active.numel() > 0 else 0.0
-            adv_std = adv_active.std().item() if adv_active.numel() > 1 else 0.0
+            valid_adv = phase_advantages[phase_mask_t > 0]
+            if valid_adv.numel() > 0:
+                adv_mean = valid_adv.mean().item()
+                adv_std = valid_adv.std().item() if valid_adv.numel() > 1 else 0.0
+            else:
+                adv_mean = adv_std = 0.0
+
+            token_adv_active = token_advantages[response_mask > 0]
+            tok_adv_mean = token_adv_active.mean().item() if token_adv_active.numel() > 0 else 0.0
+            tok_adv_std = token_adv_active.std().item() if token_adv_active.numel() > 1 else 0.0
 
             diag_msg = (
-                f"[PureEntropy] phases={avg_phases:.1f}, "
+                f"[PureEntropy Summary] phases={avg_phases:.1f}, "
                 f"outcome={avg_outcome:.3f}, "
-                f"phase_reward(mean={reward_mean:.3f}, std={reward_std:.3f}), "
-                f"token_adv(mean={adv_mean:.3f}, std={adv_std:.3f}), "
+                f"phase_reward(mean={reward_mean:.3f}, std={reward_std:.3f}, "
+                f"min={reward_min:.3f}, max={reward_max:.3f}), "
+                f"phase_adv(mean={adv_mean:.3f}, std={adv_std:.3f}), "
+                f"token_adv(mean={tok_adv_mean:.3f}, std={tok_adv_std:.3f}), "
                 f"layer_L={layer_L}"
             )
             print(diag_msg, flush=True)

@@ -430,17 +430,6 @@ def build_influence_matrix_A(
         for j in range(i + 1, n):
             A[i][j] = 0.0  # zero upper triangle
 
-    # Log raw A before normalization
-    logger.info(
-        f"[PureEntropy A raw] norm_mode={norm_mode}, "
-        f"A (before norm):\n{np.array2string(A, precision=6, suppress_small=True)}"
-    )
-    print(
-        f"[PureEntropy A raw] norm_mode={norm_mode}, "
-        f"A (before norm):\n{np.array2string(A, precision=6, suppress_small=True)}",
-        flush=True,
-    )
-
     # Normalize
     eps = 1e-12
     if norm_mode == "row":
@@ -517,41 +506,19 @@ def solve_phase_rewards(
     c = np.zeros(n)
     c[-1] = r_last
 
-    # Log the system
-    logger.info(f"[PureEntropy Solve] System size: {n}x{n}, r_last={r_last:.4f}")
-    logger.info(f"[PureEntropy Solve] A matrix:\n{np.array2string(A, precision=6, suppress_small=True)}")
-    logger.info(f"[PureEntropy Solve] B matrix:\n{np.array2string(B, precision=6, suppress_small=True)}")
-    logger.info(f"[PureEntropy Solve] c vector: {c}")
-    print(f"[PureEntropy Solve] System size: {n}x{n}, r_last={r_last:.4f}", flush=True)
-    print(f"[PureEntropy Solve] A matrix:\n{np.array2string(A, precision=6, suppress_small=True)}", flush=True)
-    print(f"[PureEntropy Solve] B matrix:\n{np.array2string(B, precision=6, suppress_small=True)}", flush=True)
-    print(f"[PureEntropy Solve] c vector: {c}", flush=True)
-
     # Solve the system
     try:
         det_B = np.linalg.det(B)
-        logger.info(f"[PureEntropy Solve] det(B) = {det_B:.6e}")
-        print(f"[PureEntropy Solve] det(B) = {det_B:.6e}", flush=True)
 
         if abs(det_B) < 1e-12:
-            # Singular or near-singular: use least-squares
             logger.warning(
-                f"[PureEntropy Solve] B is near-singular (det={det_B:.6e}), "
-                "using least-squares solution"
-            )
-            print(
-                f"[PureEntropy Solve] WARNING: B is near-singular (det={det_B:.6e}), "
-                "using least-squares",
-                flush=True,
+                f"[PureEntropy Solve] B near-singular (det={det_B:.6e}), using lstsq"
             )
             x, residuals, rank, sv = np.linalg.lstsq(B, c, rcond=None)
-            logger.info(f"[PureEntropy Solve] lstsq rank={rank}, residuals={residuals}")
-            print(f"[PureEntropy Solve] lstsq rank={rank}, residuals={residuals}", flush=True)
         else:
             x = np.linalg.solve(B, c)
     except np.linalg.LinAlgError as e:
-        logger.error(f"[PureEntropy Solve] LinAlgError: {e}, falling back to uniform rewards")
-        print(f"[PureEntropy Solve] ERROR: {e}, falling back to uniform", flush=True)
+        logger.error(f"[PureEntropy Solve] LinAlgError: {e}, falling back to uniform")
         x = np.full(n, r_last)
 
     # x = [r_0, r_1, ..., r_{m-2}]
@@ -564,33 +531,18 @@ def solve_phase_rewards(
     rewards_clamped = np.clip(rewards, -reward_abs_max, reward_abs_max)
     if not np.allclose(rewards, rewards_clamped):
         logger.warning(
-            f"[PureEntropy Solve] Clamped rewards: before={rewards}, after={rewards_clamped}"
-        )
-        print(
-            f"[PureEntropy Solve] WARNING: Clamped extreme rewards: "
-            f"before={rewards}, after={rewards_clamped}",
-            flush=True,
+            f"[PureEntropy Solve] Clamped: {rewards} -> {rewards_clamped}"
         )
         rewards = rewards_clamped
 
-    logger.info(f"[PureEntropy Solve] Solved rewards: {rewards}")
-    print(f"[PureEntropy Solve] Solved rewards: {rewards}", flush=True)
-
     # Verify: A * x should ≈ [r_1, ..., r_{m-1}]
+    residual = 0.0
     if n > 0:
         lhs = A @ rewards[:n]
         rhs = rewards[1:]
         residual = np.abs(lhs - rhs).max()
-        logger.info(
-            f"[PureEntropy Solve] Verification: max|A*x - r[1:m]| = {residual:.6e}, "
-            f"A*x = {lhs}, r[1:m] = {rhs}"
-        )
-        print(
-            f"[PureEntropy Solve] Verification: max|A*x - r[1:m]| = {residual:.6e}",
-            flush=True,
-        )
 
-    return rewards
+    return rewards, residual
 
 
 # ---------------------------------------------------------------------------
@@ -740,6 +692,9 @@ def compute_pure_entropy_advantages(
 
     Returns:
         token_advantages: (batch, seq_len) per-token advantages.
+        phase_advantages: (batch, max_K) per-phase advantages.
+        phase_rewards_tensor: (batch, max_K) per-phase rewards.
+        phase_mask_tensor: (batch, max_K) phase mask.
     """
     batch_size, seq_len = response_mask.shape
     device = response_mask.device
@@ -774,4 +729,4 @@ def compute_pure_entropy_advantages(
         response_mask=response_mask,
     )
 
-    return token_advantages
+    return token_advantages, phase_advantages, phase_rewards, phase_mask_tensor
