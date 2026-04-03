@@ -31,7 +31,9 @@ def main(config: DictConfig):
     config = migrate_legacy_reward_impl(config)
     print(OmegaConf.to_yaml(config))
 
-    task_runner_cls = ray.remote(num_cpus=1)(PureEntropyTaskRunner)
+    # PureEntropy needs GPU for HF model forward (hidden states + attention reconstruction).
+    # Request 1 GPU so the worker process has CUDA access.
+    task_runner_cls = ray.remote(num_cpus=1, num_gpus=1)(PureEntropyTaskRunner)
     run_ppo(config, task_runner_class=task_runner_cls)
 
 
