@@ -31,7 +31,6 @@ from adpo.pure_entropy_algorithm import (
     build_phase_attention_matrix,
     build_influence_matrix_A,
     solve_phase_rewards,
-    extract_hidden_states_hf,
     reconstruct_attention_at_layer,
     compute_pure_entropy_advantages,
 )
@@ -41,22 +40,36 @@ logger = logging.getLogger(__name__)
 
 
 def _load_hf_model(model_path: str):
-    """Load HuggingFace model for hidden state extraction.
+    """Load HuggingFace model for hidden state extraction + attention reconstruction.
 
-    Loads with eager attention (required for reconstruction) and bfloat16.
+    Uses flash_attention_2 for fast partial forward. This is safe because
+    reconstruct_attention() computes attention directly from model weights
+    (q_proj, k_proj, layernorm, RoPE) -- it never calls the model's own
+    attention implementation.
+
     Cached after first load.
     """
     from transformers import AutoModelForCausalLM
     logger.info(f"[PureEntropy] Loading HF model from {model_path} for attention reconstruction...")
     print(f"[PureEntropy] Loading HF model from {model_path} for attention reconstruction...", flush=True)
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        trust_remote_code=True,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="eager",  # Required for attention reconstruction
-        device_map="auto",
-    )
+    # Try flash_attention_2 first (fastest), fall back to eager
+    for attn_impl in ["flash_attention_2", "eager"]:
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                trust_remote_code=True,
+                torch_dtype=torch.bfloat16,
+                attn_implementation=attn_impl,
+                device_map="auto",
+            )
+            print(f"[PureEntropy] Loaded with attn_implementation={attn_impl}", flush=True)
+            break
+        except Exception as e:
+            if attn_impl == "flash_attention_2":
+                print(f"[PureEntropy] flash_attention_2 unavailable ({e}), falling back to eager", flush=True)
+            else:
+                raise
     model.eval()
 
     n_layers = model.config.num_hidden_layers
@@ -322,10 +335,22 @@ def patch_verl_grpo_with_pure_entropy(
         )
 
         # =====================================================================
-        # STEP 5: Load HF model and extract hidden states at layer L
+        # STEP 5+6 (fused): Partial forward → reconstruct attention →
+        #   build phase matrix → solve rewards, one sample at a time.
+        #
+        # Key optimizations vs. naive approach:
+        # 1. flash_attention_2 for the forward pass (2-4x faster)
+        # 2. Partial forward: only layers 0..L-1 (skip later layers + lm_head)
+        # 3. Slice to response tokens before attention reconstruction:
+        #    O(resp_len²) instead of O(seq_len²)
+        # 4. Never store full-batch hidden states — process & discard per sample
         # =====================================================================
+        import time
+        t_step5 = time.time()
+
         hf_model = _get_hf_model()
         n_layers = hf_model.config.num_hidden_layers
+        hf_device = next(hf_model.parameters()).device
 
         # Determine layer index
         layer_L = attention_layer
@@ -336,18 +361,6 @@ def patch_verl_grpo_with_pure_entropy(
 
         print(f"[PureEntropy] Using layer L={layer_L} (total layers={n_layers})", flush=True)
 
-        # Extract hidden states
-        hidden_states, position_ids_hs = extract_hidden_states_hf(
-            model=hf_model,
-            tokenizer=tokenizer,
-            input_ids=token_ids,
-            response_mask=response_mask,
-            layer_idx=layer_L,
-        )
-
-        # =====================================================================
-        # STEP 6: Build attention matrix and solve for phase rewards
-        # =====================================================================
         phase_rewards_batch = []
 
         for b in range(batch_size):
@@ -358,10 +371,10 @@ def patch_verl_grpo_with_pure_entropy(
 
             resp_start = active[0].item()
             resp_end = active[-1].item() + 1
+            resp_len = resp_end - resp_start
             n_phases = len(boundaries_batch[b])
 
             if n_phases <= 1:
-                # Single phase: just use last-phase reward
                 phase_rewards_batch.append(np.array([last_phase_rewards[b]]))
                 if b == 0:
                     print(
@@ -370,42 +383,67 @@ def patch_verl_grpo_with_pure_entropy(
                     )
                 continue
 
-            # Get hidden states for this response (slice to response portion)
-            hs_b = hidden_states[b:b+1, :, :].to(
-                dtype=torch.bfloat16,
-                device=next(hf_model.parameters()).device,
-            )
-            pos_b = position_ids_hs[b:b+1].to(device=next(hf_model.parameters()).device)
+            # --- Partial forward for this sample only ---
+            sub_ids = token_ids[b:b+1].to(hf_device)
+            pos_ids = torch.arange(seq_len, device=hf_device).unsqueeze(0)
 
-            # Reconstruct attention at layer L
-            try:
-                attn_weights = reconstruct_attention_at_layer(
-                    model=hf_model,
-                    layer_idx=layer_L,
-                    hidden_state=hs_b,
-                    position_ids=pos_b,
-                )  # (num_heads, seq_len, seq_len)
-            except Exception as e:
-                logger.error(f"[PureEntropy] Attention reconstruction failed for b={b}: {e}")
-                print(f"[PureEntropy] ERROR: Attention reconstruction failed for b={b}: {e}", flush=True)
-                phase_rewards_batch.append(np.full(n_phases, last_phase_rewards[b]))
-                continue
+            with torch.no_grad():
+                from adpo.pure_entropy_algorithm import _partial_forward
+                hs_full = _partial_forward(hf_model, sub_ids, pos_ids, layer_L)
+                # hs_full: (1, seq_len, hidden_dim)
 
-            # Build phase attention matrix (m x m)
+                # --- Slice to response tokens only ---
+                # This reduces attention reconstruction from O(seq_len²)
+                # to O(resp_len²). For seq_len=5120, resp_len~2048: ~6x speedup.
+                hs_resp = hs_full[:, resp_start:resp_end, :]
+                pos_resp = torch.arange(
+                    resp_start, resp_end, device=hf_device,
+                ).unsqueeze(0)
+
+                del hs_full, sub_ids
+
+                # --- Reconstruct attention (response tokens only) ---
+                try:
+                    attn_weights = reconstruct_attention_at_layer(
+                        model=hf_model,
+                        layer_idx=layer_L,
+                        hidden_state=hs_resp,
+                        position_ids=pos_resp,
+                    )  # (num_heads, resp_len, resp_len)
+                except Exception as e:
+                    logger.error(f"[PureEntropy] Attention reconstruction failed for b={b}: {e}")
+                    print(f"[PureEntropy] ERROR: Attention reconstruction failed for b={b}: {e}", flush=True)
+                    phase_rewards_batch.append(np.full(n_phases, last_phase_rewards[b]))
+                    del hs_resp, pos_resp
+                    continue
+
+                del hs_resp, pos_resp
+
+            # --- Build phase attention matrix ---
+            # Boundaries are in absolute coords; shift to response-relative
+            # since attn_weights is now (num_heads, resp_len, resp_len)
+            boundaries_relative = [bd - resp_start for bd in boundaries_batch[b]]
+            resp_end_relative = resp_end - resp_start
+
             phase_attn = build_phase_attention_matrix(
                 attn_weights=attn_weights,
-                boundaries=boundaries_batch[b],
-                resp_end=resp_end,
+                boundaries=boundaries_relative,
+                resp_end=resp_end_relative,
             )
+
+            del attn_weights
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             if b == 0:
                 print(
-                    f"[PureEntropy PhaseAttn] resp=0: phase_attn ({phase_attn.shape}):\n"
+                    f"[PureEntropy PhaseAttn] resp=0: phase_attn ({phase_attn.shape}), "
+                    f"resp_len={resp_len} (sliced from seq_len={seq_len}):\n"
                     f"{np.array2string(phase_attn, precision=6, suppress_small=True)}",
                     flush=True,
                 )
 
-            # Build influence matrix A (m-1 x m-1)
+            # --- Build influence matrix A ---
             A = build_influence_matrix_A(phase_attn, norm_mode=attention_norm_mode)
 
             if b == 0:
@@ -415,7 +453,7 @@ def patch_verl_grpo_with_pure_entropy(
                     flush=True,
                 )
 
-            # Solve for phase rewards
+            # --- Solve for phase rewards ---
             rewards = solve_phase_rewards(
                 A=A,
                 r_last=last_phase_rewards[b],
@@ -430,10 +468,21 @@ def patch_verl_grpo_with_pure_entropy(
                     flush=True,
                 )
 
-            # Free GPU memory per-sample
-            del attn_weights, hs_b, pos_b
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            # Progress log every 16 samples
+            if (b + 1) % 16 == 0 or b == batch_size - 1:
+                elapsed = time.time() - t_step5
+                rate = (b + 1) / elapsed
+                eta = (batch_size - b - 1) / rate if rate > 0 else 0
+                print(
+                    f"[PureEntropy Progress] {b+1}/{batch_size} samples, "
+                    f"{elapsed:.1f}s elapsed, {rate:.1f} samples/s, ETA {eta:.0f}s",
+                    flush=True,
+                )
+
+        print(
+            f"[PureEntropy] Step 5+6 done: {batch_size} samples in {time.time()-t_step5:.1f}s",
+            flush=True,
+        )
 
         # =====================================================================
         # STEP 7: Phase rewards -> phase advantages -> token advantages
