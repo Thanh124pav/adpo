@@ -28,9 +28,10 @@ algorithm:
   psi: 0.95                      # Decay factor for cumulative entropy (1.0 = no decay)
   default_threshold_percentile: 90.0  # Percentile for threshold when all responses wrong
 
-  # Reward for last phase (from exact matching)
-  correct_reward: 1.0
-  incorrect_reward: 0.0
+  # Total reward budget (sum of all phase rewards per response)
+  correct_total: 1.0              # sum(r_i) when answer is correct
+  incorrect_total: -1.0           # sum(r_i) when answer is wrong
+  partial_total: 0.1              # sum(r_i) when partial/no answer
 
   # Advantage decay within phase
   decay_gamma: 0.0               # 0 = hard assignment, >0 = in-phase decreasing (e.g. 0.9)

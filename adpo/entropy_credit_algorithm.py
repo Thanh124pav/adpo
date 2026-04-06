@@ -174,38 +174,42 @@ def compute_entropy_credit_rewards(
     cum_entropy_batch: List[List[float]],
     outcome_rewards: List[float],
     index: torch.Tensor,
-    correct_reward: float = 1.0,
-    incorrect_reward: float = 0.0,
+    correct_total: float = 1.0,
+    incorrect_total: float = -1.0,
+    partial_total: float = 0.1,
     default_percentile: float = 90.0,
 ) -> List[np.ndarray]:
     """Compute phase rewards based on cumulative entropy thresholds.
 
-    Algorithm:
-    1. Last phase: reward = exact match score (correct_reward or incorrect_reward).
-    2. For phases 0..m-2:
-       a. Determine threshold P:
-          - If group has correct responses: P = max cumulative entropy
-            among ALL phases of correct responses.
-          - If all wrong: P = percentile(all_phase_entropies, default_percentile).
-       b. R = min(1, (P - E) / (P_100 - P))
-          where E = cumulative entropy of this phase,
-                P_100 = max cumulative entropy across all phases in group.
-          - E < P → R > 0 (good phase, low entropy)
-          - E > P → R < 0 (bad phase, high entropy)
+    Key constraint: sum(r_1, r_2, ..., r_m) = R_total for each response.
+        R_total = correct_total (1.0) if answer is correct
+        R_total = incorrect_total (-1.0) if answer is wrong
+        R_total = partial_total (0.1) if no boxed answer / partial
+
+    The DISTRIBUTION of R_total across phases is determined by entropy credit:
+    1. Compute raw score per phase: raw[k] = min(1, (P - E_k) / (P_100 - P))
+       - E_k < P → raw > 0 (good phase, low entropy)
+       - E_k > P → raw < 0 (bad phase, high entropy)
+    2. Shift all raw scores by a constant so their sum = R_total:
+       r[k] = raw[k] + (R_total/m - mean(raw))
+
+    Threshold P:
+        - If group has correct responses: P = max cum_entropy of correct responses.
+        - If all wrong: P = percentile(all_cum_entropies, default_percentile).
 
     Args:
         cum_entropy_batch: List of lists of cumulative entropies per phase.
         outcome_rewards: List of outcome scores (1.0 = correct, 0.0 = wrong).
         index: (batch,) group indices.
-        correct_reward: Reward for last phase when correct.
-        incorrect_reward: Reward for last phase when incorrect.
-        default_percentile: Percentile for threshold when all responses are wrong.
+        correct_total: Total reward budget when answer is correct.
+        incorrect_total: Total reward budget when answer is wrong.
+        partial_total: Total reward budget when partial/no answer.
+        default_percentile: Percentile for threshold when all responses wrong.
 
     Returns:
-        List of np.ndarray: rewards per phase per response.
+        List of np.ndarray: rewards per phase per response. sum = R_total.
     """
     batch_size = len(cum_entropy_batch)
-    device = index.device
 
     # Group responses by uid
     unique_uids = torch.unique(index).tolist()
@@ -245,6 +249,8 @@ def compute_entropy_credit_rewards(
         else:
             P = np.percentile(all_cum_e, default_percentile)
 
+        denom = P_100 - P + 1e-8
+
         # Log for first group
         if uid == unique_uids[0]:
             n_correct = sum(1 for b in group_indices if outcome_rewards[b] >= 1.0)
@@ -252,41 +258,56 @@ def compute_entropy_credit_rewards(
                 f"[EntropyCredit Threshold] group uid={uid}: "
                 f"{n_correct}/{len(group_indices)} correct, "
                 f"P={P:.4f} ({'from correct' if has_correct else f'pct={default_percentile}'}), "
-                f"P_100={P_100:.4f}, "
-                f"all_cum_e range=[{min(all_cum_e):.4f}, {max(all_cum_e):.4f}]",
+                f"P_100={P_100:.4f}, denom={denom:.4f}",
                 flush=True,
             )
 
         # Compute rewards for each response in group
-        eps = 1e-8
         for b in group_indices:
             cum_e = cum_entropy_batch[b]
             n_phases = len(cum_e)
-            rewards = np.zeros(n_phases)
 
-            # Last phase: exact match reward
+            # Determine R_total for this response
             if outcome_rewards[b] >= 1.0:
-                rewards[-1] = correct_reward
+                R_total = correct_total
             elif outcome_rewards[b] > 0.0:
-                rewards[-1] = outcome_rewards[b] * correct_reward
+                R_total = partial_total
             else:
-                rewards[-1] = incorrect_reward
+                R_total = incorrect_total
 
-            # Phases 0..m-2: entropy-based reward
-            denom = P_100 - P + eps
-            for k in range(n_phases - 1):
-                E = cum_e[k]
-                R = min(1.0, (P - E) / denom)
-                rewards[k] = R
+            if n_phases <= 1:
+                phase_rewards_batch[b] = np.array([R_total])
+                continue
+
+            # Raw credit per phase: min(1, (P - E_k) / (P_100 - P))
+            raw = np.array([
+                min(1.0, (P - cum_e[k]) / denom)
+                for k in range(n_phases)
+            ])
+
+            # Shift so sum(rewards) = R_total
+            # rewards[k] = raw[k] + shift, where shift = R_total/m - mean(raw)
+            mean_raw = raw.mean()
+            shift = R_total / n_phases - mean_raw
+            rewards = raw + shift
 
             phase_rewards_batch[b] = rewards
 
-            # Log first response
+            # Log first response of first group
             if b == group_indices[0] and uid == unique_uids[0]:
                 print(
-                    f"[EntropyCredit Rewards] resp={b}: "
-                    f"cum_entropy={[f'{e:.2f}' for e in cum_e]}, "
-                    f"rewards={[f'{r:.4f}' for r in rewards]}",
+                    f"[EntropyCredit Rewards] resp={b}: R_total={R_total:.2f}, "
+                    f"cum_entropy={[f'{e:.2f}' for e in cum_e]}",
+                    flush=True,
+                )
+                print(
+                    f"  raw_credit={[f'{r:.4f}' for r in raw]}, "
+                    f"mean_raw={mean_raw:.4f}, shift={shift:.4f}",
+                    flush=True,
+                )
+                print(
+                    f"  rewards={[f'{r:.4f}' for r in rewards]}, "
+                    f"sum={rewards.sum():.4f} (should={R_total:.2f})",
                     flush=True,
                 )
 

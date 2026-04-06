@@ -47,9 +47,10 @@ def patch_verl_grpo_with_entropy_credit(
     # Entropy credit params
     psi: float = 0.95,
     default_threshold_percentile: float = 90.0,
-    # Reward params
-    correct_reward: float = 1.0,
-    incorrect_reward: float = 0.0,
+    # Total reward budget (sum of all phase rewards per response)
+    correct_total: float = 1.0,
+    incorrect_total: float = -1.0,
+    partial_total: float = 0.1,
     # Advantage params
     decay_gamma: float = 0.0,
 ):
@@ -64,8 +65,9 @@ def patch_verl_grpo_with_entropy_credit(
         psi: Decay factor for cumulative entropy (default 0.95).
         default_threshold_percentile: Percentile for threshold when all responses
             are wrong in a group (default 90.0).
-        correct_reward: Reward for last phase when answer is correct.
-        incorrect_reward: Reward for last phase when answer is wrong.
+        correct_total: Total reward budget when correct (default 1.0).
+        incorrect_total: Total reward budget when wrong (default -1.0).
+        partial_total: Total reward budget when partial/no answer (default 0.1).
         decay_gamma: In-phase advantage decay (0 = hard, >0 = decreasing).
     """
     original_compute_advantage = ray_trainer_module.compute_advantage
@@ -264,8 +266,9 @@ def patch_verl_grpo_with_entropy_credit(
             cum_entropy_batch=cum_entropy_batch,
             outcome_rewards=outcome_rewards,
             index=index,
-            correct_reward=correct_reward,
-            incorrect_reward=incorrect_reward,
+            correct_total=correct_total,
+            incorrect_total=incorrect_total,
+            partial_total=partial_total,
             default_percentile=default_threshold_percentile,
         )
 
@@ -300,7 +303,10 @@ def patch_verl_grpo_with_entropy_credit(
             print(f"[EntropyCredit Demo] ===== Response 0 =====", flush=True)
             print(f"[EntropyCredit Demo] Question: \"{questions[0][:200]}\"", flush=True)
             print(f"[EntropyCredit Demo] Golden answer: \"{golden_answers[0]}\"", flush=True)
-            print(f"[EntropyCredit Demo] Outcome: {outcome_rewards[0]:.2f}", flush=True)
+            R_total_0 = correct_total if outcome_rewards[0] >= 1.0 else (
+                partial_total if outcome_rewards[0] > 0 else incorrect_total
+            )
+            print(f"[EntropyCredit Demo] Outcome: {outcome_rewards[0]:.2f}, R_total={R_total_0:.2f}", flush=True)
             print(f"[EntropyCredit Demo] Full response ({len(full_text_0)} chars):", flush=True)
             print(full_text_0[:500], flush=True)
             if len(full_text_0) > 500:
@@ -407,8 +413,9 @@ class EntropyCreditTaskRunner:
             phase_max_K=algo.get("phase_max_K", 10),
             psi=algo.get("psi", 0.95),
             default_threshold_percentile=algo.get("default_threshold_percentile", 90.0),
-            correct_reward=algo.get("correct_reward", 1.0),
-            incorrect_reward=algo.get("incorrect_reward", 0.0),
+            correct_total=algo.get("correct_total", 1.0),
+            incorrect_total=algo.get("incorrect_total", -1.0),
+            partial_total=algo.get("partial_total", 0.1),
             decay_gamma=algo.get("decay_gamma", 0.0),
         )
 

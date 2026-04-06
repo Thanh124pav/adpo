@@ -35,9 +35,10 @@ PSI=${PSI:-0.95}
 DEFAULT_THRESHOLD_PCT=${DEFAULT_THRESHOLD_PCT:-90.0}
 DECAY_GAMMA=${DECAY_GAMMA:-0.0}
 
-# Reward
-CORRECT_REWARD=${CORRECT_REWARD:-1.0}
-INCORRECT_REWARD=${INCORRECT_REWARD:-0.0}
+# Total reward budget
+CORRECT_TOTAL=${CORRECT_TOTAL:-1.0}
+INCORRECT_TOTAL=${INCORRECT_TOTAL:--1.0}
+PARTIAL_TOTAL=${PARTIAL_TOTAL:-0.1}
 
 # PPO
 KL_COEF=${KL_COEF:-0.001}
@@ -86,8 +87,9 @@ python -m adpo.main_entropy_credit \
     algorithm.phase_max_K="$PHASE_MAX_K" \
     algorithm.psi="$PSI" \
     algorithm.default_threshold_percentile="$DEFAULT_THRESHOLD_PCT" \
-    algorithm.correct_reward="$CORRECT_REWARD" \
-    algorithm.incorrect_reward="$INCORRECT_REWARD" \
+    algorithm.correct_total="$CORRECT_TOTAL" \
+    algorithm.incorrect_total="$INCORRECT_TOTAL" \
+    algorithm.partial_total="$PARTIAL_TOTAL" \
     algorithm.decay_gamma="$DECAY_GAMMA" \
     trainer.total_epochs="$EPOCHS" \
     trainer.save_freq=50 \
