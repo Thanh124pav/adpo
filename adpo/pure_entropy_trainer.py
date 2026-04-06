@@ -453,18 +453,25 @@ def patch_verl_grpo_with_pure_entropy(
                 del hs_full, sub_ids
 
                 # --- Reconstruct attention (response tokens only) ---
+                # matmul_on_cpu=True: Steps 1-5 (LayerNorm, Q/K proj, RoPE)
+                # run on GPU, then Q/K move to CPU for the large matmul.
+                # GPU never allocates the O(num_heads × resp_len²) tensor.
                 try:
                     attn_weights = reconstruct_attention_at_layer(
                         model=hf_model,
                         layer_idx=layer_L,
                         hidden_state=hs_resp,
                         position_ids=pos_resp,
-                    )  # (num_heads, resp_len, resp_len)
+                        output_dtype=torch.float32,
+                        matmul_on_cpu=True,
+                    )  # (num_heads, resp_len, resp_len) float32, on CPU
                 except Exception as e:
                     logger.error(f"[PureEntropy] Attention reconstruction failed for b={b}: {e}")
                     print(f"[PureEntropy] ERROR: Attention reconstruction failed for b={b}: {e}", flush=True)
                     phase_rewards_batch.append(np.full(n_phases, last_phase_rewards[b]))
                     del hs_resp, pos_resp
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                     continue
 
                 del hs_resp, pos_resp
@@ -475,6 +482,7 @@ def patch_verl_grpo_with_pure_entropy(
             boundaries_relative = [bd - resp_start for bd in boundaries_batch[b]]
             resp_end_relative = resp_end - resp_start
 
+            # attn_weights is already on CPU (matmul_on_cpu=True)
             phase_attn = build_phase_attention_matrix(
                 attn_weights=attn_weights,
                 boundaries=boundaries_relative,

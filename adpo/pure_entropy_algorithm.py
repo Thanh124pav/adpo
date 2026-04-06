@@ -312,6 +312,8 @@ def reconstruct_attention_at_layer(
     layer_idx: int,
     hidden_state: torch.Tensor,
     position_ids: torch.Tensor,
+    output_dtype: torch.dtype = torch.float32,
+    matmul_on_cpu: bool = True,
 ) -> torch.Tensor:
     """Reconstruct attention weights for one layer from its input hidden state.
 
@@ -322,9 +324,15 @@ def reconstruct_attention_at_layer(
         layer_idx: Layer index.
         hidden_state: (1, seq_len, hidden_dim).
         position_ids: (1, seq_len).
+        output_dtype: dtype for returned attention matrix.
+        matmul_on_cpu: If True (default), run the large Q·K^T matmul and
+                       softmax on CPU.  Steps 1-5 (LayerNorm, projection,
+                       QK-Norm, RoPE) still run on GPU.  This eliminates
+                       the O(num_heads × seq²) GPU memory spike entirely.
 
     Returns:
-        attn_weights: (num_heads, seq_len, seq_len) float32.
+        attn_weights: (num_heads, seq_len, seq_len).
+                      On CPU when matmul_on_cpu=True.
     """
     import sys
     import os
@@ -337,7 +345,11 @@ def reconstruct_attention_at_layer(
     from attention_analysis.reconstruct import reconstruct_attention
 
     with torch.no_grad():
-        attn = reconstruct_attention(model, layer_idx, hidden_state, position_ids)
+        attn = reconstruct_attention(
+            model, layer_idx, hidden_state, position_ids,
+            output_dtype=output_dtype,
+            matmul_on_cpu=matmul_on_cpu,
+        )
 
     return attn  # (num_heads, seq_len, seq_len)
 
@@ -367,8 +379,9 @@ def build_phase_attention_matrix(
             to tokens in phase b (head-averaged).
     """
     m = len(boundaries)
-    # Head-averaged attention
-    attn_avg = attn_weights.mean(dim=0).cpu().numpy()  # (seq_len, seq_len)
+    # Head-averaged attention.  mean() first to reduce num_heads dim,
+    # then float() for numpy compatibility (bfloat16 has no numpy dtype).
+    attn_avg = attn_weights.mean(dim=0).float().cpu().numpy()  # (seq_len, seq_len)
 
     # Compute phase spans
     phase_spans = []
@@ -502,11 +515,11 @@ def solve_phase_rewards(
     """
     m = n_phases
     if m <= 1:
-        return np.array([r_last])
+        return np.array([r_last]), 0.0
 
     n = m - 1  # size of the system
     if A.shape[0] == 0:
-        return np.array([r_last])
+        return np.array([r_last]), 0.0
 
     # Build B = A (copy), then subtract 1 from superdiagonal for rows 0..n-2
     B = A.copy()
