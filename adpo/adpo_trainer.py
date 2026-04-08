@@ -29,6 +29,7 @@ from adpo.adpo_algorithm import (
 )
 from adpo.llm_judge import create_judge, PhaseJudge
 from adpo.reward_functions import compute_score
+from adpo.golden_path import GoldenPathGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -374,6 +375,12 @@ def patch_verl_grpo_with_adpo(
     overlong_penalty_factor: float = 1.0,
     output_correct_reward: float = 0.5,
     output_incorrect_reward: float = 0.0,
+    golden_path_enabled: bool = False,
+    golden_path_endpoint: str = "",
+    golden_path_model: str = "",
+    golden_path_mode: str = "endpoint",
+    golden_path_cache_dir: str = "data/golden_paths",
+    golden_path_max_attempts: int = 3,
 ):
     """Monkey-patch verl's module-level compute_advantage function with ADPO phase
     decomposition + LLM-as-Judge.
@@ -398,6 +405,20 @@ def patch_verl_grpo_with_adpo(
         judge_kwargs["timeout"] = judge_timeout
         judge_kwargs["max_tokens"] = judge_max_tokens
     judge = create_judge(judge_type=judge_type, judge_model=judge_model, **judge_kwargs)
+
+    # Golden path generator for answer-only datasets
+    golden_gen = None
+    if golden_path_enabled:
+        gp_endpoint = golden_path_endpoint or judge_endpoint
+        gp_model = golden_path_model or judge_model
+        golden_gen = GoldenPathGenerator(
+            endpoint=gp_endpoint,
+            model=gp_model,
+            mode=golden_path_mode,
+            cache_dir=golden_path_cache_dir,
+            max_attempts=golden_path_max_attempts,
+        )
+        logger.info(f"[ADPO] Golden path generator enabled: mode={golden_path_mode}, model={gp_model}")
 
     original_compute_advantage = ray_trainer_module.compute_advantage
 
@@ -643,6 +664,54 @@ def patch_verl_grpo_with_adpo(
               f"correct={group0_correct}/{len(group0_outcomes)}, "
               f"outcomes={['✓' if r >= 1.0 else f'{r:.2f}' for r in group0_outcomes]}", flush=True)
 
+        # Step 4a: Generate golden paths for all-wrong groups (answer-only datasets)
+        # golden_paths[b] = text of golden path for response b, or None
+        golden_paths = [None] * batch_size
+        if golden_gen is not None:
+            # Find groups where ALL responses are wrong
+            all_wrong_groups = set()
+            for uid in torch.unique(index):
+                gmask = (index == uid)
+                group_outcomes = [outcome_rewards[i] for i in range(batch_size) if gmask[i]]
+                if all(r < 1.0 for r in group_outcomes):
+                    all_wrong_groups.add(uid.item())
+
+            if all_wrong_groups:
+                # Collect unique questions from all-wrong groups (one per group)
+                gp_questions, gp_answers, gp_sources, gp_group_ids = [], [], [], []
+                seen_groups = set()
+                for b in range(batch_size):
+                    uid = index[b].item()
+                    if uid in all_wrong_groups and uid not in seen_groups:
+                        seen_groups.add(uid)
+                        gp_questions.append(questions[b])
+                        gp_answers.append(golden_answers[b])
+                        gp_sources.append(data_sources[b])
+                        gp_group_ids.append(uid)
+
+                # Generate golden paths
+                gp_results = golden_gen.generate_golden_paths(
+                    gp_questions, gp_answers, gp_sources
+                )
+
+                # Map back: every response in an all-wrong group gets the golden path
+                gp_by_group = {}
+                for uid, gp_text in zip(gp_group_ids, gp_results):
+                    if gp_text is not None:
+                        gp_by_group[uid] = gp_text
+                for b in range(batch_size):
+                    uid = index[b].item()
+                    if uid in gp_by_group:
+                        golden_paths[b] = gp_by_group[uid]
+
+                n_gp = sum(1 for gp in gp_by_group.values() if gp is not None)
+                print(f"[ADPO GoldenPath] all_wrong_groups={len(all_wrong_groups)}, "
+                      f"golden_paths_generated={n_gp}", flush=True)
+
+        # Store golden_paths in data for trajectory stitching (next step)
+        # Will be used by the stitching algorithm later
+        data._golden_paths = golden_paths
+
         # Step 4b: Determine which phases are thinking vs output
         # Algorithm guarantees: if </think> found, it's a boundary → last phase = output
         # Just check if response has </think> token to know if last phase is output
@@ -887,6 +956,12 @@ class ADPOTaskRunner:
             overlong_penalty_factor=algo.get("overlong_penalty_factor", 1.0),
             output_correct_reward=algo.get("output_correct_reward", 0.5),
             output_incorrect_reward=algo.get("output_incorrect_reward", 0.0),
+            golden_path_enabled=algo.get("golden_path_enabled", False),
+            golden_path_endpoint=algo.get("golden_path_endpoint", ""),
+            golden_path_model=algo.get("golden_path_model", ""),
+            golden_path_mode=algo.get("golden_path_mode", "endpoint"),
+            golden_path_cache_dir=algo.get("golden_path_cache_dir", "data/golden_paths"),
+            golden_path_max_attempts=algo.get("golden_path_max_attempts", 3),
         )
 
         # Delegate to standard TaskRunner

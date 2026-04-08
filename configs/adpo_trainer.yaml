@@ -32,6 +32,13 @@ algorithm:
   judge_type: endpoint
   judge_model: Qwen3-14B
   judge_endpoint: ""
+  # Golden Path generation (for answer-only datasets)
+  golden_path_enabled: false
+  golden_path_endpoint: ""       # defaults to judge_endpoint if empty
+  golden_path_model: ""          # defaults to judge_model if empty
+  golden_path_mode: endpoint     # "endpoint" or "vllm"
+  golden_path_cache_dir: data/golden_paths
+  golden_path_max_attempts: 3
 
 # --- Actor / Rollout / Ref overrides ---
 actor_rollout_ref:
