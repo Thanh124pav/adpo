@@ -30,6 +30,7 @@ from adpo.adpo_algorithm import (
 from adpo.llm_judge import create_judge, PhaseJudge
 from adpo.reward_functions import compute_score
 from adpo.golden_path import GoldenPathGenerator
+from adpo.trajectory_stitching import TrajectoryStitcher, compute_stitched_advantages
 
 logger = logging.getLogger(__name__)
 
@@ -381,6 +382,10 @@ def patch_verl_grpo_with_adpo(
     golden_path_mode: str = "endpoint",
     golden_path_cache_dir: str = "data/golden_paths",
     golden_path_max_attempts: int = 3,
+    stitch_reward_decay: float = 0.1,
+    stitch_max_extensions: int = 5,
+    stitch_splice_boost: float = 2.0,
+    stitch_post_splice_decay: float = 0.9,
 ):
     """Monkey-patch verl's module-level compute_advantage function with ADPO phase
     decomposition + LLM-as-Judge.
@@ -419,6 +424,21 @@ def patch_verl_grpo_with_adpo(
             max_attempts=golden_path_max_attempts,
         )
         logger.info(f"[ADPO] Golden path generator enabled: mode={golden_path_mode}, model={gp_model}")
+
+    # Trajectory stitcher (only active when golden path is enabled)
+    stitcher = None
+    if golden_path_enabled:
+        stitch_endpoint = golden_path_endpoint or judge_endpoint
+        stitch_model = golden_path_model or judge_model
+        stitcher = TrajectoryStitcher(
+            endpoint=stitch_endpoint,
+            model=stitch_model,
+            tokenizer=tokenizer,
+            max_response_length=2048,  # will be updated from data
+            reward_decay=stitch_reward_decay,
+            max_golden_extensions=stitch_max_extensions,
+        )
+        logger.info(f"[ADPO] Trajectory stitcher enabled: splice_boost={stitch_splice_boost}")
 
     original_compute_advantage = ray_trainer_module.compute_advantage
 
@@ -847,6 +867,66 @@ def patch_verl_grpo_with_adpo(
             decay_gamma=phase_decay_gamma,
         )
 
+        # Step 8: Trajectory stitching for all-wrong groups
+        if stitcher is not None and hasattr(data, '_golden_paths'):
+            golden_paths_list = data._golden_paths
+            # Find all-wrong groups that have golden paths
+            all_wrong_groups = set()
+            for uid in torch.unique(index):
+                gmask = (index == uid)
+                group_outcomes = [outcome_rewards[i] for i in range(batch_size) if gmask[i]]
+                if all(r < 1.0 for r in group_outcomes):
+                    all_wrong_groups.add(uid.item())
+
+            stitch_results_map = {}  # batch_idx -> SpliceResult
+            n_stitched = 0
+
+            for uid_val in all_wrong_groups:
+                gmask = (index == uid_val)
+                group_indices = [i for i in range(batch_size) if gmask[i]]
+
+                # Check if golden path available for this group
+                gp_text = golden_paths_list[group_indices[0]]
+                if gp_text is None:
+                    continue
+
+                # Gather group data
+                g_questions = [questions[i] for i in group_indices]
+                g_phase_texts = [phase_texts_batch[i] for i in group_indices]
+                g_answers = [golden_answers[i] for i in group_indices]
+                g_sources = [data_sources[i] for i in group_indices]
+                g_boundaries = [boundaries_batch[i] for i in group_indices]
+
+                try:
+                    results = stitcher.stitch_group(
+                        questions=g_questions,
+                        response_phase_texts=g_phase_texts,
+                        golden_path=gp_text,
+                        golden_answers=g_answers,
+                        data_sources=g_sources,
+                        response_boundaries=g_boundaries,
+                    )
+                    for local_idx, result in enumerate(results):
+                        batch_idx = group_indices[local_idx]
+                        stitch_results_map[batch_idx] = result
+                        if result.verified:
+                            n_stitched += 1
+                except Exception as e:
+                    logger.warning(f"[Stitch] Failed for group {uid_val}: {e}")
+
+            if stitch_results_map:
+                token_advantages = compute_stitched_advantages(
+                    token_advantages=token_advantages,
+                    response_mask=response_mask,
+                    stitch_results=stitch_results_map,
+                    index=index,
+                    splice_boost=stitch_splice_boost,
+                    post_splice_decay=stitch_post_splice_decay,
+                )
+                print(f"[ADPO Stitch] {n_stitched}/{len(stitch_results_map)} "
+                      f"responses stitched successfully in "
+                      f"{len(all_wrong_groups)} all-wrong groups", flush=True)
+
         data.batch["advantages"] = token_advantages
         if "returns" not in data.batch.keys():
             data.batch["returns"] = torch.zeros_like(token_advantages)
@@ -962,6 +1042,10 @@ class ADPOTaskRunner:
             golden_path_mode=algo.get("golden_path_mode", "endpoint"),
             golden_path_cache_dir=algo.get("golden_path_cache_dir", "data/golden_paths"),
             golden_path_max_attempts=algo.get("golden_path_max_attempts", 3),
+            stitch_reward_decay=algo.get("stitch_reward_decay", 0.1),
+            stitch_max_extensions=algo.get("stitch_max_extensions", 5),
+            stitch_splice_boost=algo.get("stitch_splice_boost", 2.0),
+            stitch_post_splice_decay=algo.get("stitch_post_splice_decay", 0.9),
         )
 
         # Delegate to standard TaskRunner

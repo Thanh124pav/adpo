@@ -39,6 +39,11 @@ algorithm:
   golden_path_mode: endpoint     # "endpoint" or "vllm"
   golden_path_cache_dir: data/golden_paths
   golden_path_max_attempts: 3
+  # Trajectory Stitching (active when golden_path_enabled=true)
+  stitch_reward_decay: 0.1       # reward decay per golden extension (1.0 -> 0.9 -> 0.8)
+  stitch_max_extensions: 5       # max golden phases to extend before giving up
+  stitch_splice_boost: 2.0       # advantage multiplier at splice point
+  stitch_post_splice_decay: 0.9  # geometric decay of positive advantage after splice
 
 # --- Actor / Rollout / Ref overrides ---
 actor_rollout_ref:
