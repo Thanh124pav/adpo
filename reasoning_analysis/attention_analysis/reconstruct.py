@@ -160,11 +160,18 @@ def reconstruct_attention(
     head_dim = get_head_dim(config)
 
     seq_len = hidden_state.shape[1]
-    device = hidden_state.device
     dtype = hidden_state.dtype
 
+    # Move inputs to the same device as the layer weights (multi-GPU safe)
+    layer_device = next(layer.parameters()).device
+    hidden_state = hidden_state.to(layer_device)
+
     if position_ids is None:
-        position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
+        position_ids = torch.arange(seq_len, device=layer_device).unsqueeze(0)
+    else:
+        position_ids = position_ids.to(layer_device)
+
+    device = layer_device
 
     # Step 1: Input LayerNorm (RMSNorm)
     h = layer.input_layernorm(hidden_state)
@@ -189,6 +196,9 @@ def reconstruct_attention(
     # Step 5: RoPE — rotate Q and K based on position
     rotary_emb_module = get_rotary_emb(model, attn)
     cos, sin = call_rotary_emb(rotary_emb_module, K, position_ids, seq_len)
+    # Ensure cos/sin are on the same device (rotary_emb may live elsewhere)
+    cos = cos.to(device)
+    sin = sin.to(device)
     Q, K = apply_rotary_pos_emb(Q, K, cos, sin)
 
     # Step 6: GQA — repeat KV heads to match Q heads
@@ -248,8 +258,6 @@ def reconstruct_attention(
     del causal_mask
 
     # Step 9: Softmax
-    # When on CPU (matmul_on_cpu), already in float32 — softmax directly.
-    # When on GPU, compute softmax in float32 then cast to output_dtype.
     attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
     if output_dtype != torch.float32:
         attn_weights = attn_weights.to(output_dtype)

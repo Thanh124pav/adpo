@@ -312,7 +312,7 @@ def reconstruct_attention_at_layer(
     layer_idx: int,
     hidden_state: torch.Tensor,
     position_ids: torch.Tensor,
-    output_dtype: torch.dtype = torch.bfloat16,
+    output_dtype: torch.dtype = torch.float32,
     matmul_on_cpu: bool = True,
 ) -> torch.Tensor:
     """Reconstruct attention weights for one layer from its input hidden state.
@@ -324,15 +324,14 @@ def reconstruct_attention_at_layer(
         layer_idx: Layer index.
         hidden_state: (1, seq_len, hidden_dim).
         position_ids: (1, seq_len).
-        output_dtype: dtype for returned attention matrix.  Default bfloat16
-                      to halve GPU memory vs float32.
+        output_dtype: dtype for returned attention matrix.
         matmul_on_cpu: If True (default), run the large Q·K^T matmul and
                        softmax on CPU.  Steps 1-5 (LayerNorm, projection,
                        QK-Norm, RoPE) still run on GPU.  This eliminates
                        the O(num_heads × seq²) GPU memory spike entirely.
 
     Returns:
-        attn_weights: (num_heads, seq_len, seq_len) in output_dtype.
+        attn_weights: (num_heads, seq_len, seq_len).
                       On CPU when matmul_on_cpu=True.
     """
     import sys
