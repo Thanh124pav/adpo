@@ -1001,6 +1001,116 @@ def _segment_into_sentences(tokens: list, boundary: int) -> list:
     return segments
 
 
+def _segment_into_phases(tokens: list, neg_log_probs: list, think_boundary: int,
+                         percentile: float = 85.0, min_phase_len: int = 5,
+                         max_phases: int = 10) -> list:
+    """Segment response tokens into phases using the ADPO adaptive algorithm.
+
+    Mirrors adpo.adpo_algorithm.detect_phase_boundaries_adaptive:
+    1. Find </think> boundary → split into [think_region, output_region]
+    2. Within think_region: split into sentences, score each by mean -log_prob
+       of first 1/3 tokens, select top-K above percentile threshold
+    3. Output region = 1 single phase
+
+    Args:
+        tokens: List of token strings.
+        neg_log_probs: Per-token -log_prob values (same length as tokens).
+        think_boundary: Token index where thinking ends (after </think>).
+                        If None/0, entire response is treated as thinking.
+        percentile: Percentile threshold for selecting phase boundaries.
+        min_phase_len: Minimum tokens per sentence/phase segment.
+        max_phases: Maximum number of phases.
+
+    Returns:
+        List of dicts: {"phase_id": int, "start": int, "end": int,
+                        "section": str, "label": str}
+    """
+    import re
+
+    n_tokens = len(tokens)
+    if n_tokens == 0:
+        return []
+
+    think_end = think_boundary if think_boundary and think_boundary > 0 else n_tokens
+
+    # --- Step 1: Split thinking region into sentences ---
+    sentences = []
+    current_start = 0
+    accumulated = ""
+
+    for i in range(think_end):
+        accumulated += tokens[i]
+        is_delim = False
+        if "\n\n" in tokens[i]:
+            is_delim = True
+        elif re.search(r'[.?!]\s*$', accumulated):
+            is_delim = True
+        elif re.search(r'[.?!]$', tokens[i]):
+            is_delim = True
+
+        if is_delim and i >= current_start:
+            sentences.append((current_start, i + 1))
+            current_start = i + 1
+            accumulated = ""
+
+    if current_start < think_end:
+        sentences.append((current_start, think_end))
+
+    # Merge short sentences
+    merged = []
+    for s_start, s_end in sentences:
+        if merged and (s_start - merged[-1][0]) < min_phase_len:
+            merged[-1] = (merged[-1][0], s_end)
+        else:
+            merged.append((s_start, s_end))
+    sentences = merged if merged else [(0, think_end)]
+
+    # --- Step 2: Score sentences and select phase boundaries ---
+    sent_scores = []
+    for s_start, s_end in sentences:
+        T = s_end - s_start
+        head_len = max(1, T // 3)
+        head_nlps = neg_log_probs[s_start:s_start + head_len]
+        sent_scores.append(float(np.mean(head_nlps)) if head_nlps else 0.0)
+
+    candidates = []
+    if len(sent_scores) > 1:
+        threshold = np.percentile(sent_scores, percentile)
+        for i in range(1, len(sentences)):  # skip first sentence
+            if sent_scores[i] > threshold:
+                candidates.append((sent_scores[i], sentences[i][0]))
+        candidates.sort(key=lambda x: -x[0])
+
+    # Build boundary list: [0] + think candidates + [think_end (output)]
+    boundaries = [0]
+    max_think_phases = max_phases - 1 if (think_end < n_tokens) else max_phases
+    for _, s_start in candidates[:max_think_phases - 1]:
+        boundaries.append(s_start)
+
+    if think_end < n_tokens:
+        boundaries.append(think_end)
+
+    boundaries = sorted(set(boundaries))
+
+    # --- Step 3: Build phase segments ---
+    phases = []
+    for k, b_start in enumerate(boundaries):
+        b_end = boundaries[k + 1] if k + 1 < len(boundaries) else n_tokens
+        section = "thinking" if b_start < think_end else "output"
+        seg_text = "".join(tokens[b_start:b_end]).strip()
+        if len(seg_text) > 40:
+            seg_text = seg_text[:37] + "..."
+        phases.append({
+            "phase_id": k,
+            "start": b_start,
+            "end": b_end,
+            "section": section,
+            "label": f"P{k}[{section[0].upper()}]: {seg_text}",
+        })
+
+    return phases
+
+
 def _compute_sentence_attention(attn_matrix: np.ndarray, segments: list,
                                 row_offset: int, col_offset: int) -> np.ndarray:
     """Compute sentence-level attention from token-level attention matrix.
@@ -1105,6 +1215,7 @@ def _render_attention_heatmap_html(
     output_path: str,
     cmap_name: str = "Blues",
     normalize_per_row: bool = False,
+    is_causal: bool = False,
 ):
     """Render an attention heatmap as a fully interactive HTML file.
 
@@ -1114,12 +1225,51 @@ def _render_attention_heatmap_html(
 
     Args:
         normalize_per_row: If True, normalize each row independently instead
-                          of the whole matrix. Useful for per-layer entropy.
+                          of the whole matrix. Better for attention (shows
+                          per-query distribution) and per-layer entropy.
+        is_causal: If True, cells above the diagonal (j > i) are masked
+                   with a distinct gray color to indicate future positions
+                   that the model cannot attend to.
     """
     n_rows, n_cols = matrix.shape
 
     # Normalize for color mapping
-    if normalize_per_row:
+    # When causal: exclude diagonal values (self-attention is typically very
+    # large and dominates the color scale, washing out off-diagonal patterns)
+    if is_causal and n_rows == n_cols:
+        # Build mask: True for off-diagonal, lower-triangle cells only
+        off_diag_mask = np.zeros_like(matrix, dtype=bool)
+        for i in range(n_rows):
+            off_diag_mask[i, :i] = True  # j < i only
+
+        if normalize_per_row:
+            normed = np.zeros_like(matrix, dtype=np.float64)
+            for i in range(n_rows):
+                row_vals = matrix[i, :i]  # exclude diagonal and future
+                if len(row_vals) == 0 or np.all(row_vals == 0):
+                    normed[i] = 0.0
+                    continue
+                nonzero = row_vals[row_vals > 0]
+                if len(nonzero) == 0:
+                    normed[i] = 0.0
+                    continue
+                vmin = np.percentile(nonzero, 2)
+                vmax = np.percentile(nonzero, 98)
+                if vmax <= vmin:
+                    vmax = vmin + 1e-8
+                normed[i] = np.clip((matrix[i] - vmin) / (vmax - vmin), 0.0, 1.0)
+        else:
+            off_diag_vals = matrix[off_diag_mask]
+            nonzero = off_diag_vals[off_diag_vals > 0]
+            if len(nonzero) == 0:
+                normed = np.zeros_like(matrix, dtype=np.float64)
+            else:
+                vmin = np.percentile(nonzero, 2)
+                vmax = np.percentile(nonzero, 98)
+                if vmax <= vmin:
+                    vmax = vmin + 1e-8
+                normed = np.clip((matrix - vmin) / (vmax - vmin), 0.0, 1.0)
+    elif normalize_per_row:
         normed = np.zeros_like(matrix, dtype=np.float64)
         for i in range(n_rows):
             normed[i] = _normalize_attention_for_viz(matrix[i:i+1]).flatten()
@@ -1244,14 +1394,16 @@ td:hover {{
 .tooltip {{
     display: none;
     position: fixed;
-    background: rgba(0,0,0,0.85);
+    background: rgba(0,0,0,0.9);
     color: #fff;
-    padding: 6px 10px;
-    border-radius: 4px;
+    padding: 8px 12px;
+    border-radius: 6px;
     font-size: 12px;
     pointer-events: none;
     z-index: 999;
-    white-space: pre;
+    white-space: pre-wrap;
+    max-width: 500px;
+    line-height: 1.5;
 }}
 .legend {{
     margin: 10px 0;
@@ -1278,6 +1430,12 @@ td:hover {{
 """)
 
     # Legend
+    norm_label = "per-row normalized" if normalize_per_row else "global percentile-normalized"
+    causal_legend = ('<span style="display:inline-block;width:16px;height:16px;'
+                     'background:#e8e8e8;border:1px solid #ccc;vertical-align:middle;'
+                     'margin-left:12px"></span> '
+                     '<span style="color:#888">= masked (self + future)</span>'
+                     if is_causal else "")
     if "Orange" in cmap_name:
         grad = "linear-gradient(to right, rgb(255,255,255), rgb(255,65,30))"
     else:
@@ -1286,7 +1444,8 @@ td:hover {{
   <span>Low</span>
   <div class="legend-bar" style="background: {grad}"></div>
   <span>High</span>
-  <span style="color:#888">(percentile-normalized for contrast)</span>
+  <span style="color:#888">({norm_label})</span>
+  {causal_legend}
 </div>
 <div class="zoom-controls">
   <button id="zoom-out" title="Zoom out">−</button>
@@ -1303,6 +1462,13 @@ td:hover {{
     for i in range(n_rows):
         html_parts.append(f'<tr><th class="row-header" title="row {i}: {esc(row_tokens[i])}">{esc(row_tokens[i])}</th>')
         for j in range(n_cols):
+            # Causal mask: gray out diagonal and above (self + future)
+            if is_causal and n_rows == n_cols and j >= i:
+                html_parts.append(
+                    f'<td style="background:#e8e8e8" '
+                    f'data-r="{i}" data-c="{j}" data-v="masked">'
+                    f'</td>')
+                continue
             raw_val = matrix[i, j]
             norm_val = normed[i, j]
             color = val_to_rgb(float(norm_val))
@@ -1321,26 +1487,34 @@ td:hover {{
 
     html_parts.append('</table>\n</div>\n</div>\n')
 
+    # Embed full token/label text as JSON for tooltip lookup
+    import json as _json
+    row_tokens_json = _json.dumps(row_tokens, ensure_ascii=False)
+    col_tokens_json = _json.dumps(col_tokens, ensure_ascii=False)
+
     # Tooltip + zoom/pan script
-    html_parts.append("""
+    html_parts.append(f"""
 <div class="tooltip" id="tooltip"></div>
 <script>
-(function() {
+(function() {{
     const wrap = document.getElementById('heatmap-wrap');
     const inner = document.getElementById('heatmap-inner');
     const tip = document.getElementById('tooltip');
     const zoomLabel = document.getElementById('zoom-label');
 
+    const ROW_LABELS = {row_tokens_json};
+    const COL_LABELS = {col_tokens_json};
+
     let scale = 1, panX = 0, panY = 0;
     let dragging = false, startX = 0, startY = 0, startPanX = 0, startPanY = 0;
     const MIN_SCALE = 0.1, MAX_SCALE = 5;
 
-    function applyTransform() {
-        inner.style.transform = `translate(${panX}px, ${panY}px) scale(${scale})`;
+    function applyTransform() {{
+        inner.style.transform = `translate(${{panX}}px, ${{panY}}px) scale(${{scale}})`;
         zoomLabel.textContent = Math.round(scale * 100) + '%';
-    }
+    }}
 
-    function zoomAt(cx, cy, factor) {
+    function zoomAt(cx, cy, factor) {{
         const rect = wrap.getBoundingClientRect();
         const mx = cx - rect.left;
         const my = cy - rect.top;
@@ -1350,68 +1524,68 @@ td:hover {{
         panY = my - ratio * (my - panY);
         scale = newScale;
         applyTransform();
-    }
+    }}
 
     // Wheel zoom
-    wrap.addEventListener('wheel', function(e) {
+    wrap.addEventListener('wheel', function(e) {{
         e.preventDefault();
         const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
         zoomAt(e.clientX, e.clientY, factor);
-    }, {passive: false});
+    }}, {{passive: false}});
 
     // Button zoom
-    document.getElementById('zoom-in').addEventListener('click', function() {
+    document.getElementById('zoom-in').addEventListener('click', function() {{
         const rect = wrap.getBoundingClientRect();
         zoomAt(rect.left + rect.width/2, rect.top + rect.height/2, 1.3);
-    });
-    document.getElementById('zoom-out').addEventListener('click', function() {
+    }});
+    document.getElementById('zoom-out').addEventListener('click', function() {{
         const rect = wrap.getBoundingClientRect();
         zoomAt(rect.left + rect.width/2, rect.top + rect.height/2, 1/1.3);
-    });
-    document.getElementById('zoom-reset').addEventListener('click', function() {
+    }});
+    document.getElementById('zoom-reset').addEventListener('click', function() {{
         scale = 1; panX = 0; panY = 0;
         applyTransform();
-    });
+    }});
 
     // Drag to pan
-    wrap.addEventListener('mousedown', function(e) {
+    wrap.addEventListener('mousedown', function(e) {{
         if (e.button !== 0) return;
         dragging = true;
         startX = e.clientX; startY = e.clientY;
         startPanX = panX; startPanY = panY;
         wrap.classList.add('dragging');
         e.preventDefault();
-    });
-    window.addEventListener('mousemove', function(e) {
-        if (dragging) {
+    }});
+    window.addEventListener('mousemove', function(e) {{
+        if (dragging) {{
             panX = startPanX + (e.clientX - startX);
             panY = startPanY + (e.clientY - startY);
             applyTransform();
-        }
+        }}
         // Tooltip
         const td = e.target.closest('td[data-v]');
-        if (td) {
-            const r = td.dataset.r, c = td.dataset.c, v = td.dataset.v;
-            const rt = document.querySelectorAll('th.row-header')[r];
-            const ct = document.querySelectorAll('th.col-header')[c];
-            const rn = rt ? rt.textContent : r;
-            const cn = ct ? ct.textContent : c;
-            tip.innerHTML = `Row[${r}]: ${rn}\\nCol[${c}]: ${cn}\\nValue: ${v}`;
+        if (td) {{
+            const r = parseInt(td.dataset.r);
+            const c = parseInt(td.dataset.c);
+            const v = td.dataset.v;
+            const rn = ROW_LABELS[r] || r;
+            const cn = COL_LABELS[c] || c;
+            tip.innerHTML = `<b>Row[${{r}}]:</b> ${{rn}}\\n<b>Col[${{c}}]:</b> ${{cn}}\\n<b>Value:</b> ${{v}}`;
             tip.style.display = 'block';
             tip.style.left = (e.clientX + 14) + 'px';
             tip.style.top = (e.clientY + 14) + 'px';
-        } else {
+        }} else {{
             tip.style.display = 'none';
-        }
-    });
-    window.addEventListener('mouseup', function() {
+        }}
+    }});
+    window.addEventListener('mouseup', function() {{
         dragging = false;
         wrap.classList.remove('dragging');
-    });
-    wrap.addEventListener('mouseleave', function() {
+    }});
+    wrap.addEventListener('mouseleave', function() {{
         tip.style.display = 'none';
-    });
-})();
+    }});
+}})();
 </script>
 </body></html>""")
 
@@ -1444,30 +1618,53 @@ def _free_model(model):
         torch.cuda.empty_cache()
 
 
+def _get_neg_log_probs_for_sample(analysis_results: list | None,
+                                  meta: dict,
+                                  n_tokens: int) -> list | None:
+    """Look up neg_log_prob values for a sample from analysis results.
+
+    Matches by prompt_idx and sample_idx from the .npz metadata.
+    Returns list of floats (one per token) or None if not found.
+    """
+    if not analysis_results:
+        return None
+    prompt_idx = meta.get("prompt_idx")
+    sample_idx = meta.get("sample_idx", 0)
+    for r in analysis_results:
+        if (r.get("prompt_idx") == prompt_idx
+                and r.get("sample_idx", 0) == sample_idx):
+            toks = r.get("tokens", [])
+            if len(toks) >= n_tokens:
+                return [t["neg_log_prob"] for t in toks[:n_tokens]]
+            elif toks:
+                # Pad with zeros if slightly shorter
+                nlps = [t["neg_log_prob"] for t in toks]
+                nlps.extend([0.0] * (n_tokens - len(nlps)))
+                return nlps
+    return None
+
+
 def generate_attention_heatmaps(model, internals_dir: str,
                                 output_dir: str, max_samples: int = 50,
                                 layers: list[int] | None = None,
-                                no_png: bool = False):
-    """Generate attention heatmaps as interactive HTML files + optional PNG.
+                                analysis_results: list | None = None):
+    """Generate attention heatmaps as interactive HTML files.
 
     Reconstructs attention matrices from hidden states + model weights.
     All tokens are shown on axes (no truncation). Color is percentile-
     normalized to ensure visible contrast even with sparse attention.
+
+    Generates: token-level (think→think, output→think), sentence-level,
+    and phase-level heatmaps.
 
     Args:
         model: Pre-loaded HuggingFace causal LM.
         layers: List of layer indices (0-based) to visualize.
                 None = last layer only.
                 Each layer gets its own subdirectory: attention_heatmaps/layer_XX/
-        no_png: If True, skip PNG generation (saves significant RAM for
-                large token counts where matplotlib figures become huge).
+        analysis_results: List of analysis result dicts (from evaluate.py JSONL).
+                          Used to extract per-token neg_log_prob for phase detection.
     """
-    if not no_png:
-        import matplotlib
-        matplotlib.use("Agg")
-        _configure_matplotlib()
-        import matplotlib.pyplot as plt
-
     samples = _load_npz_samples(internals_dir, max_samples)
     if not samples:
         return
@@ -1532,7 +1729,7 @@ def generate_attention_heatmaps(model, internals_dir: str,
 
             layer_tag = f"L{viz_layer}"
 
-            # --- Token-level heatmaps (HTML + PNG) ---
+            # --- Token-level heatmaps (HTML only) ---
 
             # Think→Think sub-matrix
             if think_boundary is not None and think_len > 0:
@@ -1540,33 +1737,13 @@ def generate_attention_heatmaps(model, internals_dir: str,
                 think_tokens = tokens[:think_boundary]
                 title = (f"Think→Think Attention (sample {sample_idx}, "
                          f"layer {viz_layer}, head avg, {len(think_tokens)} tokens)")
-
-                # HTML (primary — always full detail)
                 _render_attention_heatmap_html(
                     tt, think_tokens, think_tokens, title,
                     os.path.join(attn_dir, f"sample_{sample_idx:03d}_think_think.html"),
                     cmap_name="Blues",
+                    normalize_per_row=True,
+                    is_causal=True,
                 )
-
-                # PNG (with percentile normalization + all tokens shown)
-                if not no_png:
-                    normed_tt = _normalize_attention_for_viz(tt)
-                    fig_w = max(10, len(think_tokens) * 0.35)
-                    fig_h = max(8, len(think_tokens) * 0.30)
-                    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-                    im = ax.imshow(normed_tt, aspect="auto", cmap="Blues", vmin=0, vmax=1)
-                    ax.set_title(title, fontsize=10)
-                    ax.set_xlabel("Key (thinking tokens)")
-                    ax.set_ylabel("Query (thinking tokens)")
-                    ax.set_xticks(range(len(think_tokens)))
-                    ax.set_xticklabels(think_tokens, rotation=90, fontsize=max(4, min(7, 500 // len(think_tokens))))
-                    ax.set_yticks(range(len(think_tokens)))
-                    ax.set_yticklabels(think_tokens, fontsize=max(4, min(7, 500 // len(think_tokens))))
-                    plt.colorbar(im, ax=ax, shrink=0.8, label="attention (normalized)")
-                    plt.tight_layout()
-                    plt.savefig(os.path.join(attn_dir, f"sample_{sample_idx:03d}_think_think_tokens.png"),
-                                dpi=150, bbox_inches="tight")
-                    plt.close()
 
             # Output→Think sub-matrix
             if think_boundary is not None and think_len > 0 and out_len > 0:
@@ -1575,70 +1752,50 @@ def generate_attention_heatmaps(model, internals_dir: str,
                 out_tokens = tokens[think_boundary:]
                 title = (f"Output→Think Attention (sample {sample_idx}, "
                          f"layer {viz_layer}, head avg, {len(out_tokens)}x{len(think_tokens)})")
-
-                # HTML
                 _render_attention_heatmap_html(
                     ot, out_tokens, think_tokens, title,
                     os.path.join(attn_dir, f"sample_{sample_idx:03d}_out_think.html"),
                     cmap_name="Oranges",
+                    normalize_per_row=True,
                 )
-
-                # PNG
-                if not no_png:
-                    normed_ot = _normalize_attention_for_viz(ot)
-                    fig_w = max(10, len(think_tokens) * 0.35)
-                    fig_h = max(6, len(out_tokens) * 0.35)
-                    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-                    im = ax.imshow(normed_ot, aspect="auto", cmap="Oranges", vmin=0, vmax=1)
-                    ax.set_title(title, fontsize=10)
-                    ax.set_xlabel("Key (thinking tokens)")
-                    ax.set_ylabel("Query (output tokens)")
-                    ax.set_xticks(range(len(think_tokens)))
-                    ax.set_xticklabels(think_tokens, rotation=90, fontsize=max(4, min(7, 500 // len(think_tokens))))
-                    ax.set_yticks(range(len(out_tokens)))
-                    ax.set_yticklabels(out_tokens, fontsize=max(4, min(7, 500 // len(out_tokens))))
-                    plt.colorbar(im, ax=ax, shrink=0.8, label="attention (normalized)")
-                    plt.tight_layout()
-                    plt.savefig(os.path.join(attn_dir, f"sample_{sample_idx:03d}_out_think_tokens.png"),
-                                dpi=150, bbox_inches="tight")
-                    plt.close()
 
             # --- Sentence-level heatmaps ---
             boundary = think_boundary if think_boundary is not None else 0
             segments = _segment_into_sentences(tokens, boundary)
-            if len(segments) < 2:
-                continue
+            if len(segments) >= 2:
+                labels = [s["label"] for s in segments]
+                sent_attn = _compute_sentence_attention(attn_avg, segments,
+                                                        row_offset=0, col_offset=0)
+                _render_attention_heatmap_html(
+                    sent_attn, labels, labels,
+                    f"Sentence-level Attention (sample {sample_idx}, layer {viz_layer})",
+                    os.path.join(attn_dir, f"sample_{sample_idx:03d}_sentences.html"),
+                    cmap_name="Blues",
+                    normalize_per_row=True,
+                    is_causal=True,
+                )
 
-            labels = [s["label"] for s in segments]
-
-            # Sentence-level from full response attention
-            sent_attn = _compute_sentence_attention(attn_avg, segments,
-                                                    row_offset=0, col_offset=0)
-
-            # HTML
-            _render_attention_heatmap_html(
-                sent_attn, labels, labels,
-                f"Sentence-level Attention (sample {sample_idx}, layer {viz_layer})",
-                os.path.join(attn_dir, f"sample_{sample_idx:03d}_sentences.html"),
-                cmap_name="Blues",
-            )
-
-            # PNG
-            if not no_png:
-                normed_sent = _normalize_attention_for_viz(sent_attn)
-                fig_size = max(8, len(segments) * 0.6)
-                fig, ax = plt.subplots(figsize=(fig_size, fig_size))
-                im = ax.imshow(normed_sent, aspect="auto", cmap="Blues", vmin=0, vmax=1)
-                ax.set_title(f"Sentence-level Attention (sample {sample_idx}, layer {viz_layer})")
-                ax.set_xticks(range(len(labels)))
-                ax.set_xticklabels(labels, rotation=90, fontsize=7)
-                ax.set_yticks(range(len(labels)))
-                ax.set_yticklabels(labels, fontsize=7)
-                plt.colorbar(im, ax=ax, shrink=0.8, label="attention (normalized)")
-                plt.tight_layout()
-                plt.savefig(os.path.join(attn_dir, f"sample_{sample_idx:03d}_sentences.png"),
-                            dpi=150, bbox_inches="tight")
-                plt.close()
+            # --- Phase-level heatmaps (ADPO algorithm) ---
+            # Get neg_log_probs for this sample from analysis_results
+            neg_log_probs = _get_neg_log_probs_for_sample(
+                analysis_results, meta, len(tokens))
+            if neg_log_probs is not None:
+                phases = _segment_into_phases(
+                    tokens, neg_log_probs, think_boundary)
+                if len(phases) >= 2:
+                    phase_labels = [p["label"] for p in phases]
+                    phase_attn = _compute_sentence_attention(
+                        attn_avg, phases, row_offset=0, col_offset=0)
+                    _render_attention_heatmap_html(
+                        phase_attn, phase_labels, phase_labels,
+                        f"Phase-level Attention (sample {sample_idx}, "
+                        f"layer {viz_layer}, {len(phases)} phases)",
+                        os.path.join(attn_dir,
+                                     f"sample_{sample_idx:03d}_phases.html"),
+                        cmap_name="Blues",
+                        normalize_per_row=True,
+                        is_causal=True,
+                    )
 
             if (sample_idx + 1) % 10 == 0:
                 print(f"    [{sample_idx+1}/{len(samples)}] heatmaps generated")
@@ -1687,16 +1844,262 @@ def _compute_layer_entropy(model, hidden_states: np.ndarray) -> np.ndarray:
     return entropies
 
 
+def _render_layer_entropy_by_phases(
+    entropies: np.ndarray,
+    tokens: list,
+    layer_labels: list,
+    phases: list,
+    title: str,
+    output_path: str,
+    normalize_per_row: bool = False,
+):
+    """Render layer entropy as multiple HTML tables, one per phase.
+
+    Each phase gets its own heatmap table showing layers (rows) x tokens (cols),
+    preventing overly wide tables for long sequences.
+
+    Args:
+        entropies: (n_layers+1, response_len) array.
+        tokens: List of token strings.
+        layer_labels: Row labels (e.g. ["emb", "L0", ...]).
+        phases: List of phase dicts with start/end/label.
+        title: Overall title for the page.
+        output_path: Where to write the HTML file.
+        normalize_per_row: If True, normalize each layer row independently.
+    """
+    n_rows = entropies.shape[0]
+
+    def esc(s):
+        return html_lib.escape(str(s)).replace(" ", "&nbsp;")
+
+    html_parts = []
+    html_parts.append(f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>{html_lib.escape(title)}</title>
+<style>
+body {{ font-family: monospace; margin: 20px; background: #fafafa; }}
+h1 {{ font-size: 18px; color: #2c3e50; }}
+h2 {{ font-size: 15px; color: #34495e; margin-top: 25px; }}
+.info {{ font-size: 13px; color: #555; margin-bottom: 10px; }}
+.phase-container {{
+    margin: 15px 0;
+    padding: 10px;
+    background: white;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+}}
+.heatmap-wrap {{
+    overflow: auto;
+    max-width: 95vw;
+    max-height: 75vh;
+    border: 1px solid #ccc;
+    position: relative;
+}}
+table {{
+    border-collapse: collapse;
+    font-size: 10px;
+}}
+td, th {{
+    width: 28px;
+    min-width: 28px;
+    max-width: 28px;
+    height: 22px;
+    text-align: center;
+    padding: 0;
+    border: 1px solid rgba(200,200,200,0.3);
+    overflow: hidden;
+}}
+th {{
+    background: #f8f8f8;
+    font-weight: normal;
+    font-size: 9px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 28px;
+    padding: 2px;
+}}
+th.col-header {{
+    writing-mode: vertical-rl;
+    text-orientation: mixed;
+    height: 80px;
+    max-height: 80px;
+    vertical-align: top;
+}}
+th.row-header {{
+    text-align: right;
+    padding-right: 4px;
+    max-width: 60px;
+    width: 60px;
+    min-width: 60px;
+}}
+th.corner {{
+    background: #f0f0f0;
+    width: 60px; min-width: 60px;
+    height: 80px;
+}}
+td:hover {{
+    outline: 2px solid #333;
+    z-index: 1;
+}}
+.legend {{
+    margin: 10px 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+}}
+.legend-bar {{
+    width: 200px;
+    height: 16px;
+    border-radius: 3px;
+    border: 1px solid #ccc;
+}}
+.tooltip {{
+    display: none;
+    position: fixed;
+    background: rgba(0,0,0,0.9);
+    color: #fff;
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-size: 12px;
+    pointer-events: none;
+    z-index: 999;
+    white-space: pre-wrap;
+    max-width: 500px;
+    line-height: 1.5;
+}}
+.phase-nav {{ margin: 10px 0; }}
+.phase-nav a {{ margin: 0 6px; text-decoration: none; color: #3498db; }}
+</style>
+</head>
+<body>
+<h1>{html_lib.escape(title)}</h1>
+<div class="info">
+  Layers: {n_rows} &nbsp;|&nbsp; Total tokens: {len(tokens)} &nbsp;|&nbsp;
+  Phases: {len(phases)}
+</div>
+""")
+
+    grad = "linear-gradient(to right, rgb(255,255,255), rgb(8,48,107))"
+    html_parts.append(f"""<div class="legend">
+  <span>Low</span>
+  <div class="legend-bar" style="background: {grad}"></div>
+  <span>High</span>
+  <span style="color:#888">(percentile-normalized)</span>
+</div>
+""")
+
+    # Phase navigation
+    html_parts.append('<div class="phase-nav"><strong>Jump to phase:</strong> ')
+    for p in phases:
+        html_parts.append(f'<a href="#phase-{p["phase_id"]}">{p["label"][:20]}</a> ')
+    html_parts.append('</div>\n')
+
+    def val_to_rgb(v):
+        r = int(255 - v * 247)
+        g = int(255 - v * 207)
+        b = int(255 - v * 148)
+        return f"rgb({r},{g},{b})"
+
+    # Render one table per phase
+    for phase in phases:
+        p_start = phase["start"]
+        p_end = phase["end"]
+        phase_tokens = tokens[p_start:p_end]
+        phase_ent = entropies[:, p_start:p_end]  # (n_layers+1, phase_len)
+        n_cols = len(phase_tokens)
+
+        if n_cols == 0:
+            continue
+
+        # Normalize
+        if normalize_per_row:
+            normed = np.zeros_like(phase_ent, dtype=np.float64)
+            for i in range(n_rows):
+                normed[i] = _normalize_attention_for_viz(phase_ent[i:i+1]).flatten()
+        else:
+            normed = _normalize_attention_for_viz(phase_ent)
+
+        html_parts.append(f'<div class="phase-container" id="phase-{phase["phase_id"]}">\n')
+        html_parts.append(f'<h2>{html_lib.escape(phase["label"])} '
+                          f'(tokens {p_start}–{p_end-1}, {n_cols} tokens)</h2>\n')
+        html_parts.append(f'<div class="info">Value range: '
+                          f'[{phase_ent.min():.4f}, {phase_ent.max():.4f}]</div>\n')
+        html_parts.append('<div class="heatmap-wrap">\n<table>\n')
+
+        for i in range(n_rows):
+            html_parts.append(f'<tr><th class="row-header">{esc(layer_labels[i])}</th>')
+            for j in range(n_cols):
+                raw_val = phase_ent[i, j]
+                norm_val = normed[i, j]
+                color = val_to_rgb(float(norm_val))
+                html_parts.append(
+                    f'<td style="background:{color}" '
+                    f'data-r="{i}" data-c="{p_start+j}" data-v="{raw_val:.4f}">'
+                    f'</td>')
+            html_parts.append('</tr>\n')
+
+        # Column labels at bottom
+        html_parts.append('<tr><th class="corner"></th>')
+        for j, tok in enumerate(phase_tokens):
+            html_parts.append(f'<th class="col-header" '
+                              f'title="pos {p_start+j}: {esc(tok)}">{esc(tok)}</th>')
+        html_parts.append('</tr>\n')
+
+        html_parts.append('</table>\n</div>\n</div>\n')
+
+    # Embed data for tooltip
+    import json as _json
+    layer_labels_json = _json.dumps(layer_labels, ensure_ascii=False)
+    all_tokens_json = _json.dumps(tokens, ensure_ascii=False)
+
+    html_parts.append(f"""
+<div class="tooltip" id="tooltip"></div>
+<script>
+(function() {{
+    const tip = document.getElementById('tooltip');
+    const LAYERS = {layer_labels_json};
+    const TOKENS = {all_tokens_json};
+    document.addEventListener('mousemove', function(e) {{
+        const td = e.target.closest('td[data-v]');
+        if (td) {{
+            const r = parseInt(td.dataset.r);
+            const c = parseInt(td.dataset.c);
+            const v = td.dataset.v;
+            const layerName = LAYERS[r] || r;
+            const tokenText = TOKENS[c] || ('pos ' + c);
+            tip.innerHTML = `<b>Layer:</b> ${{layerName}}\\n<b>Token[${{c}}]:</b> ${{tokenText}}\\n<b>Entropy:</b> ${{v}}`;
+            tip.style.display = 'block';
+            tip.style.left = (e.clientX + 14) + 'px';
+            tip.style.top = (e.clientY + 14) + 'px';
+        }} else {{
+            tip.style.display = 'none';
+        }}
+    }});
+}})();
+</script>
+</body></html>""")
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("".join(html_parts))
+
+
 def generate_layer_entropy_html(model, internals_dir: str,
-                                output_dir: str, max_samples: int = 50):
+                                output_dir: str, max_samples: int = 50,
+                                analysis_results: list | None = None):
     """Generate per-layer entropy visualization using logit lens.
 
     For each sample, projects hidden states at every layer through the final
-    norm + lm_head to get logits, then computes entropy. Produces an HTML
-    heatmap showing how entropy evolves across layers for each token.
+    norm + lm_head to get logits, then computes entropy. Produces HTML
+    heatmaps split by phase (one table per phase) to avoid overly wide tables.
 
     Args:
         model: Pre-loaded HuggingFace causal LM.
+        analysis_results: List of analysis result dicts for phase detection.
     """
     samples = _load_npz_samples(internals_dir, max_samples)
     if not samples:
@@ -1728,25 +2131,43 @@ def generate_layer_entropy_html(model, internals_dir: str,
             "think_boundary": think_boundary,
         })
 
-        # Per-sample HTML heatmap: layers (rows) x tokens (cols)
         layer_labels = ["emb"] + [f"L{i}" for i in range(n_layers)]
         sample_title = (f"Layer Entropy — sample {sample_idx} "
                         f"(prompt {meta['prompt_idx']}, {len(tokens)} tokens)")
 
-        # Global normalization (across all layers)
-        _render_attention_heatmap_html(
-            entropies, layer_labels, list(tokens),
+        # --- Split by phases and generate one heatmap per phase ---
+        neg_log_probs = _get_neg_log_probs_for_sample(
+            analysis_results, meta, len(tokens))
+
+        if neg_log_probs is not None:
+            phases = _segment_into_phases(
+                list(tokens), neg_log_probs, think_boundary)
+        else:
+            # Fallback: if no analysis_results, split at think boundary
+            phases = []
+            if think_boundary and 0 < think_boundary < len(tokens):
+                phases.append({"phase_id": 0, "start": 0,
+                               "end": think_boundary, "section": "thinking",
+                               "label": "P0[T]: thinking"})
+                phases.append({"phase_id": 1, "start": think_boundary,
+                               "end": len(tokens), "section": "output",
+                               "label": "P1[O]: output"})
+            else:
+                phases.append({"phase_id": 0, "start": 0,
+                               "end": len(tokens), "section": "thinking",
+                               "label": "P0[T]: full response"})
+
+        _render_layer_entropy_by_phases(
+            entropies, list(tokens), layer_labels, phases,
             sample_title + " [global norm]",
             os.path.join(ent_dir, f"sample_{sample_idx:03d}_layer_entropy.html"),
-            cmap_name="Blues",
+            normalize_per_row=False,
         )
 
-        # Per-layer normalization (each layer independently)
-        _render_attention_heatmap_html(
-            entropies, layer_labels, list(tokens),
+        _render_layer_entropy_by_phases(
+            entropies, list(tokens), layer_labels, phases,
             sample_title + " [per-layer norm]",
             os.path.join(ent_dir, f"sample_{sample_idx:03d}_layer_entropy_perlayer.html"),
-            cmap_name="Blues",
             normalize_per_row=True,
         )
 
@@ -2024,14 +2445,22 @@ def main():
                         help="Layer indices (0-based) for attention heatmaps. "
                              "Accepts one or more values, e.g. --layers 0 12 27. "
                              "Default: last layer only.")
-    parser.add_argument("--no_png", action="store_true",
-                        help="Skip PNG heatmap generation to save RAM. "
-                             "Only HTML heatmaps will be produced.")
+    parser.add_argument("--max_tokens_for_visualize", type=int, default=None,
+                        help="Only visualize samples with fewer tokens than this value. "
+                             "Helps limit storage for very long responses.")
     args = parser.parse_args()
 
     print(f"Loading results from {args.input_path} ...")
     results = load_results(args.input_path)
     print(f"Loaded {len(results)} responses")
+
+    # Filter by max token count if specified
+    if args.max_tokens_for_visualize is not None:
+        original_count = len(results)
+        results = [r for r in results
+                   if len(r.get("tokens", [])) <= args.max_tokens_for_visualize]
+        print(f"Filtered to {len(results)}/{original_count} responses "
+              f"(max {args.max_tokens_for_visualize} tokens)")
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -2076,7 +2505,7 @@ def main():
                     internals_dir=args.internals_dir,
                     output_dir=args.output_dir,
                     layers=args.layers,
-                    no_png=args.no_png,
+                    analysis_results=results,
                 )
             except ImportError as e:
                 print(f"  WARNING: Attention heatmaps skipped ({e})")
@@ -2087,6 +2516,7 @@ def main():
                     model=model,
                     internals_dir=args.internals_dir,
                     output_dir=args.output_dir,
+                    analysis_results=results,
                 )
             except ImportError as e:
                 print(f"  WARNING: Layer entropy skipped ({e})")

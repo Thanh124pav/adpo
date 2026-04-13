@@ -30,11 +30,10 @@ MAX_TOKENS="${MAX_TOKENS:-1024}"
 TOP_LOGPROBS="${TOP_LOGPROBS:-20}"
 TP_SIZE="${TP_SIZE:-1}"                  # tensor_parallel_size for vLLM
 DEVICE="${DEVICE:-auto}"                 # Device for HF forward pass
-EXACT_ENTROPY="${EXACT_ENTROPY:-0}"      # Set 1 to enable exact entropy
 ATTN_IMPL="${ATTN_IMPL:-eager}"  # flash_attention_2 (default) or eager
 VIZ_ONLY="${VIZ_ONLY:-False}"
 LAYERS="${LAYERS:-None}"
-NO_PNG="${NO_PNG:-0}"
+MAX_TOKENS_FOR_VISUALIZE="${MAX_TOKENS_FOR_VISUALIZE:-}"  # empty = no limit
 # Derived paths
 ANALYSIS_FILE="$OUTPUT_DIR/analysis.jsonl"
 INTERNALS_DIR="$OUTPUT_DIR/internals"
@@ -42,9 +41,6 @@ VIZ_DIR="$OUTPUT_DIR/visualizations"
 
 # Optional flags
 EXTRA_FLAGS=""
-if [ "$EXACT_ENTROPY" = "1" ]; then
-    EXTRA_FLAGS="$EXTRA_FLAGS --exact_entropy"
-fi
 
 # ---------------------------------------------------------------------------
 echo "============================================================"
@@ -136,8 +132,8 @@ echo "  Generating: log_prob HTML, entropy HTML, statistical plots, attention he
 echo ""
 
 VIZ_FLAGS=""
-if [ "$NO_PNG" = "1" ]; then
-    VIZ_FLAGS="$VIZ_FLAGS --no_png"
+if [ -n "$MAX_TOKENS_FOR_VISUALIZE" ]; then
+    VIZ_FLAGS="$VIZ_FLAGS --max_tokens_for_visualize $MAX_TOKENS_FOR_VISUALIZE"
 fi
 
 python reasoning_analysis/visualize.py \
@@ -173,11 +169,14 @@ echo "      ├── entropy.html                # token-level entropy (50 samp
 echo "      ├── distributions.png           # statistical distributions"
 echo "      ├── per_response_stats.png      # per-response statistics"
 echo "      ├── per_position_trends.png     # positional trends"
-echo "      └── attention_heatmaps/         # attention heatmaps (50 samples)"
-echo "          ├── sample_XXX_think_think_tokens.png"
-echo "          ├── sample_XXX_think_think_sentences.png"
-echo "          ├── sample_XXX_out_think_tokens.png"
-echo "          └── sample_XXX_out_think_sentences.png"
+echo "      ├── attention_heatmaps/         # attention heatmaps (HTML only)"
+echo "      │   ├── sample_XXX_think_think.html"
+echo "      │   ├── sample_XXX_out_think.html"
+echo "      │   ├── sample_XXX_sentences.html"
+echo "      │   └── sample_XXX_phases.html  # phase-level attention"
+echo "      └── layer_entropy/              # per-phase layer entropy heatmaps"
+echo "          ├── sample_XXX_layer_entropy.html"
+echo "          └── summary.html"
 echo ""
 
 # File sizes
