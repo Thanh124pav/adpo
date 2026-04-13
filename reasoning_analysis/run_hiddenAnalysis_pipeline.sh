@@ -18,21 +18,22 @@ set -e
 # ---------------------------------------------------------------------------
 # Configuration (override via env vars)
 # ---------------------------------------------------------------------------
-MODEL="${MODEL:-Qwen/Qwen2.5-14B-Instruct}"
-DATASET="${DATASET:-data/aime2025.parquet}"
-OUTPUT_DIR="${OUTPUT_DIR:-reasoning_analysis/outputs/full_pipeline}"
-MAX_SAMPLES="${MAX_SAMPLES:-100}"         # Number of prompts (-1 = all)
-N_SAMPLES="${N_SAMPLES:-1}"              # Responses per prompt
-BACKEND="${BACKEND:-vllm}"               # vllm or hf
-TEMPERATURE="${TEMPERATURE:-0.6}"
+MODEL="${MODEL:-Qwen/Qwen3-0.6B}"
+DATASET="${DATASET:-data/processed/eval/gsm8k_test.parquet}"
+OUTPUT_DIR="${OUTPUT_DIR:-"reasoning_analysis/outputs/hidden_states_analysis_$MODEL" }"
+MAX_SAMPLES="${MAX_SAMPLES:-15}"         # Number of prompts (-1 = all)
+N_SAMPLES="${N_SAMPLES:-4}"              # Responses per prompt
+BACKEND="${BACKEND:-hf}"               # vllm or hf
+TEMPERATURE="${TEMPERATURE:-0.7}"
 TOP_P="${TOP_P:-0.95}"
-MAX_TOKENS="${MAX_TOKENS:-2048}"
+MAX_TOKENS="${MAX_TOKENS:-1024}"
 TOP_LOGPROBS="${TOP_LOGPROBS:-20}"
 TP_SIZE="${TP_SIZE:-1}"                  # tensor_parallel_size for vLLM
 DEVICE="${DEVICE:-auto}"                 # Device for HF forward pass
-EXACT_ENTROPY="${EXACT_ENTROPY:-0}"      # Set 1 to enable exact entropy
-ATTN_IMPL="${ATTN_IMPL:-flash_attention_2}"  # flash_attention_2 (default) or eager
-
+ATTN_IMPL="${ATTN_IMPL:-eager}"  # flash_attention_2 (default) or eager
+VIZ_ONLY="${VIZ_ONLY:-False}"
+LAYERS="${LAYERS:-None}"
+MAX_TOKENS_FOR_VISUALIZE="${MAX_TOKENS_FOR_VISUALIZE:-}"  # empty = no limit
 # Derived paths
 ANALYSIS_FILE="$OUTPUT_DIR/analysis.jsonl"
 INTERNALS_DIR="$OUTPUT_DIR/internals"
@@ -40,9 +41,6 @@ VIZ_DIR="$OUTPUT_DIR/visualizations"
 
 # Optional flags
 EXTRA_FLAGS=""
-if [ "$EXACT_ENTROPY" = "1" ]; then
-    EXTRA_FLAGS="$EXTRA_FLAGS --exact_entropy"
-fi
 
 # ---------------------------------------------------------------------------
 echo "============================================================"
@@ -93,32 +91,38 @@ fi
 # ---------------------------------------------------------------------------
 # Step 1: Inference + log_prob/entropy + attention extraction
 # ---------------------------------------------------------------------------
-echo "=== Step 1: Inference + Hidden States Extraction ==="
-echo "  This runs vLLM generation, then HF forward pass for hidden states."
-echo "  (Attention matrices will be reconstructed at visualization time)"
-echo ""
 
-python reasoning_analysis/evaluate.py \
-    --model_path "$MODEL" \
-    --dataset_path "$DATASET" \
-    --output_path "$ANALYSIS_FILE" \
-    --backend "$BACKEND" \
-    --max_samples "$MAX_SAMPLES" \
-    --n_samples "$N_SAMPLES" \
-    --temperature "$TEMPERATURE" \
-    --top_p "$TOP_P" \
-    --max_tokens "$MAX_TOKENS" \
-    --top_logprobs "$TOP_LOGPROBS" \
-    --tensor_parallel_size "$TP_SIZE" \
-    --device "$DEVICE" \
-    --extract_internals \
-    --attn_impl "$ATTN_IMPL" \
-    $EXTRA_FLAGS
+if [ "$VIZ_ONLY" == "False" ]; then
+    echo "=== Step 1: Inference + Hidden States Extraction ==="
+    echo "  This runs vLLM generation, then HF forward pass for hidden states."
+    echo "  (Attention matrices will be reconstructed at visualization time)"
+    echo ""
+    python reasoning_analysis/evaluate.py \
+        --model_path "$MODEL" \
+        --dataset_path "$DATASET" \
+        --output_path "$ANALYSIS_FILE" \
+        --backend "$BACKEND" \
+        --max_samples "$MAX_SAMPLES" \
+        --n_samples "$N_SAMPLES" \
+        --temperature "$TEMPERATURE" \
+        --top_p "$TOP_P" \
+        --max_tokens "$MAX_TOKENS" \
+        --top_logprobs "$TOP_LOGPROBS" \
+        --tensor_parallel_size "$TP_SIZE" \
+        --device "$DEVICE" \
+        --extract_internals \
+        --attn_impl "$ATTN_IMPL" \
+        $EXTRA_FLAGS
 
-echo ""
-echo "  Analysis saved to: $ANALYSIS_FILE"
-echo "  Internals saved to: $INTERNALS_DIR/"
-echo ""
+    echo ""
+    echo "  Analysis saved to: $ANALYSIS_FILE"
+    echo "  Internals saved to: $INTERNALS_DIR/"
+    echo ""
+else
+    echo ""
+    echo "=== Skip Step 1 ===="
+    echo ""
+fi
 
 # ---------------------------------------------------------------------------
 # Step 2: Visualization
@@ -127,12 +131,19 @@ echo "=== Step 2: Visualization ==="
 echo "  Generating: log_prob HTML, entropy HTML, statistical plots, attention heatmaps"
 echo ""
 
+VIZ_FLAGS=""
+if [ -n "$MAX_TOKENS_FOR_VISUALIZE" ]; then
+    VIZ_FLAGS="$VIZ_FLAGS --max_tokens_for_visualize $MAX_TOKENS_FOR_VISUALIZE"
+fi
+
 python reasoning_analysis/visualize.py \
     --input_path "$ANALYSIS_FILE" \
     --internals_dir "$INTERNALS_DIR" \
     --model_path "$MODEL" \
     --attn_impl "$ATTN_IMPL" \
-    --output_dir "$VIZ_DIR"
+    --output_dir "$VIZ_DIR" \
+    --layers $LAYERS \
+    $VIZ_FLAGS
 
 # ---------------------------------------------------------------------------
 # Summary
@@ -158,11 +169,14 @@ echo "      ├── entropy.html                # token-level entropy (50 samp
 echo "      ├── distributions.png           # statistical distributions"
 echo "      ├── per_response_stats.png      # per-response statistics"
 echo "      ├── per_position_trends.png     # positional trends"
-echo "      └── attention_heatmaps/         # attention heatmaps (50 samples)"
-echo "          ├── sample_XXX_think_think_tokens.png"
-echo "          ├── sample_XXX_think_think_sentences.png"
-echo "          ├── sample_XXX_out_think_tokens.png"
-echo "          └── sample_XXX_out_think_sentences.png"
+echo "      ├── attention_heatmaps/         # attention heatmaps (HTML only)"
+echo "      │   ├── sample_XXX_think_think.html"
+echo "      │   ├── sample_XXX_out_think.html"
+echo "      │   ├── sample_XXX_sentences.html"
+echo "      │   └── sample_XXX_phases.html  # phase-level attention"
+echo "      └── layer_entropy/              # per-phase layer entropy heatmaps"
+echo "          ├── sample_XXX_layer_entropy.html"
+echo "          └── summary.html"
 echo ""
 
 # File sizes

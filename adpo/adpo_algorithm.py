@@ -936,4 +936,12 @@ def compute_adpo_phase_advantages(
         boundaries_batch=boundaries_batch,
     )
 
+    # Normalize by number of phases per response:
+    # responses with fewer phases get higher per-token advantages
+    batch_size = response_mask.shape[0]
+    for b in range(batch_size):
+        n_phases = len(boundaries_batch[b])
+        if n_phases > 0:
+            token_advantages[b] = token_advantages[b] / n_phases
+
     return token_advantages
