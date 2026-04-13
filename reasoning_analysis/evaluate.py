@@ -322,10 +322,11 @@ def extract_attention_hidden_states(
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         trust_remote_code=True,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         attn_implementation=attn_impl,
         device_map=device,
     )
+    print(model.dtype)
     model.eval()
 
     if tokenizer.pad_token is None:
@@ -384,12 +385,12 @@ def extract_attention_hidden_states(
         for layer_idx in range(len(outputs.hidden_states)):
             hs = outputs.hidden_states[layer_idx][0]  # (seq_len, hidden_dim)
             # Only keep response (thinking + output) token positions
-            hs_response = hs[gen_start:gen_end].cpu().to(torch.float16).numpy()
+            hs_response = hs[gen_start:gen_end].cpu().to(torch.float32).numpy()
             hidden_list.append(hs_response)
 
         # --- Save to .npz ---
         npz_data = {
-            # (all_layers+1, response_len, hidden_dim) in float16
+            # (all_layers+1, response_len, hidden_dim) in bfloat16
             "hidden_states": np.stack(hidden_list),
         }
 
@@ -457,9 +458,12 @@ def generate_with_logprobs_hf(
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         trust_remote_code=True,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         device_map=device,
     )
+    print(model.dtype)
+    print(next(model.parameters()).device)  # cuda:0 hay cpu?
+    print(torch.cuda.is_bf16_supported())   # True hay False?
     model.eval()
 
     all_results = []

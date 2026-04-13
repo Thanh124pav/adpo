@@ -19,14 +19,14 @@ set -e
 # Configuration (override via env vars)
 # ---------------------------------------------------------------------------
 MODEL="${MODEL:-Qwen/Qwen3-0.6B}"
-DATASET="${DATASET:-data/processed/eval/gsm8k_test.parquet}"
+DATASET="${DATASET:-data/processed/eval/aime_2025.parquet}"
 OUTPUT_DIR="${OUTPUT_DIR:-"reasoning_analysis/outputs/hidden_states_analysis_$MODEL" }"
-MAX_SAMPLES="${MAX_SAMPLES:-15}"         # Number of prompts (-1 = all)
-N_SAMPLES="${N_SAMPLES:-4}"              # Responses per prompt
+MAX_SAMPLES="${MAX_SAMPLES:-5}"         # Number of prompts (-1 = all)
+N_SAMPLES="${N_SAMPLES:-1}"              # Responses per prompt
 BACKEND="${BACKEND:-hf}"               # vllm or hf
 TEMPERATURE="${TEMPERATURE:-0.7}"
 TOP_P="${TOP_P:-0.95}"
-MAX_TOKENS="${MAX_TOKENS:-1024}"
+MAX_TOKENS="${MAX_TOKENS:-2048}"
 TOP_LOGPROBS="${TOP_LOGPROBS:-20}"
 TP_SIZE="${TP_SIZE:-1}"                  # tensor_parallel_size for vLLM
 DEVICE="${DEVICE:-auto}"                 # Device for HF forward pass

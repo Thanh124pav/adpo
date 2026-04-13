@@ -990,13 +990,13 @@ def _segment_into_sentences(tokens: list, boundary: int) -> list:
             "section": section,
         })
 
-    # Create short labels
+    # Create short labels and full text
     for idx, seg in enumerate(segments):
         seg_tokens = tokens[seg["start"]:seg["end"]]
-        text = "".join(seg_tokens).strip()
-        if len(text) > 30:
-            text = text[:27] + "..."
-        seg["label"] = f"S{idx}[{seg['section'][0].upper()}]: {text}"
+        full_text = "".join(seg_tokens).strip()
+        short_text = full_text if len(full_text) <= 30 else full_text[:27] + "..."
+        seg["label"] = f"S{idx}[{seg['section'][0].upper()}]: {short_text}"
+        seg["full_text"] = full_text
 
     return segments
 
@@ -1233,6 +1233,16 @@ def _render_attention_heatmap_html(
     """
     n_rows, n_cols = matrix.shape
 
+    # Mask diagonal before normalization
+    diag_mask = set()
+    if mask_diagonal and n_rows == n_cols:
+        mat_masked = matrix.copy()
+        for i in range(min(n_rows, n_cols)):
+            mat_masked[i, i] = 0
+            diag_mask.add((i, i))
+    else:
+        mat_masked = matrix
+
     # Normalize for color mapping
     # When causal: exclude diagonal values (self-attention is typically very
     # large and dominates the color scale, washing out off-diagonal patterns)
@@ -1272,9 +1282,9 @@ def _render_attention_heatmap_html(
     elif normalize_per_row:
         normed = np.zeros_like(matrix, dtype=np.float64)
         for i in range(n_rows):
-            normed[i] = _normalize_attention_for_viz(matrix[i:i+1]).flatten()
+            normed[i] = _normalize_attention_for_viz(mat_masked[i:i+1]).flatten()
     else:
-        normed = _normalize_attention_for_viz(matrix)
+        normed = _normalize_attention_for_viz(mat_masked)
 
     # Generate color for each cell
     # Blues-like: 0 → white (255,255,255), 1 → dark blue (8,48,107)
@@ -1456,11 +1466,18 @@ td:hover {{
 </div>
 """)
 
+    # Resolve full texts for tooltips
+    r_full = row_full_texts if row_full_texts else row_tokens
+    c_full = col_full_texts if col_full_texts else col_tokens
+
     html_parts.append('<div class="heatmap-wrap" id="heatmap-wrap">\n<div class="heatmap-inner" id="heatmap-inner">\n<table>\n')
 
     # Data rows
     for i in range(n_rows):
-        html_parts.append(f'<tr><th class="row-header" title="row {i}: {esc(row_tokens[i])}">{esc(row_tokens[i])}</th>')
+        row_full_esc = html_lib.escape(str(r_full[i]))
+        html_parts.append(
+            f'<tr><th class="row-header" title="{row_full_esc}" '
+            f'data-full="{row_full_esc}">{esc(row_tokens[i])}</th>')
         for j in range(n_cols):
             # Causal mask: gray out diagonal and above (self + future)
             if is_causal and n_rows == n_cols and j >= i:
@@ -1470,8 +1487,11 @@ td:hover {{
                     f'</td>')
                 continue
             raw_val = matrix[i, j]
-            norm_val = normed[i, j]
-            color = val_to_rgb(float(norm_val))
+            if (i, j) in diag_mask:
+                color = "rgb(200,230,200)"  # green for masked diagonal
+            else:
+                norm_val = normed[i, j]
+                color = val_to_rgb(float(norm_val))
             html_parts.append(
                 f'<td style="background:{color}" '
                 f'data-r="{i}" data-c="{j}" data-v="{raw_val:.6f}">'
@@ -1482,7 +1502,10 @@ td:hover {{
     # Column token labels at the bottom
     html_parts.append('<tr><th class="corner"></th>')
     for j, tok in enumerate(col_tokens):
-        html_parts.append(f'<th class="col-header" title="col {j}: {esc(tok)}">{esc(tok)}</th>')
+        col_full_esc = html_lib.escape(str(c_full[j]))
+        html_parts.append(
+            f'<th class="col-header" title="{col_full_esc}" '
+            f'data-full="{col_full_esc}">{esc(tok)}</th>')
     html_parts.append('</tr>\n')
 
     html_parts.append('</table>\n</div>\n</div>\n')
