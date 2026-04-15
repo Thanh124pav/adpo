@@ -263,6 +263,116 @@ class TrajectoryStitcher:
     # Splice point finding
     # ------------------------------------------------------------------
 
+    def find_splice_points_hf(
+        self,
+        response_phase_texts: List[List[str]],
+        golden_phase_texts: List[str],
+        max_response_length: int,
+        hf_model,
+        tokenizer,
+        sub_batch_size: int = 8,
+    ) -> List[Tuple[int, int, float]]:
+        """Find optimal (j, i) splice point using the training model's own log-probs.
+
+        Replaces find_splice_points() which called an external endpoint.
+        Runs HF model forward pass directly — uses the model at the current
+        training step, not a stale vLLM snapshot.
+
+        Score(j, i) = mean log P_model(golden_phase[i] token | prefix tokens)
+                    where prefix = response phases [0..j]
+
+        Args:
+            response_phase_texts: [n][J] phase text strings per response
+            golden_phase_texts: [G] golden phase text strings
+            max_response_length: max total character length constraint
+            hf_model: HuggingFace model (already loaded, eval mode)
+            tokenizer: corresponding tokenizer
+            sub_batch_size: sequences per GPU forward call
+
+        Returns:
+            List of (j, i, avg_log_prob) per response.
+            (-1, -1, -inf) if no valid candidate found.
+        """
+        n_responses = len(response_phase_texts)
+        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+        device = next(hf_model.parameters()).device
+
+        # Build candidates: (r, j, i, full_ids, n_prefix_tokens)
+        candidates = []
+        for r in range(n_responses):
+            phases = response_phase_texts[r]
+            for j in range(len(phases) - 1, -1, -1):
+                prefix_text = " ".join(phases[: j + 1])
+                for i in range(len(golden_phase_texts)):
+                    golden_suffix_len = sum(
+                        len(p) for p in golden_phase_texts[i:]
+                    )
+                    if len(prefix_text) + golden_suffix_len > max_response_length:
+                        continue
+                    probe_text = golden_phase_texts[i][:200]
+                    full_text = prefix_text + " " + probe_text
+                    full_ids = tokenizer.encode(full_text, add_special_tokens=False)
+                    prefix_ids_len = len(
+                        tokenizer.encode(prefix_text, add_special_tokens=False)
+                    )
+                    if prefix_ids_len >= len(full_ids):
+                        continue  # probe tokenised to nothing
+                    candidates.append((r, j, i, full_ids, prefix_ids_len))
+
+        if not candidates:
+            return [(-1, -1, float("-inf"))] * n_responses
+
+        all_scores: List[Tuple[int, int, int, float]] = []  # (r, j, i, score)
+
+        for start in range(0, len(candidates), sub_batch_size):
+            sub = candidates[start : start + sub_batch_size]
+            max_len = max(len(c[3]) for c in sub)
+
+            # Left-pad so probe tokens align at the right end
+            input_ids_list, attn_mask_list = [], []
+            for _, _, _, full_ids, _ in sub:
+                pad_len = max_len - len(full_ids)
+                input_ids_list.append([pad_id] * pad_len + full_ids)
+                attn_mask_list.append([0] * pad_len + [1] * len(full_ids))
+
+            ids_t = torch.tensor(input_ids_list, dtype=torch.long, device=device)
+            mask_t = torch.tensor(attn_mask_list, dtype=torch.long, device=device)
+
+            with torch.no_grad():
+                logits = hf_model(input_ids=ids_t, attention_mask=mask_t).logits
+                log_probs = torch.log_softmax(logits.float(), dim=-1)  # (B, L, V)
+
+            for idx, (r, j, i, full_ids, prefix_len) in enumerate(sub):
+                pad_len = max_len - len(full_ids)
+                probe_len = len(full_ids) - prefix_len
+                if probe_len <= 0:
+                    all_scores.append((r, j, i, float("-inf")))
+                    continue
+
+                # token at padded position p is predicted by logits at p-1
+                lps = []
+                for k in range(probe_len):
+                    tok_pos = pad_len + prefix_len + k  # position in padded seq
+                    if tok_pos == 0:
+                        continue
+                    tok_id = full_ids[prefix_len + k]
+                    lps.append(log_probs[idx, tok_pos - 1, tok_id].item())
+
+                avg_lp = sum(lps) / len(lps) if lps else float("-inf")
+                all_scores.append((r, j, i, avg_lp))
+
+            del logits, log_probs, ids_t, mask_t
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        # Keep best (j, i) per response
+        best: Dict[int, Tuple[int, int, float]] = {}
+        for r, j, i, avg_lp in all_scores:
+            if r not in best or avg_lp > best[r][2]:
+                best[r] = (j, i, avg_lp)
+
+        return [best.get(r, (-1, -1, float("-inf"))) for r in range(n_responses)]
+
     def find_splice_points(
         self,
         response_phase_texts: List[List[str]],
@@ -467,39 +577,46 @@ class TrajectoryStitcher:
         self,
         questions: List[str],
         response_phase_texts: List[List[str]],
-        golden_path: str,
+        golden_phase_texts: List[str],
         golden_answers: List[str],
         data_sources: List[str],
         response_boundaries: List[List[int]],
+        hf_model=None,
+        tokenizer=None,
     ) -> List[SpliceResult]:
         """Run trajectory stitching for one all-wrong group.
 
         Args:
-            questions: [n] question texts (same for all in group)
+            questions: [n] question texts
             response_phase_texts: [n][K] phase texts per response
-            golden_path: golden solution text
+            golden_phase_texts: [G] pre-split golden phases (from splitter)
             golden_answers: [n] ground truth answers
             data_sources: [n] dataset names
             response_boundaries: [n][K+1] token boundaries per response
+            hf_model: HF model for splice scoring (preferred); falls back to
+                      endpoint-based scoring if None.
+            tokenizer: tokenizer for hf_model
 
         Returns:
             [n] SpliceResults, one per response in the group.
         """
         n = len(response_phase_texts)
 
-        # Step 1: Segment golden path into phases
-        golden_phases, golden_offsets = self.segment_golden_path(
-            golden_path, questions[0]
-        )
         logger.info(
-            f"[Stitch] Golden path: {len(golden_phases)} phases, "
-            f"lengths={[len(p) for p in golden_phases]}"
+            f"[Stitch] Golden path: {len(golden_phase_texts)} phases, "
+            f"lengths={[len(p) for p in golden_phase_texts]}"
         )
 
-        # Step 2: Find splice points for all responses
-        splice_points = self.find_splice_points(
-            response_phase_texts, golden_phases, self.max_response_length,
-        )
+        # Step 2: Find splice points — use HF model when available
+        if hf_model is not None and tokenizer is not None:
+            splice_points = self.find_splice_points_hf(
+                response_phase_texts, golden_phase_texts,
+                self.max_response_length, hf_model, tokenizer,
+            )
+        else:
+            splice_points = self.find_splice_points(
+                response_phase_texts, golden_phase_texts, self.max_response_length,
+            )
 
         # Step 3: Iterative rollout per response
         results = []
@@ -516,7 +633,7 @@ class TrajectoryStitcher:
 
             result = self.iterative_rollout(
                 response_phase_texts=response_phase_texts[r],
-                golden_phase_texts=golden_phases,
+                golden_phase_texts=golden_phase_texts,
                 splice_j=j,
                 splice_i=i,
                 question=questions[r],

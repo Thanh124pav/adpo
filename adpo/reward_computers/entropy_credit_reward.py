@@ -31,7 +31,7 @@ class EntropyReward(BaseReward):
         for b in range(batch_size):
             n_phases = len(phase_rewards_batch[b])
             for k in range(n_phases):
-                phase_rewards_tensor = float(phase_rewards_batch[b][k])
+                phase_rewards_tensor[b, k] = float(phase_rewards_batch[b][k])
                 phase_mask_tensor[b,k] = 1.0
         return phase_rewards_tensor, phase_mask_tensor, {}
 

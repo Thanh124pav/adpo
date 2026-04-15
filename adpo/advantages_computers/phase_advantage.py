@@ -11,7 +11,7 @@ class PhaseAdvantage:
         self.decay_gamma = config.algorithm.get("decay_gamma", 0.0)
         self.eps = 1e-10
 
-    def comput(self, phase_rewards, phase_mask, response_mask,
+    def compute(self, phase_rewards, phase_mask, response_mask,
                boundaries_batch, index,
                alpha = None, decay_gamma = None, eps = None) -> torch.Tensor:
         if alpha is None:
@@ -28,6 +28,7 @@ class PhaseAdvantage:
             n_phases = len(boundaries_batch[b])
             if n_phases > 0:
                 token_adv[b] /= n_phases
+        return token_adv
 
 def build_phase_mask(
     boundaries_batch: List[List[int]],
