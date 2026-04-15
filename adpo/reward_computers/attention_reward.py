@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 class AttentionReward(BaseReward):
     def __init__(self, config):
-        super(self, AttentionReward).__init__()
+        super().__init__()
         algo = config.algorithm
         self.attention_layer = getattr(algo, 'attention_layer', 21)
         self.attention_norm_mode = getattr(algo, 'attention_norm_mode', None)
@@ -24,7 +24,7 @@ class AttentionReward(BaseReward):
     def compute(self, boundaries_batch, response_mask, index, token_ids, hf_model, golden_answers, full_responses, data_sources,  **context):
         t_step5 = time.time()
         outcome_rewards = []
-
+        batch_size, seq_len = response_mask.shape
         for b in range(batch_size):
             if golden_answers[b]:
                 r = compute_score(
@@ -53,7 +53,6 @@ class AttentionReward(BaseReward):
             flush=True,
         )
 
-        batch_size, seq_len = response_mask.shape
         phase_rewards_batch = []
         for b in range(batch_size):
             active = response_mask[b].nonzero(as_tuple=True)[0] 
@@ -67,6 +66,7 @@ class AttentionReward(BaseReward):
             n_phases = len(boundaries_batch[b])
             if n_phases <= 1:
                 phase_rewards_batch.append(np.array([last_phase_rewards[b]]))
+                continue
 
             # --- Partial forward for this sample only ---
             n_layers = hf_model.config.num_hidden_layers
@@ -77,7 +77,6 @@ class AttentionReward(BaseReward):
             pos_ids = torch.arange(seq_len, device=hf_device).unsqueeze(0) # [1, seq_len]
 
             with torch.no_grad():
-                from adpo.pure_entropy_algorithm import _partial_forward
                 layer_L = self.attention_layer
                 hs_full = _partial_forward(hf_model, sub_ids, pos_ids, layer_L)
                 # hs_full: (1, seq_len, hidden_dim)
@@ -190,7 +189,15 @@ class AttentionReward(BaseReward):
             f"[PureEntropy] Step 5+6 done: {batch_size} samples in {time.time()-t_step5:.1f}s",
             flush=True,
         )
-        return phase_rewards_batch
+        max_K = max(len(r) for r in phase_rewards_batch)
+        device = response_mask.device
+        phase_rewards_tensor = torch.zeros(batch_size, max_K, device=device)
+        phase_mask_tensor = torch.zeros(batch_size, max_K, device=device)
+        for b, rewards in enumerate(phase_rewards_batch):
+            k = len(rewards)
+            phase_rewards_tensor[b, :k] = torch.tensor(rewards, dtype=torch.float32)
+            phase_mask_tensor[b, :k] = 1.0
+        return phase_rewards_tensor, phase_mask_tensor, {}
 
 def _get_hf_model(_hf_model, model_path):
     if _hf_model[0] is None:

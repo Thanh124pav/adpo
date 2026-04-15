@@ -20,7 +20,7 @@ class PhaseSegment:
 
 class PhaseSplitter(ABC):
     def __init__(self):
-        super(self, PhaseSplitter).__init__()
+        super().__init__()
     @abstractmethod
     def split(self, entropy, response_mask, log_probs=None, token_ids=None, tokenizer=None) -> List[List[int]]:
         """

@@ -11,7 +11,9 @@ logger = logging.getLogger(__name__)
 
 class JudgeReward(BaseReward):
     def __init__(self, config):
-        super(self, JudgeReward).__init__()
+        super().__init__()
+        self.config = config 
+        self.name = "JUDGE"
         algo = config.algorithm
         self.correct_reward_floor = getattr(algo, "correct_reward_floor", 0.5)
         self.incorrect_penalty = getattr(algo, "incorrect_penalty", 0.3)
@@ -33,7 +35,7 @@ class JudgeReward(BaseReward):
         )
 
         logger.info(
-            f"ADPO Trainer: method={self.phase_method}, judge={judge_type}"
+            f"Reward Type: {self.name} "
         )
 
     def compute(self, boundaries_batch, response_mask, index, phase_texts_batch, questions, golden_answers, data_sources, full_responses):
@@ -124,4 +126,4 @@ class JudgeReward(BaseReward):
             overlong_tensor = torch.tensor(overlong_rewards, device=device)
             phase_rewards = phase_rewards + (overlong_tensor.unsqueeze(1) * phase_mask_tensor)
 
-        return phase_rewards
+        return phase_rewards, phase_mask_tensor, {}

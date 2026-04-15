@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 class PureEntropySplitter(PhaseSplitter):
     def __init__(self, config):
-        super(self, PureEntropySplitter).__init__()
+        super().__init__()
         self.window_size = config.entropy_window_size
         self.percentile = config.entropy_percentile
         self.min_phase_len = config.phase_min_len
@@ -22,6 +22,7 @@ class PureEntropySplitter(PhaseSplitter):
         self,
         entropy: torch.Tensor,
         response_mask: torch.Tensor,
+        log_probs = None,
         token_ids: Optional[torch.Tensor] = None,
         tokenizer=None,
     ) -> List[List[int]]:

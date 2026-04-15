@@ -4,7 +4,7 @@ Nhánh làm việc: `reconstruct-project`
 
 ---
 
-## PHASE A — Sửa Lỗi Trong Code Hiện Có (Ưu tiên cao nhất)
+## PHASE A — Sửa Lỗi Trong Code Hiện Có (Ưu tiên cao nhất) [DONE]
 
 | # | File | Lỗi | Cách sửa |
 |---|------|-----|---------|

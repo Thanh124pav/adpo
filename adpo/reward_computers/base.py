@@ -7,9 +7,9 @@ from abc import ABC, abstractmethod
 
 class BaseReward(ABC):
     def __init__(self):
-        super(self, BaseReward).__init__()
+        super().__init__()
     @abstractmethod
-    def compute(boundaries_batch: List[List[int]], response_mask: torch.Tensor, index: torch.Tensor, **context ) \
+    def compute(self, boundaries_batch: List[List[int]], response_mask: torch.Tensor, index: torch.Tensor, **context ) \
         -> Tuple[torch.Tensor,  torch.Tensor, dict ]:
         pass
 

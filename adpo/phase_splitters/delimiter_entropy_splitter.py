@@ -9,7 +9,7 @@ from .base import PhaseSplitter
 
 class DeliEntropySplitter(PhaseSplitter):
     def __init__(self, config):
-        super(self, DeliEntropySplitter).__init__()
+        super().__init__()
         self.method = config.phase_method
         self.delta = config.phase_delta
         self.percentile = config.phase_percentile
