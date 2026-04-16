@@ -13,23 +13,37 @@ logger = logging.getLogger(__name__)
 class AttentionReward(BaseReward):
     """Reward computer based on attention-flow between phases.
 
-    Extensibility:
+    Extensibility — three pluggable functions, each independently swappable:
+
+        hidden_confluence_fn(hidden_states, boundaries, resp_end) → np.ndarray (m, m)
+            FAST PATH: operates directly on hidden states (L, D) moved to CPU
+            immediately after _partial_forward. Skips reconstruct_attention_at_layer
+            entirely — GPU is freed before any heavy computation.
+            Default: None (uses attention reconstruction path below).
+            Set via: config.algorithm.attention_hidden_pca_components > 0
+                   or: AttentionReward(config, hidden_confluence_fn=my_fn)
+
         confluence_fn(attn_weights, boundaries, resp_end) → np.ndarray (m, m)
+            ATTENTION PATH (only used when hidden_confluence_fn is None):
             Converts raw (num_heads, L, L) attention to an inter-phase confluence
             matrix. Default: build_phase_attention_matrix (head-averaged mean).
-            Swap to implement max-head, sum, or custom aggregation.
+            Set via: config.algorithm.attention_pca_components > 0
+                   or: AttentionReward(config, confluence_fn=my_fn)
 
         influence_fn(phase_attn, norm_mode) → np.ndarray (m-1, m-1)
-            Converts the confluence matrix to a lower-triangular influence matrix A
-            used to solve for phase rewards. Default: build_influence_matrix_A.
-            Swap to implement graph Laplacian, PageRank-style, or any other
-            influence measure.
+            Converts any (m, m) confluence matrix to the lower-triangular
+            influence matrix A used to solve for phase rewards.
+            Default: build_influence_matrix_A.
 
-    Both functions can be passed at construction time or replaced on the
-    instance after construction (self.confluence_fn = my_fn).
+    Memory comparison (resp_len=2048, hidden_dim=4096, num_heads=32):
+        Attention path: Q/K on GPU 2×16MB, attn on CPU 536MB (num_heads×L²×4B)
+        Hidden PCA path: hs_cpu 32MB (L×D×4B), Gram 32MB (L×L×8B), then tiny
+
+    All three can be swapped after construction (e.g., reward.confluence_fn = fn).
     """
 
-    def __init__(self, config, confluence_fn=None, influence_fn=None):
+    def __init__(self, config, confluence_fn=None, influence_fn=None,
+                 hidden_confluence_fn=None):
         super().__init__()
         algo = config.algorithm
         self.attention_layer = getattr(algo, 'attention_layer', 21)
@@ -39,8 +53,21 @@ class AttentionReward(BaseReward):
         self.incorrect_reward = getattr(algo, 'incorrect_reward', -1)
         self.partial_reward = getattr(algo, 'partial_reward', 0.1)
 
-        # Pluggable matrix-building functions.
-        # Priority: constructor arg > config PCA key > default mean
+        # --- hidden_confluence_fn (fast path, skips attention reconstruction) ---
+        # Priority: constructor arg > config key > None (use attention path)
+        if hidden_confluence_fn is not None:
+            self.hidden_confluence_fn = hidden_confluence_fn
+        else:
+            n_hs_pca = getattr(algo, 'attention_hidden_pca_components', 0)
+            if n_hs_pca > 0:
+                self.hidden_confluence_fn = make_hidden_pca_confluence_fn(n_hs_pca)
+                logger.info(
+                    f"[AttentionReward] Fast path: hidden PCA, n_components={n_hs_pca}"
+                )
+            else:
+                self.hidden_confluence_fn = None  # use attention path
+
+        # --- confluence_fn (attention path, used only when hidden_confluence_fn=None) ---
         if confluence_fn is not None:
             self.confluence_fn = confluence_fn
         else:
@@ -48,7 +75,7 @@ class AttentionReward(BaseReward):
             if n_pca > 0:
                 self.confluence_fn = make_pca_confluence_fn(n_pca)
                 logger.info(
-                    f"[AttentionReward] Using PCA confluence, n_components={n_pca}"
+                    f"[AttentionReward] Attention PCA confluence, n_components={n_pca}"
                 )
             else:
                 self.confluence_fn = build_phase_attention_matrix
@@ -116,67 +143,108 @@ class AttentionReward(BaseReward):
                 hs_full = _partial_forward(hf_model, sub_ids, pos_ids, layer_L)
                 # hs_full: (1, seq_len, hidden_dim)
 
-                # --- Slice to response tokens only ---
-                # This reduces attention reconstruction from O(seq_len²)
-                # to O(resp_len²). For seq_len=5120, resp_len~2048: ~6x speedup.
+                # Slice to response tokens only
                 hs_resp = hs_full[:, resp_start:resp_end, :]
-                pos_resp = torch.arange(
-                    resp_start, resp_end, device=hf_device,
-                ).unsqueeze(0)
+                # (1, resp_len, hidden_dim) — still on GPU
 
                 del hs_full, sub_ids
 
-                # --- Reconstruct attention (response tokens only) ---
-                # matmul_on_cpu=True: Steps 1-5 (LayerNorm, Q/K proj, RoPE)
-                # run on GPU, then Q/K move to CPU for the large matmul.
-                # GPU never allocates the O(num_heads × resp_len²) tensor.
-                try:
-                    attn_weights = reconstruct_attention_at_layer(
-                        model=hf_model,
-                        layer_idx=layer_L,
-                        hidden_state=hs_resp,
-                        position_ids=pos_resp,
-                        output_dtype=torch.float32,
-                        matmul_on_cpu=True,
-                    )  # (num_heads, resp_len, resp_len) float32, on CPU
-                except Exception as e:
-                    logger.error(f"[PureEntropy] Attention reconstruction failed for b={b}: {e}")
-                    print(f"[PureEntropy] ERROR: Attention reconstruction failed for b={b}: {e}", flush=True)
-                    # Nếu ko tái tạo đc thì lấy điểm reward cuối làm điểm chung ??? 
-                    phase_rewards_batch.append(np.full(n_phases, last_phase_rewards[b]))  
-                    del hs_resp, pos_resp
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    continue
-
-                del hs_resp, pos_resp
-
-            # --- Build phase attention matrix ---
-            # Boundaries are in absolute coords; shift to response-relative
-            # since attn_weights is now (num_heads, resp_len, resp_len)
+            # Shift boundaries to response-relative coords
             boundaries_relative = [bd - resp_start for bd in boundaries_batch[b]]
             resp_end_relative = resp_end - resp_start
 
-            # attn_weights is already on CPU (matmul_on_cpu=True)
-            # --- Confluence matrix: pluggable via self.confluence_fn ---
-            phase_attn = self.confluence_fn(
-                attn_weights=attn_weights,
-                boundaries=boundaries_relative,
-                resp_end=resp_end_relative,
-            )
+            # ----------------------------------------------------------------
+            # FAST PATH: hidden_confluence_fn set → move hs to CPU immediately,
+            # skip reconstruct_attention_at_layer entirely.
+            # GPU freed before any heavy computation — eliminates Q/K OOM risk.
+            # ----------------------------------------------------------------
+            if self.hidden_confluence_fn is not None:
+                hs_cpu = hs_resp[0].float().cpu()  # (resp_len, hidden_dim)
+                del hs_resp
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
-            del attn_weights
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                try:
+                    phase_attn = self.hidden_confluence_fn(
+                        hs_cpu, boundaries_relative, resp_end_relative,
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"[PureEntropy] hidden_confluence_fn failed for b={b}: {e}"
+                    )
+                    print(
+                        f"[PureEntropy] ERROR: hidden_confluence_fn failed b={b}: {e}",
+                        flush=True,
+                    )
+                    phase_rewards_batch.append(np.full(n_phases, last_phase_rewards[b]))
+                    continue
 
-            if b == 0:
-                print(
-                    f"[PureEntropy PhaseAttn] resp=0: phase_attn ({phase_attn.shape}), "
-                    f"confluence_fn={self.confluence_fn.__name__}, "
-                    f"resp_len={resp_len} (sliced from seq_len={seq_len}):\n"
-                    f"{np.array2string(phase_attn, precision=6, suppress_small=True)}",
-                    flush=True,
+                if b == 0:
+                    print(
+                        f"[PureEntropy PhaseAttn] resp=0: phase_attn ({phase_attn.shape}), "
+                        f"hidden_confluence_fn={self.hidden_confluence_fn.__name__}, "
+                        f"resp_len={resp_len}:\n"
+                        f"{np.array2string(phase_attn, precision=6, suppress_small=True)}",
+                        flush=True,
+                    )
+
+            # ----------------------------------------------------------------
+            # ATTENTION PATH: reconstruct Q·K^T at chosen layer.
+            # matmul_on_cpu=True keeps the (num_heads, L, L) tensor off GPU.
+            # ----------------------------------------------------------------
+            else:
+                with torch.no_grad():
+                    pos_resp = torch.arange(
+                        resp_start, resp_end, device=hf_device,
+                    ).unsqueeze(0)
+
+                    try:
+                        attn_weights = reconstruct_attention_at_layer(
+                            model=hf_model,
+                            layer_idx=layer_L,
+                            hidden_state=hs_resp,
+                            position_ids=pos_resp,
+                            output_dtype=torch.float32,
+                            matmul_on_cpu=True,
+                        )  # (num_heads, resp_len, resp_len) float32, CPU
+                    except Exception as e:
+                        logger.error(
+                            f"[PureEntropy] Attention reconstruction failed b={b}: {e}"
+                        )
+                        print(
+                            f"[PureEntropy] ERROR: Attention reconstruction failed b={b}: {e}",
+                            flush=True,
+                        )
+                        phase_rewards_batch.append(
+                            np.full(n_phases, last_phase_rewards[b])
+                        )
+                        del hs_resp, pos_resp
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        continue
+
+                    del hs_resp, pos_resp
+
+                # Confluence matrix: pluggable via self.confluence_fn
+                phase_attn = self.confluence_fn(
+                    attn_weights=attn_weights,
+                    boundaries=boundaries_relative,
+                    resp_end=resp_end_relative,
                 )
+
+                del attn_weights
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                if b == 0:
+                    print(
+                        f"[PureEntropy PhaseAttn] resp=0: phase_attn ({phase_attn.shape}), "
+                        f"confluence_fn={self.confluence_fn.__name__}, "
+                        f"resp_len={resp_len} (sliced from seq_len={seq_len}):\n"
+                        f"{np.array2string(phase_attn, precision=6, suppress_small=True)}",
+                        flush=True,
+                    )
+
             # --- Influence matrix A: pluggable via self.influence_fn ---
             A = self.influence_fn(phase_attn, norm_mode=self.attention_norm_mode)
             if b == 0:
@@ -526,6 +594,120 @@ def reconstruct_attention_at_layer(
         )
 
     return attn  # (num_heads, seq_len, seq_len)
+
+
+# ---------------------------------------------------------------------------
+# Hidden-State Confluence (fast path — no attention reconstruction)
+# ---------------------------------------------------------------------------
+
+def build_phase_confluence_from_hidden_pca(
+    hidden_states: torch.Tensor,
+    boundaries: List[int],
+    resp_end: int,
+    n_components: int = 32,
+) -> np.ndarray:
+    """Phase confluence from PCA-compressed hidden states.
+
+    Completely bypasses attention reconstruction: operates on
+    hidden_states (resp_len, D) already on CPU, never touches GPU again.
+
+    Algorithm:
+        1. Center token embeddings: hs_c = hs - mean(hs, axis=0)
+        2. Gram matrix G = hs_c @ hs_c.T  (resp_len × resp_len)
+           — cheaper than (D×D) covariance when resp_len < D
+        3. Top-n_comp eigenvectors of G = left singular vectors of hs_c
+        4. Mean-pool token scores per phase → phase embeddings (m, n_comp)
+        5. Cosine similarity → (m, m) confluence matrix
+
+    Memory (resp_len=2048, D=4096, n_comp=32):
+        hs on CPU: 2048 × 4096 × 4B = 32 MB
+        G on CPU:  2048 × 2048 × 8B = 32 MB   ← peak
+        result:    m × m × 8B        ≈ tiny
+
+    vs. attention path peak: num_heads × resp_len² × 4B = 536 MB (n_h=32)
+
+    Args:
+        hidden_states: (resp_len, hidden_dim) float tensor on CPU.
+        boundaries:    Relative phase boundary positions.
+        resp_end:      End of response (relative, exclusive).
+        n_components:  Number of PCA components (default 32).
+
+    Returns:
+        phase_attn: (m, m) cosine-similarity confluence matrix, values in [0, 1].
+    """
+    hs = hidden_states.numpy() if isinstance(hidden_states, torch.Tensor) \
+        else np.asarray(hidden_states, dtype=np.float64)
+    hs = hs.astype(np.float64)
+    resp_len, D = hs.shape
+    n_comp = min(n_components, resp_len - 1, D)
+
+    # Center
+    hs_mean = hs.mean(axis=0, keepdims=True)   # (1, D)
+    hs_c = hs - hs_mean                         # (resp_len, D)
+
+    # Gram matrix in token-space (resp_len × resp_len)
+    # When resp_len < D (common for sliced response windows), this is
+    # cheaper than the feature-space covariance (D × D).
+    G = hs_c @ hs_c.T                           # (resp_len, resp_len)
+    G /= max(resp_len - 1, 1)
+
+    # Eigen-decomposition (eigh: symmetric, ascending order)
+    eigenvalues, eigenvectors = np.linalg.eigh(G)
+    top_idx = np.argsort(eigenvalues)[::-1][:n_comp]
+    # eigenvectors[:,i] are the left singular vectors (U) of hs_c
+    token_scores = eigenvectors[:, top_idx]     # (resp_len, n_comp)
+
+    # Log explained variance at DEBUG
+    total_var = max(eigenvalues.sum(), 1e-12)
+    expl_var = eigenvalues[top_idx].sum() / total_var
+    logger.debug(
+        f"[AttentionReward HiddenPCA] n_comp={n_comp}, "
+        f"explained_var={expl_var:.3f}, resp_len={resp_len}, D={D}"
+    )
+
+    # Phase embeddings: mean-pool token scores per phase
+    m = len(boundaries)
+    phase_embs = np.zeros((m, n_comp), dtype=np.float64)
+    for k in range(m):
+        s = boundaries[k]
+        e = boundaries[k + 1] if k + 1 < m else resp_end
+        if e > s:
+            phase_embs[k] = token_scores[s:e].mean(axis=0)
+
+    # Cosine similarity matrix → shift to [0, 1]
+    norms = np.linalg.norm(phase_embs, axis=1, keepdims=True).clip(min=1e-12)
+    phase_embs_normed = phase_embs / norms
+    sim = phase_embs_normed @ phase_embs_normed.T   # (m, m), range [-1, 1]
+    return (sim + 1.0) / 2.0
+
+
+def make_hidden_pca_confluence_fn(n_components: int = 32):
+    """Factory: return a hidden_confluence_fn using PCA on hidden states.
+
+    The returned function has signature:
+        fn(hidden_states, boundaries, resp_end) → np.ndarray (m, m)
+    and can be passed directly as hidden_confluence_fn.
+
+    Args:
+        n_components: Number of PCA components (default 32).
+
+    Usage:
+        # At construction (automatic if config key set)
+        reward = AttentionReward(config,
+                     hidden_confluence_fn=make_hidden_pca_confluence_fn(64))
+
+        # Or swap after construction
+        reward.hidden_confluence_fn = make_hidden_pca_confluence_fn(16)
+
+        # Via config key (auto-selected in AttentionReward.__init__)
+        # config.algorithm.attention_hidden_pca_components = 32
+    """
+    def _hidden_pca(hidden_states, boundaries, resp_end):
+        return build_phase_confluence_from_hidden_pca(
+            hidden_states, boundaries, resp_end, n_components=n_components,
+        )
+    _hidden_pca.__name__ = f"hidden_pca_confluence(n={n_components})"
+    return _hidden_pca
 
 
 # ---------------------------------------------------------------------------
