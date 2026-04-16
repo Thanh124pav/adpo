@@ -32,7 +32,8 @@ algorithm:
   # ==========================================================================
   alpha: 0.5          # blend of local (per-phase) and global (per-response) advantage
                       # 0.0 = pure global (GRPO), 1.0 = pure local
-  decay_gamma: 0.95*0.99    # in-phase token decay: 0.0 = uniform, >0 = earlier tokens get more
+  decay_gamma: 0.9405    # in-phase token decay: 0.0 = uniform, >0 = earlier tokens get more
+                      # (was 0.95*0.99 — YAML does not evaluate arithmetic)
                       # (e.g. 0.9: first token gets ~2× last token within a phase)
 
   # ==========================================================================
@@ -49,7 +50,8 @@ algorithm:
   # ==========================================================================
   # Reward: EntropyReward  (pipeline_reward: entropy)
   # ==========================================================================
-  psi:                        0.95*0.99    # cumulative-entropy decay factor (1.0 = no decay)
+  psi:                        0.9405    # cumulative-entropy decay factor (1.0 = no decay)
+                                      # (was 0.95*0.99 — YAML does not evaluate arithmetic)
                                       # E_phase = e_1 + e_2*psi + e_3*psi² + ...
   default_threshold_percentile: 90.0  # percentile for P when all responses wrong
   correct_total:              1.0     # sum(phase_rewards) for correct responses

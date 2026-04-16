@@ -246,6 +246,7 @@ class ADPOTrainer:
             data_sources=data_sources,
             full_responses=full_responses,
             golden_solutions=golden_solutions,
+            token_ids=token_ids,        # AttentionReward needs full input_ids
             hf_model=self.hf_model,
             tokenizer=self.tokenizer,
         )

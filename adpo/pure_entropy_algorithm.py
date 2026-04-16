@@ -578,19 +578,16 @@ def solve_phase_rewards(
         r0 = fixed_first_reward
 
         # Unknowns are y = [r_1, ..., r_{m-1}] and the first reward is fixed.
-        # The system becomes:
-        #   M @ y = b
-        # where:
-        #   row 0:          r_1 = A[0,0] * r_0
-        #   row i (i>=1):  r_{i+1} - sum_{j=1..i} A[i,j] * r_j = -A[i,0] * r_0
+        # The system M @ y = b comes from moving r_0 terms to the RHS:
+        #   row 0:         r_1 = A[0,0] * r_0
+        #   row i (i>=1): r_{i+1} - sum_{j=1..i} A[i,j] * r_j = A[i,0] * r_0
         M = np.zeros((n, n))
         M[0, 0] = 1.0
         for i in range(1, n):
             M[i, :i] = -A[i, 1:i + 1]
             M[i, i] = 1.0
 
-        b = -A[:, 0] * r0
-        b[0] = A[0, 0] * r0
+        b = A[:, 0] * r0   # positive: A[i,0]*r_0 on the RHS for all rows
 
         try:
             det_B = np.linalg.det(M)
