@@ -554,12 +554,8 @@ def patch_verl_grpo_with_pure_entropy(
 
                 print(
                     f"[PureEntropy Solve] resp=0: {n_phases} phases, "
-                    f"det(B)={det_B:.6e}, residual={residual:.6e}",
-                    flush=True,
-                )
-                print(
-                    f"[PureEntropy Solve] B matrix:\n"
-                    f"{np.array2string(B_demo, precision=6, suppress_small=True)}",
+                    f"det(B)={det_B:.6e}, residual={residual:.6e}, "
+                    f"rewards={[f'{v:.4f}' for v in rewards[0].tolist()[:n]]}",
                     flush=True,
                 )
 
@@ -596,83 +592,32 @@ def patch_verl_grpo_with_pure_entropy(
             data.batch["returns"] = torch.zeros_like(token_advantages)
 
         # =====================================================================
-        # DEMO: Response 0 — full text, phases, A, rewards, advantages
-        # (tham khảo adpo_trainer.py)
+        # DEMO: Response 0 — compact summary of rewards & advantages
         # =====================================================================
         if batch_size > 0:
-            active0 = response_mask[0].nonzero(as_tuple=True)[0]
-            resp_start0 = active0[0].item() if len(active0) > 0 else 0
-            resp_end0 = active0[-1].item() + 1 if len(active0) > 0 else 0
-
-            # -- Full response text --
-            full_text_0 = tokenizer.decode(
-                token_ids[0][resp_start0:resp_end0].tolist(),
-                skip_special_tokens=True,
-            )
-            print(f"[PureEntropy Demo] ===== Response 0 =====", flush=True)
-            print(f"[PureEntropy Demo] Question: \"{questions[0][:200]}\"", flush=True)
-            print(f"[PureEntropy Demo] Golden answer: \"{golden_answers[0]}\"", flush=True)
+            # -- Basic info --
+            print(f"[PureEntropy Demo] Q: {questions[0][:80]}... | A: {golden_answers[0]}", flush=True)
             print(f"[PureEntropy Demo] Outcome: {outcome_rewards[0]:.2f} "
-                  f"(last_phase_reward={last_phase_rewards[0]:.2f})", flush=True)
-            print(f"[PureEntropy Demo] Full response ({len(full_text_0)} chars):", flush=True)
-            print(full_text_0[:500], flush=True)
-            if len(full_text_0) > 500:
-                print("...(truncated)", flush=True)
+                  f"(last_phase={last_phase_rewards[0]:.2f})", flush=True)
 
-            # -- Phase boundaries & texts --
-            n_phases_0 = len(boundaries_batch[0])
-            demo_bounds = boundaries_batch[0]
-            print(f"[PureEntropy Demo] {n_phases_0} phases, boundaries={demo_bounds}", flush=True)
-
-            phases_0 = segment_response_into_phases(
-                boundaries=demo_bounds,
-                response_length=resp_end0,
-                token_ids=token_ids[0],
-                tokenizer=tokenizer,
-            )
-            for k, phase in enumerate(phases_0):
-                b_start = demo_bounds[k] if k < len(demo_bounds) else "?"
-                b_end = demo_bounds[k + 1] if k + 1 < len(demo_bounds) else "end"
-                preview = phase.text[:150].replace('\n', '\\n')
-                print(f"  phase {k} (tok {b_start}-{b_end}): \"{preview}\"", flush=True)
-
-            # -- Phase rewards (solved) --
+            # -- Phase rewards summary --
             r0 = phase_rewards_t[0][phase_mask_t[0] > 0]
-            print(
-                f"[PureEntropy Demo] Phase rewards: "
-                f"{[f'{v:.4f}' for v in r0.tolist()]}",
-                flush=True,
-            )
+            if r0.numel() > 0:
+                print(
+                    f"[PureEntropy Demo] Phase rewards: "
+                    f"n={r0.numel()}, mean={r0.mean():.4f}, min={r0.min():.4f}, max={r0.max():.4f}",
+                    flush=True,
+                )
 
-            # -- Phase advantages --
-            a0 = phase_advantages[0][phase_mask_t[0] > 0]
-            print(
-                f"[PureEntropy Demo] Phase advantages: "
-                f"{[f'{v:.4f}' for v in a0.tolist()]}",
-                flush=True,
-            )
-
-            # -- Token advantage stats for resp 0 --
+            # -- Token advantage stats --
             tok_adv_0 = token_advantages[0][response_mask[0] > 0]
             if tok_adv_0.numel() > 0:
                 print(
-                    f"[PureEntropy Demo] Token adv resp=0: "
+                    f"[PureEntropy Demo] Token adv: "
                     f"mean={tok_adv_0.mean():.4f}, std={tok_adv_0.std():.4f}, "
                     f"min={tok_adv_0.min():.4f}, max={tok_adv_0.max():.4f}",
                     flush=True,
                 )
-
-            # -- Group info --
-            idx0 = index[0].item()
-            group0_mask = (index == idx0)
-            group0_outcomes = [outcome_rewards[i] for i in range(batch_size) if group0_mask[i]]
-            group0_correct = sum(1 for r in group0_outcomes if r >= 1.0)
-            print(
-                f"[PureEntropy Demo] Group uid={idx0}: "
-                f"{group0_correct}/{len(group0_outcomes)} correct",
-                flush=True,
-            )
-            print(f"[PureEntropy Demo] ===== End Response 0 =====", flush=True)
 
         # =====================================================================
         # Diagnostics (batch-level summary)
