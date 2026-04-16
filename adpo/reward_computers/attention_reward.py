@@ -39,9 +39,20 @@ class AttentionReward(BaseReward):
         self.incorrect_reward = getattr(algo, 'incorrect_reward', -1)
         self.partial_reward = getattr(algo, 'partial_reward', 0.1)
 
-        # Pluggable matrix-building functions
-        self.confluence_fn = confluence_fn if confluence_fn is not None \
-            else build_phase_attention_matrix
+        # Pluggable matrix-building functions.
+        # Priority: constructor arg > config PCA key > default mean
+        if confluence_fn is not None:
+            self.confluence_fn = confluence_fn
+        else:
+            n_pca = getattr(algo, 'attention_pca_components', 0)
+            if n_pca > 0:
+                self.confluence_fn = make_pca_confluence_fn(n_pca)
+                logger.info(
+                    f"[AttentionReward] Using PCA confluence, n_components={n_pca}"
+                )
+            else:
+                self.confluence_fn = build_phase_attention_matrix
+
         self.influence_fn = influence_fn if influence_fn is not None \
             else build_influence_matrix_A
 
@@ -565,6 +576,122 @@ def build_phase_attention_matrix(
                 phase_attn[a][b] = block.mean()
 
     return phase_attn
+
+
+def build_phase_attention_matrix_pca(
+    attn_weights: torch.Tensor,
+    boundaries: List[int],
+    resp_end: int,
+    n_components: int = 1,
+) -> np.ndarray:
+    """PCA-reduced inter-phase attention matrix.
+
+    Instead of simple head-averaging, aggregates the num_heads dimension
+    via PCA.  Each (query, key) token-pair is treated as a point in
+    num_heads-dimensional space.  PCA finds the directions of maximum
+    variance across all token-pairs; the first n_components principal
+    components capture the dominant shared attention pattern.
+
+    Algorithm (avoids large SVD by working in head-space):
+        X  : (L², H)   — each token-pair's head-attention vector
+        C  : (H, H)    — covariance matrix in head-space (H << L²)
+        eig(C) → top-n_comp eigenvectors → project → reconstruct → head-mean
+
+    Why PCA helps:
+        • Removes noise heads that fire randomly (PC variance → low → dropped)
+        • Preserves heads with consistent, structured attention patterns
+        • Reconstruction smooths out high-variance outlier heads
+
+    Args:
+        attn_weights: (num_heads, resp_len, resp_len) on CPU, float32.
+        boundaries:   Relative phase boundary positions.
+        resp_end:     End of response (relative, exclusive).
+        n_components: Number of PCA components to keep (default 1).
+                      1 → first PC only (most variance); higher values
+                      preserve more head diversity.
+
+    Returns:
+        phase_attn: (m, m) inter-phase attention matrix.
+    """
+    num_heads, L, _ = attn_weights.shape
+    n_comp = min(n_components, num_heads)
+
+    # (H, L, L) → (L², H): each token-pair is a point in head-space
+    X = attn_weights.float().cpu().numpy().reshape(num_heads, L * L).T  # (L², H)
+
+    # Center
+    X_mean = X.mean(axis=0, keepdims=True)   # (1, H)
+    X_c = X - X_mean                          # (L², H)
+
+    # Covariance in head-space: (H, H) — cheap since H (≤32..64) << L²
+    n_samples = max(X_c.shape[0] - 1, 1)
+    C = (X_c.T @ X_c) / n_samples            # (H, H)
+
+    # Eigen-decomposition (eigh = symmetric, returns ascending order)
+    eigenvalues, eigenvectors = np.linalg.eigh(C)
+    top_idx = np.argsort(eigenvalues)[::-1][:n_comp]
+    components = eigenvectors[:, top_idx].T   # (n_comp, H)
+
+    # Project → reconstruct denoised X
+    scores = X_c @ components.T               # (L², n_comp)
+    X_approx = scores @ components + X_mean   # (L², H) denoised
+
+    # Head-average the denoised matrix and reshape
+    attn_denoised = X_approx.mean(axis=1).reshape(L, L)   # (L, L)
+    attn_denoised = np.clip(attn_denoised, 0.0, None)     # attention ≥ 0
+
+    # Explained variance ratio — log directly here
+    total_var = max(eigenvalues.sum(), 1e-12)
+    expl_var = eigenvalues[top_idx].sum() / total_var
+    logger.debug(
+        f"[AttentionReward PCA] n_components={n_comp}/{num_heads}, "
+        f"explained_variance={expl_var:.3f}, L={L}"
+    )
+
+    # Build inter-phase matrix (same logic as base function)
+    m = len(boundaries)
+    phase_spans = []
+    for k in range(m):
+        s = boundaries[k]
+        e = boundaries[k + 1] if k + 1 < m else resp_end
+        phase_spans.append((s, e))
+
+    phase_attn = np.zeros((m, m), dtype=np.float64)
+    for a in range(m):
+        a_s, a_e = phase_spans[a]
+        for b in range(m):
+            b_s, b_e = phase_spans[b]
+            if a_e > a_s and b_e > b_s:
+                phase_attn[a][b] = attn_denoised[a_s:a_e, b_s:b_e].mean()
+
+    return phase_attn
+
+
+def make_pca_confluence_fn(n_components: int = 1):
+    """Factory: return a confluence_fn that uses PCA head-aggregation.
+
+    The returned function has the same signature as build_phase_attention_matrix
+    and can be passed directly as confluence_fn.
+
+    Args:
+        n_components: Number of PCA components (default 1 = first PC only).
+
+    Usage:
+        # At construction
+        reward = AttentionReward(config, confluence_fn=make_pca_confluence_fn(3))
+
+        # Or swap after construction
+        reward.confluence_fn = make_pca_confluence_fn(n_components=5)
+
+        # Via config key (auto-selected in AttentionReward.__init__)
+        # config.algorithm.attention_pca_components = 3
+    """
+    def _pca_confluence(attn_weights, boundaries, resp_end):
+        return build_phase_attention_matrix_pca(
+            attn_weights, boundaries, resp_end, n_components=n_components,
+        )
+    _pca_confluence.__name__ = f"pca_confluence(n={n_components})"
+    return _pca_confluence
 
 
 def build_influence_matrix_A(
