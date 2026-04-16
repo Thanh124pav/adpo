@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 
 from .base import BaseReward
 from adpo.reward_functions import compute_score
+from adpo.pure_entropy_algorithm import extract_attention_at_layer_hf
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,7 @@ class AttentionReward(BaseReward):
         algo = config.algorithm
         self.attention_layer = getattr(algo, 'attention_layer', 21)
         self.attention_norm_mode = getattr(algo, 'attention_norm_mode', None)
+        self.use_direct_attention = getattr(algo, 'attention_use_direct', False)
 
         self.correct_reward = getattr(algo, 'correct_reward', 1.0)
         self.incorrect_reward = getattr(algo, 'incorrect_reward', -1)
@@ -79,6 +81,9 @@ class AttentionReward(BaseReward):
                 )
             else:
                 self.confluence_fn = build_phase_attention_matrix
+
+        if self.use_direct_attention:
+            logger.info("[AttentionReward] Direct attention path enabled (requires eager attention)")
 
         self.influence_fn = influence_fn if influence_fn is not None \
             else build_influence_matrix_A
@@ -130,7 +135,6 @@ class AttentionReward(BaseReward):
                 phase_rewards_batch.append(np.array([last_phase_rewards[b]]))
                 continue
 
-            # --- Partial forward for this sample only ---
             n_layers = hf_model.config.num_hidden_layers
             if self.attention_layer < 0: 
                 self.attention_layer = int(n_layers * 3/4)
@@ -138,27 +142,69 @@ class AttentionReward(BaseReward):
             sub_ids = token_ids[b:b+1].to(hf_device) # [1, seq_len]
             pos_ids = torch.arange(seq_len, device=hf_device).unsqueeze(0) # [1, seq_len]
 
-            with torch.no_grad():
-                layer_L = self.attention_layer
-                hs_full = _partial_forward(hf_model, sub_ids, pos_ids, layer_L)
-                # hs_full: (1, seq_len, hidden_dim)
-
-                # Slice to response tokens only
-                hs_resp = hs_full[:, resp_start:resp_end, :]
-                # (1, resp_len, hidden_dim) — still on GPU
-
-                del hs_full, sub_ids
-
             # Shift boundaries to response-relative coords
             boundaries_relative = [bd - resp_start for bd in boundaries_batch[b]]
             resp_end_relative = resp_end - resp_start
 
+            layer_L = self.attention_layer
+
+            # ----------------------------------------------------------------
+            # DIRECT ATTENTION PATH: use outputs.attentions from eager attention.
+            # This skips hidden-state extraction and reconstruction entirely.
+            # ----------------------------------------------------------------
+            if self.use_direct_attention:
+                with torch.no_grad():
+                    try:
+                        attn_full = extract_attention_at_layer_hf(
+                            hf_model,
+                            sub_ids,
+                            layer_L,
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"[PureEntropy] Direct attention extraction failed for b={b}: {e}"
+                        )
+                        print(
+                            f"[PureEntropy] ERROR: Direct attention extraction failed for b={b}: {e}",
+                            flush=True,
+                        )
+                        phase_rewards_batch.append(np.full(n_phases, last_phase_rewards[b]))
+                        del sub_ids
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        continue
+
+                attn_weights = attn_full[0, :, resp_start:resp_end, resp_start:resp_end].contiguous()
+                del attn_full, sub_ids
+
+                phase_attn = self.confluence_fn(
+                    attn_weights=attn_weights,
+                    boundaries=boundaries_relative,
+                    resp_end=resp_end_relative,
+                )
+
+                del attn_weights
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                if b == 0:
+                    print(
+                        f"[PureEntropy PhaseAttn] resp=0: phase_attn ({phase_attn.shape}), "
+                        f"direct_attention=True, resp_len={resp_len} (sliced from seq_len={seq_len}):\n"
+                        f"{np.array2string(phase_attn, precision=6, suppress_small=True)}",
+                        flush=True,
+                    )
+
             # ----------------------------------------------------------------
             # FAST PATH: hidden_confluence_fn set → move hs to CPU immediately,
             # skip reconstruct_attention_at_layer entirely.
-            # GPU freed before any heavy computation — eliminates Q/K OOM risk.
             # ----------------------------------------------------------------
-            if self.hidden_confluence_fn is not None:
+            elif self.hidden_confluence_fn is not None:
+                with torch.no_grad():
+                    hs_full = _partial_forward(hf_model, sub_ids, pos_ids, layer_L)
+                    hs_resp = hs_full[:, resp_start:resp_end, :]
+                    del hs_full, sub_ids
+
                 hs_cpu = hs_resp[0].float().cpu()  # (resp_len, hidden_dim)
                 del hs_resp
                 if torch.cuda.is_available():
@@ -194,6 +240,15 @@ class AttentionReward(BaseReward):
             # ----------------------------------------------------------------
             else:
                 with torch.no_grad():
+                    hs_full = _partial_forward(hf_model, sub_ids, pos_ids, layer_L)
+                    # hs_full: (1, seq_len, hidden_dim)
+
+                    # Slice to response tokens only
+                    hs_resp = hs_full[:, resp_start:resp_end, :]
+                    # (1, resp_len, hidden_dim) — still on GPU
+
+                    del hs_full, sub_ids
+
                     pos_resp = torch.arange(
                         resp_start, resp_end, device=hf_device,
                     ).unsqueeze(0)
@@ -225,7 +280,6 @@ class AttentionReward(BaseReward):
 
                     del hs_resp, pos_resp
 
-                # Confluence matrix: pluggable via self.confluence_fn
                 phase_attn = self.confluence_fn(
                     attn_weights=attn_weights,
                     boundaries=boundaries_relative,

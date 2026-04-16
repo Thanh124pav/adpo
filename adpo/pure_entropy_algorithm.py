@@ -304,8 +304,50 @@ class _EarlyStopForward(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Attention Reconstruction (from hidden states + model weights)
+# Attention Extraction / Reconstruction
 # ---------------------------------------------------------------------------
+
+def extract_attention_at_layer_hf(
+    model,
+    input_ids: torch.Tensor,
+    layer_idx: int,
+    attention_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Extract raw attention weights from a HuggingFace forward pass.
+
+    This requires the model to be loaded with attn_implementation="eager"
+    and output_attentions support enabled by the architecture.
+
+    Args:
+        model: HuggingFace AutoModelForCausalLM.
+        input_ids: (batch, seq_len) token IDs.
+        layer_idx: Layer index to extract.
+        attention_mask: Optional attention mask for padded inputs.
+
+    Returns:
+        attn_weights: (batch, num_heads, seq_len, seq_len) attention tensor.
+    """
+    device = next(model.parameters()).device
+    with torch.no_grad():
+        outputs = model(
+            input_ids=input_ids.to(device),
+            attention_mask=attention_mask.to(device) if attention_mask is not None else None,
+            output_attentions=True,
+            output_hidden_states=False,
+            use_cache=False,
+        )
+
+    if not hasattr(outputs, "attentions") or outputs.attentions is None:
+        raise RuntimeError(
+            "Model did not return attentions. Load it with attn_implementation='eager' "
+            "and ensure the architecture supports output_attentions=True."
+        )
+
+    attn_weights = outputs.attentions[layer_idx]
+    if attn_weights is None:
+        raise RuntimeError(f"No attention tensor returned for layer {layer_idx}")
+
+    return attn_weights
 
 def reconstruct_attention_at_layer(
     model,
@@ -336,13 +378,12 @@ def reconstruct_attention_at_layer(
     """
     import sys
     import os
-    # Add reasoning_analysis to path for importing reconstruct module
+    # Add project root to path so the sibling reasoning_analysis package resolves.
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    ra_path = os.path.join(project_root, "reasoning_analysis")
-    if ra_path not in sys.path:
-        sys.path.insert(0, ra_path)
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
 
-    from attention_analysis.reconstruct import reconstruct_attention
+    from reasoning_analysis.attention_analysis.reconstruct import reconstruct_attention
 
     with torch.no_grad():
         attn = reconstruct_attention(

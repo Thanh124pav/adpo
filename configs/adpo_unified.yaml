@@ -61,6 +61,7 @@ algorithm:
   # ==========================================================================
   attention_layer:      -1      # layer index for hidden-state extraction
                                 # -1 = auto: floor(n_layers * 3/4)
+  attention_use_direct: false   # false = reconstruct from hidden states; true = use outputs.attentions (requires eager)
   attention_norm_mode:  row     # influence matrix A normalization:
                                 #   none | row (default) | col | matrix
   correct_reward:       1.0     # last-phase reward when answer is correct
