@@ -630,15 +630,7 @@ def reconstruct_attention_at_layer(
         attn_weights: (num_heads, seq_len, seq_len).
                       On CPU when matmul_on_cpu=True.
     """
-    import sys
-    import os
-    # Add reasoning_analysis to path for importing reconstruct module
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    ra_path = os.path.join(project_root, "reasoning_analysis")
-    if ra_path not in sys.path:
-        sys.path.insert(0, ra_path)
-
-    from attention_analysis.reconstruct import reconstruct_attention
+    from reasoning_analysis.attention_analysis.reconstruct import reconstruct_attention
 
     with torch.no_grad():
         attn = reconstruct_attention(
@@ -1011,8 +1003,16 @@ def solve_phase_rewards(
     A: np.ndarray,
     r_last: float,
     n_phases: int,
+    fixed_first_reward: Optional[float] = None,
 ) -> np.ndarray:
-    """Solve for phase rewards using the system A * r[0:m-2] = r[1:m-1].
+    """Solve for phase rewards.
+
+    Modes:
+        1. Default: solve A * r[0:m-2] = r[1:m-1] with the last reward fixed
+           to r_last.
+        2. Variant: if fixed_first_reward is provided, solve the shifted system
+              with r[0] fixed to that value and solve for the remaining rewards
+              using an explicit bias vector b.
 
     Given:
         A: (m-1, m-1) lower triangular matrix (diagonal included).
@@ -1037,11 +1037,59 @@ def solve_phase_rewards(
     """
     m = n_phases
     if m <= 1:
+        if fixed_first_reward is not None:
+            return np.array([fixed_first_reward]), 0.0
         return np.array([r_last]), 0.0
 
     n = m - 1  # size of the system
     if A.shape[0] == 0:
+        if fixed_first_reward is not None:
+            return np.array([fixed_first_reward]), 0.0
         return np.array([r_last]), 0.0
+
+    if fixed_first_reward is not None:
+        r0 = fixed_first_reward
+
+        M = np.zeros((n, n))
+        M[0, 0] = 1.0
+        for i in range(1, n):
+            M[i, :i] = -A[i, 1:i + 1]
+            M[i, i] = 1.0
+
+        b = -A[:, 0] * r0
+        b[0] = A[0, 0] * r0
+
+        try:
+            det_B = np.linalg.det(M)
+
+            if abs(det_B) < 1e-12:
+                logger.warning(
+                    f"[PureEntropy Solve] B near-singular (det={det_B:.6e}), using lstsq"
+                )
+                y, residuals, rank, sv = np.linalg.lstsq(M, b, rcond=None)
+            else:
+                y = np.linalg.solve(M, b)
+        except np.linalg.LinAlgError as e:
+            logger.error(f"[PureEntropy Solve] LinAlgError: {e}, falling back to uniform")
+            y = np.full(n, r0)
+
+        rewards = np.zeros(m)
+        rewards[0] = r0
+        rewards[1:] = y
+
+        reward_abs_max = max(abs(r0) * 10, 5.0)
+        rewards_clamped = np.clip(rewards, -reward_abs_max, reward_abs_max)
+        if not np.allclose(rewards, rewards_clamped):
+            logger.warning(
+                f"[PureEntropy Solve] Clamped: {rewards} -> {rewards_clamped}"
+            )
+            rewards = rewards_clamped
+
+        residual = 0.0
+        if n > 0:
+            residual = np.abs(M @ rewards[1:] - b).max()
+
+        return rewards, residual
 
     # Build B = A (copy), then subtract 1 from superdiagonal for rows 0..n-2
     B = A.copy()

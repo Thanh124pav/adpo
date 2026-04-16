@@ -555,7 +555,7 @@ def patch_verl_grpo_with_pure_entropy(
                 print(
                     f"[PureEntropy Solve] resp=0: {n_phases} phases, "
                     f"det(B)={det_B:.6e}, residual={residual:.6e}, "
-                    f"rewards={[f'{v:.4f}' for v in rewards[0].tolist()[:n]]}",
+                    f"rewards={[f'{v:.4f}' for v in rewards[:n]]}",
                     flush=True,
                 )
 
