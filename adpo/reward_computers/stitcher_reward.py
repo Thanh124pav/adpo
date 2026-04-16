@@ -1,7 +1,9 @@
+import os
 import torch
 import numpy as np
 import logging
-from typing import Dict, List, Optional, Tuple
+from datetime import datetime
+from typing import Callable, Dict, List, Optional, Tuple
 
 from .base import BaseReward
 from .trajectory_stitching import TrajectoryStitcher, SpliceResult
@@ -16,22 +18,43 @@ class StitchReward(BaseReward):
     For groups where every response is wrong:
       1. Retrieve or generate a golden path (step-by-step solution)
       2. Split golden path into phases using the same PhaseSplitter as responses
-      3. Find the optimal splice point (j, i) using HF model log-probs
+      3. Find the optimal splice point (j, i) — method is pluggable
       4. Roll out from stitched prefix; assign concentrated reward at splice
 
     For groups with ≥1 correct response: uniform outcome reward per phase.
 
+    Rollout modes (config.algorithm.stitch_rollout_mode):
+        "full"  (default) — iteratively extend golden phases until correct:
+                            pi(• | g[i], a[:j]) → extend to g[i:i+2], etc.
+        "lite"  — single rollout with all golden phases from i:
+                            pi(• | g[i:], a[:j])  (faster, one shot)
+
+    Splice scorer (config.algorithm.stitch_splice_scorer or splice_scorer_fn arg):
+        None / "hf"       — HF model log-prob scoring (default when hf_model given)
+        "endpoint"        — force endpoint-based scoring
+        callable          — custom fn(response_phase_texts, golden_phase_texts,
+                            max_len) → List[Tuple[j, i, score]]
+
+    Demo logging (config.algorithm.stitch_demo_log_path):
+        When a group is all-wrong, a detailed record is appended to this
+        text file for offline inspection.  Set to "" to disable.
+
     Constructor args:
-        stitcher:    TrajectoryStitcher — handles rollout via endpoint
-        splitter:    PhaseSplitter — splits golden path consistently
-        config:      OmegaConf / SimpleNamespace with config.algorithm.*
-        hf_model:    Loaded HF model for splice-point scoring (required for
-                     find_splice_points_hf). Pass None to fall back to endpoint.
-        golden_gen:  GoldenPathGenerator or None.
-                     None → dataset already has golden solutions; must be
-                            supplied via compute(golden_solutions=[...]).
-                     Not-None → answer-only dataset; generator will be called
-                                for all-wrong groups.
+        stitcher:         TrajectoryStitcher — handles rollout via endpoint
+        splitter:         PhaseSplitter — splits golden path consistently
+        config:           OmegaConf / SimpleNamespace with config.algorithm.*
+        hf_model:         Loaded HF model for HF-based splice scoring.
+                          Pass None to fall back to endpoint.
+        tokenizer:        Tokenizer for hf_model.
+        golden_gen:       GoldenPathGenerator or None.
+                          None → dataset already has golden solutions; must be
+                                 supplied via compute(golden_solutions=[...]).
+                          Not-None → answer-only dataset; generator called for
+                                     all-wrong groups.
+        splice_scorer_fn: Optional callable to override splice scorer entirely.
+                          Signature: fn(response_phase_texts, golden_phase_texts,
+                          max_len) → List[Tuple[j, i, score]].
+                          Takes priority over config.algorithm.stitch_splice_scorer.
     """
 
     def __init__(
@@ -42,6 +65,7 @@ class StitchReward(BaseReward):
         hf_model=None,
         tokenizer=None,
         golden_gen=None,
+        splice_scorer_fn: Optional[Callable] = None,
     ):
         super().__init__()
         self.stitcher = stitcher
@@ -56,6 +80,26 @@ class StitchReward(BaseReward):
         self.splice_boost = getattr(algo, "stitch_splice_boost", 2.0)
         self.pre_splice_adv = getattr(algo, "stitch_pre_splice_adv", 0.0)
         self.post_splice_decay = getattr(algo, "stitch_post_splice_decay", 0.9)
+
+        # Rollout mode: "full" (iterative golden extension) | "lite" (one-shot)
+        self.rollout_mode = getattr(algo, "stitch_rollout_mode", "full")
+
+        # Splice scorer resolution (priority: constructor arg > config string)
+        if splice_scorer_fn is not None:
+            self._splice_scorer = splice_scorer_fn
+        else:
+            cfg_scorer = getattr(algo, "stitch_splice_scorer", None)
+            if cfg_scorer == "endpoint":
+                # Force endpoint even when hf_model is available
+                self._splice_scorer = self.stitcher.find_splice_points
+            elif callable(cfg_scorer):
+                self._splice_scorer = cfg_scorer
+            else:
+                # None / "hf" → default dispatch in stitch_group()
+                self._splice_scorer = None
+
+        # Demo file logging path; empty string = disabled
+        self.demo_log_path = getattr(algo, "stitch_demo_log_path", "stitch_demo.txt")
 
     # ------------------------------------------------------------------
     # Public interface
@@ -115,6 +159,14 @@ class StitchReward(BaseReward):
             if all(outcome_rewards[b] < 1.0 for b in group_idx):
                 all_wrong_uids[uid] = group_idx
 
+        n_all_wrong_groups = len(all_wrong_uids)
+        print(
+            f"[StitchReward] {n_all_wrong_groups} all-wrong groups out of "
+            f"{len(torch.unique(index))} total | rollout_mode={self.rollout_mode} | "
+            f"splice_scorer={'custom' if self._splice_scorer is not None else 'default'}",
+            flush=True,
+        )
+
         if not all_wrong_uids:
             return phase_rewards, phase_mask_t, {}
 
@@ -130,6 +182,7 @@ class StitchReward(BaseReward):
             )
             if golden_text is None:
                 logger.warning(f"[StitchReward] No golden text for group uid={uid}, skipping")
+                print(f"[StitchReward] WARN: No golden text for uid={uid}, skipping", flush=True)
                 continue
 
             # Step 2: Split golden text into phases using the same splitter
@@ -137,6 +190,13 @@ class StitchReward(BaseReward):
             if not golden_phase_texts:
                 logger.warning(f"[StitchReward] Empty golden phases for uid={uid}, skipping")
                 continue
+
+            print(
+                f"[StitchReward] uid={uid} | {len(group_idx)} responses | "
+                f"{len(golden_phase_texts)} golden phases | "
+                f"q='{questions[b0][:60].replace(chr(10), ' ')}...'",
+                flush=True,
+            )
 
             # Step 3: Run stitching for all responses in this group
             group_phase_texts = [phase_texts_batch[b] for b in group_idx]
@@ -154,9 +214,18 @@ class StitchReward(BaseReward):
                 response_boundaries=group_boundaries,
                 hf_model=self.hf_model,
                 tokenizer=self.tokenizer,
+                rollout_mode=self.rollout_mode,
+                splice_scorer=self._splice_scorer,
             )
 
-            # Step 4: Map SpliceResults back to batch indices
+            # Step 4: Map SpliceResults back to batch indices and screen log
+            n_verified = sum(1 for r in results if r.verified)
+            print(
+                f"[StitchReward] uid={uid}: {n_verified}/{len(results)} verified | "
+                f"splice_points={[(r.splice_j, r.splice_i) for r in results]}",
+                flush=True,
+            )
+
             for local_r, result in enumerate(results):
                 b = group_idx[local_r]
                 result.response_idx = b
@@ -164,10 +233,8 @@ class StitchReward(BaseReward):
 
                 if result.verified and result.splice_token_pos >= 0:
                     # Overwrite phase rewards: concentrate reward at splice phase
-                    n_phases = len(boundaries_batch[b])
-                    bounds = boundaries_batch[b]
                     splice_j = result.splice_j
-
+                    n_phases = len(boundaries_batch[b])
                     for k in range(n_phases):
                         if k < splice_j:
                             phase_rewards[b, k] = self.pre_splice_adv
@@ -178,11 +245,101 @@ class StitchReward(BaseReward):
                             phase_rewards[b, k] = result.reward * decay
                 # else: keep the uniform incorrect_total / n_phases reward
 
+            # Step 5: Write detailed demo log to file (all-wrong → log everything)
+            if self.demo_log_path:
+                self._write_demo_log(
+                    uid=uid,
+                    group_idx=group_idx,
+                    questions=questions,
+                    phase_texts_batch=phase_texts_batch,
+                    golden_answers=golden_answers,
+                    outcome_rewards=outcome_rewards,
+                    boundaries_batch=boundaries_batch,
+                    golden_text=golden_text,
+                    golden_phase_texts=golden_phase_texts,
+                    splice_results_group=results,
+                    phase_rewards=phase_rewards,
+                )
+
         return phase_rewards, phase_mask_t, {"splice_results": splice_results}
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _write_demo_log(
+        self,
+        uid: int,
+        group_idx: List[int],
+        questions: List[str],
+        phase_texts_batch: List[List[str]],
+        golden_answers: List[str],
+        outcome_rewards: List[float],
+        boundaries_batch: List[List[int]],
+        golden_text: str,
+        golden_phase_texts: List[str],
+        splice_results_group: List[SpliceResult],
+        phase_rewards: torch.Tensor,
+    ) -> None:
+        """Append a detailed record for one all-wrong group to the demo log file.
+
+        Logged information:
+          - Timestamp and group UID
+          - Golden answer and golden phases
+          - For each wrong response:
+              · Question (first 200 chars)
+              · All phase texts with their computed rewards
+              · Splice point (j, i), verification status, reward, stitched text
+        """
+        try:
+            lines = []
+            sep = "=" * 80
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            lines.append(f"\n{sep}")
+            lines.append(f"[StitchReward Demo Log]  {ts}  |  uid={uid}  |  "
+                         f"n_responses={len(group_idx)}  |  "
+                         f"rollout_mode={self.rollout_mode}")
+            lines.append(sep)
+
+            # Golden reference
+            lines.append(f"\n--- Golden Answer ---")
+            lines.append(golden_answers[group_idx[0]])
+            lines.append(f"\n--- Golden Text (first 400 chars) ---")
+            lines.append(golden_text[:400])
+            lines.append(f"\n--- Golden Phases ({len(golden_phase_texts)}) ---")
+            for gi, gp in enumerate(golden_phase_texts):
+                lines.append(f"  g[{gi}]: {gp[:120]!r}")
+
+            # Each wrong response
+            for local_r, (b, result) in enumerate(zip(group_idx, splice_results_group)):
+                lines.append(f"\n{'─' * 60}")
+                lines.append(f"  Response {local_r} (batch_idx={b}) | "
+                             f"outcome={outcome_rewards[b]:.2f}")
+                lines.append(f"  Question (200c): {questions[b][:200]!r}")
+
+                phases = phase_texts_batch[b]
+                n = len(phases)
+                lines.append(f"  Phases ({n}):")
+                for k, ph in enumerate(phases):
+                    r_val = phase_rewards[b, k].item() if k < phase_rewards.shape[1] else 0.0
+                    lines.append(f"    a[{k}] r={r_val:+.4f}: {ph[:100]!r}")
+
+                lines.append(f"  Splice: j={result.splice_j}, i={result.splice_i} | "
+                             f"verified={result.verified} | reward={result.reward:.4f} | "
+                             f"token_pos={result.splice_token_pos}")
+                if result.verified:
+                    lines.append(f"  Stitched text (first 300c): "
+                                 f"{result.stitched_text[:300]!r}")
+                else:
+                    lines.append(f"  Stitching FAILED")
+
+            lines.append("")  # trailing blank line
+
+            with open(self.demo_log_path, "a", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+
+        except Exception as e:
+            logger.warning(f"[StitchReward] Failed to write demo log: {e}")
 
     def _get_golden_text(
         self,

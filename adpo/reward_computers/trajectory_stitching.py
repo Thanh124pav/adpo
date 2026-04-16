@@ -487,6 +487,64 @@ class TrajectoryStitcher:
             verified=False,
         )
 
+    def iterative_rollout_lite(
+        self,
+        response_phase_texts: List[str],
+        golden_phase_texts: List[str],
+        splice_j: int,
+        splice_i: int,
+        question: str,
+        answer: str,
+        data_source: str,
+    ) -> SpliceResult:
+        """Lite rollout: concatenate ALL golden phases from i, rollout once.
+
+        pi(• | g[i:], a[:j])
+        Single generation — no iterative extension of golden phases.
+        Faster than the full mode; suitable when the golden suffix is short
+        enough to fit in the context window.
+
+        Flow:
+            prefix = response[:j+1]
+            golden_suffix = golden[i] + golden[i+1] + ... + golden[-1]
+            rollout → check answer (one shot)
+        """
+        prefix_base = " ".join(response_phase_texts[: splice_j + 1])
+        golden_suffix = " ".join(golden_phase_texts[splice_i:])
+        stitched_prefix = f"{prefix_base} {golden_suffix}"
+        remaining_tokens = max(
+            256,
+            (self.max_response_length - len(stitched_prefix)) // 4,
+        )
+
+        async def _rollout():
+            import aiohttp
+            sem = asyncio.Semaphore(self.max_concurrent)
+            async with aiohttp.ClientSession() as session:
+                return await self._generate_batch(
+                    session, sem, [stitched_prefix],
+                    max_tokens=remaining_tokens, temperature=0.7,
+                )
+
+        continuations = self._run_async(_rollout())
+        full_text = stitched_prefix + continuations[0]
+        score = compute_score(
+            data_source=data_source,
+            solution_str=full_text,
+            ground_truth=answer,
+        )
+        verified = score >= 1.0
+        return SpliceResult(
+            response_idx=-1,
+            splice_j=splice_j,
+            splice_i=splice_i,
+            splice_token_pos=-1,
+            stitched_text=full_text,
+            reward=1.0 if verified else 0.0,
+            golden_phases_used=len(golden_phase_texts) - splice_i,
+            verified=verified,
+        )
+
     # ------------------------------------------------------------------
     # Full stitching pipeline
     # ------------------------------------------------------------------
@@ -501,6 +559,8 @@ class TrajectoryStitcher:
         response_boundaries: List[List[int]],
         hf_model=None,
         tokenizer=None,
+        rollout_mode: str = "full",
+        splice_scorer=None,
     ) -> List[SpliceResult]:
         """Run trajectory stitching for one all-wrong group.
 
@@ -511,9 +571,18 @@ class TrajectoryStitcher:
             golden_answers: [n] ground truth answers
             data_sources: [n] dataset names
             response_boundaries: [n][K+1] token boundaries per response
-            hf_model: HF model for splice scoring (preferred); falls back to
-                      endpoint-based scoring if None.
+            hf_model: HF model for default splice scoring; falls back to
+                      endpoint when None (ignored if splice_scorer is set).
             tokenizer: tokenizer for hf_model
+            rollout_mode: "full" — iterative extension of golden phases
+                                   pi(• | g[i], a[:j]) until correct (default)
+                          "lite" — single rollout with all golden phases
+                                   pi(• | g[i:], a[:j])
+            splice_scorer: Optional callable with signature:
+                    fn(response_phase_texts, golden_phase_texts, max_len)
+                        → List[Tuple[j, i, score]]
+                If None, dispatches to find_splice_points_hf (when hf_model
+                available) or find_splice_points (endpoint fallback).
 
         Returns:
             [n] SpliceResults, one per response in the group.
@@ -522,21 +591,29 @@ class TrajectoryStitcher:
 
         logger.info(
             f"[Stitch] Golden path: {len(golden_phase_texts)} phases, "
-            f"lengths={[len(p) for p in golden_phase_texts]}"
+            f"lengths={[len(p) for p in golden_phase_texts]}, "
+            f"rollout_mode={rollout_mode}"
         )
 
-        # Step 2: Find splice points — use HF model when available
-        if hf_model is not None and tokenizer is not None:
+        # --- Splice point finding — pluggable ---
+        if callable(splice_scorer):
+            splice_points = splice_scorer(
+                response_phase_texts, golden_phase_texts, self.max_response_length,
+            )
+            logger.info(f"[Stitch] splice_scorer=custom ({splice_scorer.__name__})")
+        elif hf_model is not None and tokenizer is not None:
             splice_points = self.find_splice_points_hf(
                 response_phase_texts, golden_phase_texts,
                 self.max_response_length, hf_model, tokenizer,
             )
+            logger.info("[Stitch] splice_scorer=hf_logprob")
         else:
             splice_points = self.find_splice_points(
                 response_phase_texts, golden_phase_texts, self.max_response_length,
             )
+            logger.info("[Stitch] splice_scorer=endpoint_logprob")
 
-        # Step 3: Iterative rollout per response
+        # --- Rollout per response ---
         results = []
         for r in range(n):
             j, i, log_prob = splice_points[r]
@@ -549,15 +626,26 @@ class TrajectoryStitcher:
                 ))
                 continue
 
-            result = self.iterative_rollout(
-                response_phase_texts=response_phase_texts[r],
-                golden_phase_texts=golden_phase_texts,
-                splice_j=j,
-                splice_i=i,
-                question=questions[r],
-                answer=golden_answers[r],
-                data_source=data_sources[r],
-            )
+            if rollout_mode == "lite":
+                result = self.iterative_rollout_lite(
+                    response_phase_texts=response_phase_texts[r],
+                    golden_phase_texts=golden_phase_texts,
+                    splice_j=j,
+                    splice_i=i,
+                    question=questions[r],
+                    answer=golden_answers[r],
+                    data_source=data_sources[r],
+                )
+            else:  # "full"
+                result = self.iterative_rollout(
+                    response_phase_texts=response_phase_texts[r],
+                    golden_phase_texts=golden_phase_texts,
+                    splice_j=j,
+                    splice_i=i,
+                    question=questions[r],
+                    answer=golden_answers[r],
+                    data_source=data_sources[r],
+                )
             result.response_idx = r
 
             # Map splice_j to token position

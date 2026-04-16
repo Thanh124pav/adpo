@@ -11,7 +11,25 @@ from adpo.reward_functions import compute_score
 logger = logging.getLogger(__name__)
 
 class AttentionReward(BaseReward):
-    def __init__(self, config):
+    """Reward computer based on attention-flow between phases.
+
+    Extensibility:
+        confluence_fn(attn_weights, boundaries, resp_end) → np.ndarray (m, m)
+            Converts raw (num_heads, L, L) attention to an inter-phase confluence
+            matrix. Default: build_phase_attention_matrix (head-averaged mean).
+            Swap to implement max-head, sum, or custom aggregation.
+
+        influence_fn(phase_attn, norm_mode) → np.ndarray (m-1, m-1)
+            Converts the confluence matrix to a lower-triangular influence matrix A
+            used to solve for phase rewards. Default: build_influence_matrix_A.
+            Swap to implement graph Laplacian, PageRank-style, or any other
+            influence measure.
+
+    Both functions can be passed at construction time or replaced on the
+    instance after construction (self.confluence_fn = my_fn).
+    """
+
+    def __init__(self, config, confluence_fn=None, influence_fn=None):
         super().__init__()
         algo = config.algorithm
         self.attention_layer = getattr(algo, 'attention_layer', 21)
@@ -20,6 +38,12 @@ class AttentionReward(BaseReward):
         self.correct_reward = getattr(algo, 'correct_reward', 1.0)
         self.incorrect_reward = getattr(algo, 'incorrect_reward', -1)
         self.partial_reward = getattr(algo, 'partial_reward', 0.1)
+
+        # Pluggable matrix-building functions
+        self.confluence_fn = confluence_fn if confluence_fn is not None \
+            else build_phase_attention_matrix
+        self.influence_fn = influence_fn if influence_fn is not None \
+            else build_influence_matrix_A
 
     def compute(self, boundaries_batch, response_mask, index, token_ids, hf_model, golden_answers, full_responses, data_sources,  **context):
         t_step5 = time.time()
@@ -123,7 +147,8 @@ class AttentionReward(BaseReward):
             resp_end_relative = resp_end - resp_start
 
             # attn_weights is already on CPU (matmul_on_cpu=True)
-            phase_attn = build_phase_attention_matrix(
+            # --- Confluence matrix: pluggable via self.confluence_fn ---
+            phase_attn = self.confluence_fn(
                 attn_weights=attn_weights,
                 boundaries=boundaries_relative,
                 resp_end=resp_end_relative,
@@ -136,12 +161,13 @@ class AttentionReward(BaseReward):
             if b == 0:
                 print(
                     f"[PureEntropy PhaseAttn] resp=0: phase_attn ({phase_attn.shape}), "
+                    f"confluence_fn={self.confluence_fn.__name__}, "
                     f"resp_len={resp_len} (sliced from seq_len={seq_len}):\n"
                     f"{np.array2string(phase_attn, precision=6, suppress_small=True)}",
                     flush=True,
                 )
-            # --- Build influence matrix A ---
-            A = build_influence_matrix_A(phase_attn, norm_mode=self.attention_norm_mode)
+            # --- Influence matrix A: pluggable via self.influence_fn ---
+            A = self.influence_fn(phase_attn, norm_mode=self.attention_norm_mode)
             if b == 0:
                 print(
                     f"[PureEntropy InfluenceA] resp=0: A ({A.shape}):\n"
