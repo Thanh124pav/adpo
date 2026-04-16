@@ -152,6 +152,8 @@ def patch_verl_grpo_with_pure_entropy(
     correct_reward: float = 1.0,
     incorrect_reward: float = 0.0,
     partial_reward: float = 0.1,
+    # Solve mode
+    first_phase_reward: float = 0.5,  # form b default; set to None for form a
 ):
     """Monkey-patch verl's compute_advantage with pure-entropy algorithm.
 
@@ -541,6 +543,7 @@ def patch_verl_grpo_with_pure_entropy(
                 A=A,
                 r_last=last_phase_rewards[b],
                 n_phases=n_phases,
+                fixed_first_reward=first_phase_reward,  # form b default
             )
             phase_rewards_batch.append(rewards)
 
@@ -710,6 +713,8 @@ class PureEntropyTaskRunner:
             correct_reward=algo.get("correct_reward", 1.0),
             incorrect_reward=algo.get("incorrect_reward", 0.0),
             partial_reward=algo.get("partial_reward", 0.1),
+            # Solve mode: form b (default) vs form a (legacy)
+            first_phase_reward=algo.get("attention_fixed_first_reward", 0.5),
         )
 
         # Delegate to standard TaskRunner

@@ -55,6 +55,11 @@ class AttentionReward(BaseReward):
         self.incorrect_reward = getattr(algo, 'incorrect_reward', -1)
         self.partial_reward = getattr(algo, 'partial_reward', 0.1)
 
+        # Solve mode: form b (default) vs form a (legacy)
+        #   form b: r[0] = first_phase_reward (fixed), r_last as additive bias at last row
+        #   form a: r[last] = r_last (fixed exactly), set attention_fixed_first_reward=null
+        self.first_phase_reward = getattr(algo, 'attention_fixed_first_reward', 0.5)
+
         # --- hidden_confluence_fn (fast path, skips attention reconstruction) ---
         # Priority: constructor arg > config key > None (use attention path)
         if hidden_confluence_fn is not None:
@@ -312,6 +317,7 @@ class AttentionReward(BaseReward):
                 A=A,
                 r_last=last_phase_rewards[b],
                 n_phases=n_phases,
+                fixed_first_reward=self.first_phase_reward,  # form b default
             )
             phase_rewards_batch.append(rewards)
 
@@ -1050,16 +1056,20 @@ def solve_phase_rewards(
     if fixed_first_reward is not None:
         r0 = fixed_first_reward
 
-        # M @ y = b: move r_0 terms to RHS.
-        # row 0:         r_1 = A[0,0] * r_0
-        # row i (i>=1): r_{i+1} - sum_{j=1..i} A[i,j] * r_j = A[i,0] * r_0
+        # Form b: fix r[0]=r0, inject r_last as additive bias at the last row.
+        # System M @ y = rhs, where y = [r_1, ..., r_{m-1}]:
+        #   row 0:    r_1 = A[0,0]*r_0
+        #   row i>0:  r_{i+1} - sum_{j=1..i} A[i,j]*r_j = A[i,0]*r_0
+        #   last row: rhs[-1] += r_last  (outcome injected as additive bias)
+        # → r[m-1] = A[m-2]*r[0:m-1] + r_last  (biased, not fixed)
         M = np.zeros((n, n))
         M[0, 0] = 1.0
         for i in range(1, n):
             M[i, :i] = -A[i, 1:i + 1]
             M[i, i] = 1.0
 
-        b = A[:, 0] * r0   # positive: A[i,0]*r_0 on the RHS for all rows
+        b = A[:, 0] * r0   # contribution from fixed r[0]
+        b[-1] += r_last    # inject outcome reward as bias at last phase
 
         try:
             det_B = np.linalg.det(M)
@@ -1079,7 +1089,7 @@ def solve_phase_rewards(
         rewards[0] = r0
         rewards[1:] = y
 
-        reward_abs_max = max(abs(r0) * 10, 5.0)
+        reward_abs_max = max(abs(r0) * 10, abs(r_last) * 10, 5.0)
         rewards_clamped = np.clip(rewards, -reward_abs_max, reward_abs_max)
         if not np.allclose(rewards, rewards_clamped):
             logger.warning(

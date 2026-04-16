@@ -13,7 +13,7 @@ class PhaseAdvantage:
 
     def compute(self, phase_rewards, phase_mask, response_mask,
                boundaries_batch, index,
-               alpha = None, decay_gamma = None, eps = None) -> torch.Tensor:
+               alpha=None, decay_gamma=None, eps=None, **kwargs) -> torch.Tensor:
         if alpha is None:
             alpha = self.alpha
         if decay_gamma is None:

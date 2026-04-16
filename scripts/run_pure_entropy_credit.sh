@@ -60,10 +60,12 @@ INCORRECT_TOTAL=${INCORRECT_TOTAL:--1.0}
 PARTIAL_TOTAL=${PARTIAL_TOTAL:-0.1}
 
 # ---------------------------------------------------------------------------
-# Advantage (PhaseAdvantage)
+# Advantage
 # ---------------------------------------------------------------------------
 ALPHA=${ALPHA:-0.5}           # 0 = pure global (GRPO), 1 = pure local
 DECAY_GAMMA=${DECAY_GAMMA:-0.95}
+PIPELINE_ADVANTAGE=${PIPELINE_ADVANTAGE:-"phase"}   # phase | hybrid
+HYBRID_CORRECT_THRESHOLD=${HYBRID_CORRECT_THRESHOLD:-1.0}
 
 # ---------------------------------------------------------------------------
 # Output
@@ -80,7 +82,7 @@ echo " Splitter:      window=$ENTROPY_WINDOW_SIZE  pct=$ENTROPY_PERCENTILE"
 echo "                min_len=$PHASE_MIN_LEN  max_K=$PHASE_MAX_K"
 echo " EntropyCredit: psi=$PSI  thresh_pct=$DEFAULT_THRESHOLD_PCT"
 echo "                correct=$CORRECT_TOTAL  incorrect=$INCORRECT_TOTAL"
-echo " Advantage:     alpha=$ALPHA  decay_gamma=$DECAY_GAMMA"
+echo " Advantage:     alpha=$ALPHA  decay_gamma=$DECAY_GAMMA  mode=$PIPELINE_ADVANTAGE"
 echo " Output:        $OUTPUT_DIR"
 echo "============================================================"
 
@@ -140,6 +142,8 @@ python -m adpo.main --config-name adpo_unified \
     algorithm.partial_total="$PARTIAL_TOTAL" \
     algorithm.alpha="$ALPHA" \
     algorithm.decay_gamma="$DECAY_GAMMA" \
+    algorithm.pipeline_advantage="$PIPELINE_ADVANTAGE" \
+    algorithm.hybrid_correct_threshold="$HYBRID_CORRECT_THRESHOLD" \
     trainer.use_legacy_worker_impl=disable \
     trainer.total_epochs="$EPOCHS" \
     trainer.save_freq=50 \

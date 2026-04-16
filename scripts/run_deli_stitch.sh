@@ -86,10 +86,12 @@ GOLDEN_PATH_MODEL=${GOLDEN_PATH_MODEL:-"$STITCH_MODEL"}
 GOLDEN_PATH_MAX_ATTEMPTS=${GOLDEN_PATH_MAX_ATTEMPTS:-3}
 
 # ---------------------------------------------------------------------------
-# Advantage (PhaseAdvantage)
+# Advantage
 # ---------------------------------------------------------------------------
 ALPHA=${ALPHA:-0.5}
 DECAY_GAMMA=${DECAY_GAMMA:-0.95}
+PIPELINE_ADVANTAGE=${PIPELINE_ADVANTAGE:-"phase"}   # phase | hybrid
+HYBRID_CORRECT_THRESHOLD=${HYBRID_CORRECT_THRESHOLD:-1.0}
 
 # ---------------------------------------------------------------------------
 # Output
@@ -110,7 +112,7 @@ echo "               endpoint=$STITCH_ENDPOINT"
 echo "               splice_boost=$STITCH_SPLICE_BOOST  max_ext=$STITCH_MAX_EXTENSIONS"
 [ -n "$STITCH_DEMO_LOG" ] && echo "               demo_log=$STITCH_DEMO_LOG"
 echo " GoldenPath:   enabled=$GOLDEN_PATH_ENABLED"
-echo " Advantage:    alpha=$ALPHA  decay_gamma=$DECAY_GAMMA"
+echo " Advantage:    alpha=$ALPHA  decay_gamma=$DECAY_GAMMA  mode=$PIPELINE_ADVANTAGE"
 echo " Output:       $OUTPUT_DIR"
 echo "============================================================"
 
@@ -184,6 +186,8 @@ python -m adpo.main --config-name adpo_unified \
     algorithm.golden_path_max_attempts="$GOLDEN_PATH_MAX_ATTEMPTS" \
     algorithm.alpha="$ALPHA" \
     algorithm.decay_gamma="$DECAY_GAMMA" \
+    algorithm.pipeline_advantage="$PIPELINE_ADVANTAGE" \
+    algorithm.hybrid_correct_threshold="$HYBRID_CORRECT_THRESHOLD" \
     trainer.use_legacy_worker_impl=disable \
     trainer.total_epochs="$EPOCHS" \
     trainer.save_freq=50 \

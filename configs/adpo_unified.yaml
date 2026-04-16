@@ -23,18 +23,30 @@ algorithm:
   # ==========================================================================
   pipeline_splitter:  pure_entropy   # pure_entropy | deli_entropy
   pipeline_reward:    attention        # entropy | attention | judge | stitch
-  pipeline_advantage: phase          # phase (only option currently)
+  pipeline_advantage: phase          # phase | hybrid
 
   adv_estimator: grpo
 
   # ==========================================================================
-  # PhaseAdvantage
+  # PhaseAdvantage  (pipeline_advantage: phase)
   # ==========================================================================
   alpha: 0.5          # blend of local (per-phase) and global (per-response) advantage
                       # 0.0 = pure global (GRPO), 1.0 = pure local
   decay_gamma: 0.9405    # in-phase token decay: 0.0 = uniform, >0 = earlier tokens get more
                       # (was 0.95*0.99 — YAML does not evaluate arithmetic)
                       # (e.g. 0.9: first token gets ~2× last token within a phase)
+
+  # ==========================================================================
+  # HybridAdvantage  (pipeline_advantage: hybrid)
+  #
+  # Routes per GRPO group:
+  #   Mixed group (>=1 correct answer) → standard GRPO:
+  #       A_i = (outcome_i - mean_group) / (std_group + eps)
+  #       broadcast uniformly to all response tokens
+  #   All-wrong group (every answer incorrect) → ADPO phase pipeline:
+  #       full split → phase reward → PhaseAdvantage (alpha/decay_gamma above)
+  # ==========================================================================
+  hybrid_correct_threshold: 1.0     # outcome_reward >= this counts as "correct"
 
   # ==========================================================================
   # Phase splitter (shared by PureEntropySplitter and DeliEntropySplitter)
@@ -66,9 +78,17 @@ algorithm:
   attention_use_direct: false   # false = reconstruct from hidden states; true = use outputs.attentions (requires eager)
   attention_norm_mode:  row     # influence matrix A normalization:
                                 #   none | row (default) | col | matrix
-  correct_reward:       1.0     # last-phase reward when answer is correct
-  incorrect_reward:    -1.0     # last-phase reward when answer is wrong
-  partial_reward:       0.1     # last-phase reward on partial match
+  correct_reward:       1.0     # outcome reward (r_last) injected as bias at last phase
+  incorrect_reward:    -1.0     # outcome reward for wrong answer
+  partial_reward:       0.1     # outcome reward for partial match
+
+  # Solve mode for phase rewards:
+  #   form b (default): r[0] = attention_fixed_first_reward (fixed),
+  #                     r_last injected as additive bias at last row.
+  #                     → r[m-1] = A[m-2]*r + r_last  (biased, not fixed)
+  #   form a (legacy):  set attention_fixed_first_reward to null (~~),
+  #                     r[last] = r_last exactly (fixed), solve backward.
+  attention_fixed_first_reward: 0.5   # r[0] value; set to null for form a
 
   # Head aggregation for confluence matrix (attention path):
   attention_pca_components: 0   # 0 = simple head mean (default)

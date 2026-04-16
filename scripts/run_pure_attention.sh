@@ -88,6 +88,11 @@ CORRECT_REWARD=${CORRECT_REWARD:-1.0}
 INCORRECT_REWARD=${INCORRECT_REWARD:-0.0}
 PARTIAL_REWARD=${PARTIAL_REWARD:-0.1}
 
+# Solve mode:
+#   form b (default): r[0] = FIRST_PHASE_REWARD (fixed), r_last as additive bias at last phase
+#   form a (legacy):  FIRST_PHASE_REWARD="" → r[last] fixed from outcome, solve backward
+FIRST_PHASE_REWARD=${FIRST_PHASE_REWARD:-0.5}
+
 # --- Path selection ---
 # Direct attention (requires eager attn impl, reads outputs.attentions directly)
 USE_DIRECT_ATTENTION=${USE_DIRECT_ATTENTION:-false}
@@ -129,7 +134,7 @@ elif [ "${ATTN_PCA_COMPONENTS:-0}" -gt 0 ] 2>/dev/null; then
 else
     echo "                  [RECON PATH]  hidden states → Q·K^T reconstruction"
 fi
-echo " Advantage:       alpha=$ALPHA  decay_gamma=$DECAY_GAMMA"
+echo " Advantage:       alpha=$ALPHA  decay_gamma=$DECAY_GAMMA  mode=$PIPELINE_ADVANTAGE"
 echo " Output:          $OUTPUT_DIR"
 echo "============================================================"
 
@@ -185,6 +190,7 @@ python -m adpo.main --config-name adpo_unified \
     algorithm.attention_layer="$ATTENTION_LAYER" \
     algorithm.attention_norm_mode="$ATTENTION_NORM_MODE" \
     algorithm.attention_use_direct="$USE_DIRECT_ATTENTION" \
+    algorithm.attention_fixed_first_reward="$FIRST_PHASE_REWARD" \
     algorithm.correct_reward="$CORRECT_REWARD" \
     algorithm.incorrect_reward="$INCORRECT_REWARD" \
     algorithm.partial_reward="$PARTIAL_REWARD" \
@@ -192,6 +198,8 @@ python -m adpo.main --config-name adpo_unified \
     algorithm.attention_pca_components="$ATTN_PCA_COMPONENTS" \
     algorithm.alpha="$ALPHA" \
     algorithm.decay_gamma="$DECAY_GAMMA" \
+    algorithm.pipeline_advantage="$PIPELINE_ADVANTAGE" \
+    algorithm.hybrid_correct_threshold="$HYBRID_CORRECT_THRESHOLD" \
     trainer.use_legacy_worker_impl=disable \
     trainer.total_epochs="$EPOCHS" \
     trainer.save_freq=50 \

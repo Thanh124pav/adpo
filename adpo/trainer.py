@@ -258,6 +258,7 @@ class ADPOTrainer:
             response_mask=response_mask,
             boundaries_batch=boundaries_batch,
             index=index,
+            outcome_rewards=outcome_rewards,
         )
 
         # 8. Post-process stitching if StitchReward produced splice_results
@@ -314,7 +315,7 @@ def build_pipeline_from_config(config, tokenizer=None, hf_model=None):
         pipeline_splitter  : "pure_entropy" | "deli_entropy"   (default "pure_entropy")
         pipeline_reward    : "entropy" | "judge" | "attention" | "stitch"
                              (default "entropy")
-        pipeline_advantage : "phase"  (currently only option)
+        pipeline_advantage : "phase" | "hybrid"  (default "phase")
 
     All algorithm sub-configs for each component are read by the component's
     __init__, so there's nothing more to wire here.
@@ -365,7 +366,12 @@ def build_pipeline_from_config(config, tokenizer=None, hf_model=None):
         reward_computer = EntropyReward(config)
 
     # --- Advantage computer ---
-    advantage_computer = PhaseAdvantage(config)
+    adv_name = getattr(algo, "pipeline_advantage", "phase")
+    if adv_name == "hybrid":
+        from adpo.advantages_computers.hybrid_advantage import HybridAdvantage
+        advantage_computer = HybridAdvantage(config)
+    else:
+        advantage_computer = PhaseAdvantage(config)
 
     return splitter, reward_computer, advantage_computer
 
