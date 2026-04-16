@@ -22,7 +22,7 @@ algorithm:
   # Pipeline selection
   # ==========================================================================
   pipeline_splitter:  pure_entropy   # pure_entropy | deli_entropy
-  pipeline_reward:    entropy        # entropy | attention | judge | stitch
+  pipeline_reward:    attention        # entropy | attention | judge | stitch
   pipeline_advantage: phase          # phase (only option currently)
 
   adv_estimator: grpo
@@ -32,16 +32,16 @@ algorithm:
   # ==========================================================================
   alpha: 0.5          # blend of local (per-phase) and global (per-response) advantage
                       # 0.0 = pure global (GRPO), 1.0 = pure local
-  decay_gamma: 0.0    # in-phase token decay: 0.0 = uniform, >0 = earlier tokens get more
+  decay_gamma: 0.95*0.99    # in-phase token decay: 0.0 = uniform, >0 = earlier tokens get more
                       # (e.g. 0.9: first token gets ~2× last token within a phase)
 
   # ==========================================================================
   # Phase splitter (shared by PureEntropySplitter and DeliEntropySplitter)
   # ==========================================================================
   entropy_window_size: 10     # sliding window size k for entropy averaging
-  entropy_percentile:  75.0   # percentile threshold: positions above → candidate boundary
+  entropy_percentile:  80.0   # percentile threshold: positions above → candidate boundary
   phase_min_len:       10     # minimum tokens between consecutive boundaries
-  phase_max_K:         10     # maximum number of phases per response
+  phase_max_K:         15     # maximum number of phases per response
 
   # DeliEntropySplitter only: hard boundary at </think> token if present
   # (no extra config needed; reads tokenizer's </think> token id automatically)
@@ -49,7 +49,7 @@ algorithm:
   # ==========================================================================
   # Reward: EntropyReward  (pipeline_reward: entropy)
   # ==========================================================================
-  psi:                        0.95    # cumulative-entropy decay factor (1.0 = no decay)
+  psi:                        0.95*0.99    # cumulative-entropy decay factor (1.0 = no decay)
                                       # E_phase = e_1 + e_2*psi + e_3*psi² + ...
   default_threshold_percentile: 90.0  # percentile for P when all responses wrong
   correct_total:              1.0     # sum(phase_rewards) for correct responses
@@ -73,7 +73,7 @@ algorithm:
                                 #      e.g. 4: denoises noisy heads
 
   # Fast path: skip attention reconstruction entirely, use hidden states:
-  attention_hidden_pca_components: 0   # 0 = use attention path (default)
+  attention_hidden_pca_components: 128   # 0 = use attention path (default)
                                        # >0 = PCA on hidden states, n components
                                        #      e.g. 32: GPU freed immediately,
                                        #      cosine-sim between phase embeddings
@@ -133,7 +133,7 @@ algorithm:
   # ==========================================================================
   # Shared rollout / response constraints
   # ==========================================================================
-  max_response_length: 2048   # used by stitcher to check prefix+golden fits
+  max_response_length: 4096   # used by stitcher to check prefix+golden fits
 
 # ============================================================================
 # Actor / Rollout / Ref
