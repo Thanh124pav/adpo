@@ -1,3 +1,6 @@
+# DEPRECATED — use configs/adpo_unified.yaml with pipeline_reward: attention
+# Kept for backward compatibility only.
+#
 # Pure-Entropy Trainer Config
 # Inherits from verl's ppo_trainer.yaml, only overrides what's needed.
 #

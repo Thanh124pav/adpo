@@ -1,0 +1,196 @@
+# ============================================================================
+# ADPO Unified Config
+# Single file for all pipeline combinations:
+#   (PureEntropySplitter | DeliEntropySplitter)
+#   × (EntropyReward | AttentionReward | JudgeReward | StitchReward)
+#   × PhaseAdvantage
+#
+# Inherits from verl's ppo_trainer.yaml — only overrides what ADPO needs.
+# ============================================================================
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+algorithm:
+
+  # ==========================================================================
+  # Pipeline selection
+  # ==========================================================================
+  pipeline_splitter:  pure_entropy   # pure_entropy | deli_entropy
+  pipeline_reward:    entropy        # entropy | attention | judge | stitch
+  pipeline_advantage: phase          # phase (only option currently)
+
+  adv_estimator: grpo
+
+  # ==========================================================================
+  # PhaseAdvantage
+  # ==========================================================================
+  alpha: 0.5          # blend of local (per-phase) and global (per-response) advantage
+                      # 0.0 = pure global (GRPO), 1.0 = pure local
+  decay_gamma: 0.0    # in-phase token decay: 0.0 = uniform, >0 = earlier tokens get more
+                      # (e.g. 0.9: first token gets ~2× last token within a phase)
+
+  # ==========================================================================
+  # Phase splitter (shared by PureEntropySplitter and DeliEntropySplitter)
+  # ==========================================================================
+  entropy_window_size: 10     # sliding window size k for entropy averaging
+  entropy_percentile:  75.0   # percentile threshold: positions above → candidate boundary
+  phase_min_len:       10     # minimum tokens between consecutive boundaries
+  phase_max_K:         10     # maximum number of phases per response
+
+  # DeliEntropySplitter only: hard boundary at </think> token if present
+  # (no extra config needed; reads tokenizer's </think> token id automatically)
+
+  # ==========================================================================
+  # Reward: EntropyReward  (pipeline_reward: entropy)
+  # ==========================================================================
+  psi:                        0.95    # cumulative-entropy decay factor (1.0 = no decay)
+                                      # E_phase = e_1 + e_2*psi + e_3*psi² + ...
+  default_threshold_percentile: 90.0  # percentile for P when all responses wrong
+  correct_total:              1.0     # sum(phase_rewards) for correct responses
+  incorrect_total:           -1.0     # sum(phase_rewards) for wrong responses
+  partial_total:              0.1     # sum(phase_rewards) for partial / no answer
+
+  # ==========================================================================
+  # Reward: AttentionReward  (pipeline_reward: attention)
+  # ==========================================================================
+  attention_layer:      -1      # layer index for hidden-state extraction
+                                # -1 = auto: floor(n_layers * 3/4)
+  attention_norm_mode:  row     # influence matrix A normalization:
+                                #   none | row (default) | col | matrix
+  correct_reward:       1.0     # last-phase reward when answer is correct
+  incorrect_reward:    -1.0     # last-phase reward when answer is wrong
+  partial_reward:       0.1     # last-phase reward on partial match
+
+  # Head aggregation for confluence matrix (attention path):
+  attention_pca_components: 0   # 0 = simple head mean (default)
+                                # >0 = PCA over heads, keep n components
+                                #      e.g. 4: denoises noisy heads
+
+  # Fast path: skip attention reconstruction entirely, use hidden states:
+  attention_hidden_pca_components: 0   # 0 = use attention path (default)
+                                       # >0 = PCA on hidden states, n components
+                                       #      e.g. 32: GPU freed immediately,
+                                       #      cosine-sim between phase embeddings
+
+  # ==========================================================================
+  # Reward: JudgeReward  (pipeline_reward: judge)
+  # ==========================================================================
+  judge_type:                endpoint    # rule | endpoint
+  judge_model:               Qwen3-14B
+  judge_endpoint:            ""          # http://host:port (endpoint mode)
+
+  correct_reward_floor:      0.5         # min phase reward for correct responses
+  incorrect_penalty:         0.3         # scale for wrong responses
+  no_answer_correct_scale:   0.5         # scale when no golden answer, judge-good
+  no_answer_incorrect_scale: 0.1         # scale when no golden answer, judge-bad
+  overlong_buffer_len:       0           # 0 = off; >0 = DAPO soft penalty buffer
+  overlong_penalty_factor:   1.0
+  output_correct_reward:     0.5         # reward for output phase (after </think>), correct
+  output_incorrect_reward:   0.0         # reward for output phase, wrong
+
+  # ==========================================================================
+  # Reward: StitchReward  (pipeline_reward: stitch)
+  # Activates trajectory stitching for all-wrong GRPO groups.
+  # ==========================================================================
+
+  # Rollout mode:
+  #   full — pi(• | g[i], a[:j]) — add golden phases one by one until correct
+  #   lite — pi(• | g[i:], a[:j]) — give all golden phases from i, rollout once
+  stitch_rollout_mode: full
+
+  # Splice-point scoring:
+  #   hf       — log P(golden_phase[i] | response[:j]) via training model (default)
+  #   endpoint — same but via vLLM echo endpoint (stale snapshot)
+  stitch_splice_scorer: hf
+
+  stitch_splice_boost:        2.0   # advantage multiplier at splice token position
+  stitch_pre_splice_adv:      0.0   # advantage for tokens before splice (0 = neutral)
+  stitch_post_splice_decay:   0.9   # geometric decay of positive advantage after splice
+  stitch_reward_decay:        0.1   # reward decay per golden extension (1.0→0.9→0.8…)
+  stitch_max_extensions:      5     # max golden phases to extend before giving up
+
+  # Demo file logging (appended when a group is all-wrong):
+  stitch_demo_log_path: stitch_demo.txt   # "" to disable
+
+  # vLLM endpoint (used by stitch_splice_scorer=endpoint and rollout):
+  stitch_endpoint: ""
+  stitch_model:    ""
+
+  # Golden path generation (for answer-only datasets without pre-written solutions):
+  golden_path_enabled:      false
+  golden_path_endpoint:     ""       # defaults to stitch_endpoint if empty
+  golden_path_model:        ""       # defaults to stitch_model if empty
+  golden_path_mode:         endpoint # endpoint | vllm
+  golden_path_cache_dir:    data/golden_paths
+  golden_path_max_attempts: 3
+
+  # ==========================================================================
+  # Shared rollout / response constraints
+  # ==========================================================================
+  max_response_length: 2048   # used by stitcher to check prefix+golden fits
+
+# ============================================================================
+# Actor / Rollout / Ref
+# ============================================================================
+actor_rollout_ref:
+  model:
+    path: Qwen3-4B
+  actor:
+    ppo_mini_batch_size: 128
+    use_kl_loss: true
+    use_torch_compile: false
+    loss_agg_mode: seq-mean-token-sum-norm
+    lr: 1e-6
+    lr_warmup_steps_ratio: 0.0
+    ppo_epochs: 1
+    clip_ratio: 0.2
+    entropy_coeff: 0.0
+  rollout:
+    name: vllm
+    n: 8
+    tensor_model_parallel_size: 1
+    gpu_memory_utilization: 0.4
+    enforce_eager: true
+    repetition_penalty: 1.05
+  ref:
+    fsdp_config:
+      param_offload: true
+
+# ============================================================================
+# Data
+# ============================================================================
+data:
+  train_files: data/processed/train/math.parquet
+  val_files:   data/processed/eval/math500.parquet
+  train_batch_size: 128
+  max_prompt_length:  1024
+  max_response_length: 2048
+
+# ============================================================================
+# Reward (verl integration — exact-match scoring)
+# ============================================================================
+reward:
+  custom_reward_function:
+    path: adpo/reward_functions.py
+    name: compute_score
+  reward_model:
+    enable: false
+
+# ============================================================================
+# Trainer
+# ============================================================================
+trainer:
+  total_epochs: 3
+  save_freq: 50
+  test_freq: 50
+  project_name: adpo
+  experiment_name: adpo-unified
+  logger:
+    - tensorboard
+  default_local_dir: checkpoints/

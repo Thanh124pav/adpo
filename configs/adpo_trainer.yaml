@@ -1,3 +1,6 @@
+# DEPRECATED — use configs/adpo_unified.yaml with pipeline_reward: judge
+# Kept for backward compatibility only.
+#
 # Inherit from verl's ppo_trainer.yaml — only override what ADPO needs.
 # All fields not listed here use verl's defaults.
 

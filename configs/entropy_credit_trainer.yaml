@@ -1,3 +1,6 @@
+# DEPRECATED — use configs/adpo_unified.yaml with pipeline_reward: entropy
+# Kept for backward compatibility only.
+#
 # Entropy-Credit Trainer Config
 # Inherits from verl's ppo_trainer.yaml.
 #
