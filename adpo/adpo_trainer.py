@@ -27,10 +27,10 @@ from adpo.adpo_algorithm import (
     segment_response_into_phases,
     compute_adpo_phase_advantages,
 )
-from adpo.llm_judge import create_judge, PhaseJudge
+from adpo.reward_computers.llm_judge import create_judge, PhaseJudge
 from adpo.reward_functions import compute_score
 from adpo.golden_path import GoldenPathGenerator
-from adpo.trajectory_stitching import TrajectoryStitcher, compute_stitched_advantages
+from adpo.reward_computers.trajectory_stitching import TrajectoryStitcher, compute_stitched_advantages
 
 logger = logging.getLogger(__name__)
 

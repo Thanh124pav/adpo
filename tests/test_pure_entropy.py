@@ -165,6 +165,27 @@ def test_solve_phase_rewards():
     assert len(rewards_2) == 2
     assert rewards_2[-1] == 1.0
 
+    # Variant: fix the first reward to 0.5 and solve the shifted system.
+    rewards_fixed, residual_fixed = solve_phase_rewards(
+        A,
+        r_last=1.0,
+        n_phases=3,
+        fixed_first_reward=0.5,
+    )
+    print(f"  fixed-first rewards = {rewards_fixed}")
+    print(f"  fixed-first residual = {residual_fixed:.6e}")
+
+    assert len(rewards_fixed) == 3
+    assert rewards_fixed[0] == 0.5
+    M = np.array([
+        [1.0, 0.0],
+        [-A[1, 1], 1.0],
+    ])
+    b = np.array([A[0, 0] * 0.5, -A[1, 0] * 0.5])
+    max_err_fixed = np.abs(M @ rewards_fixed[1:] - b).max()
+    print(f"  verification (fixed-first): max|M*y - b| = {max_err_fixed:.6e}")
+    assert max_err_fixed < 1e-6, f"Fixed-first verification failed: max error = {max_err_fixed}"
+
     print("  PASSED")
 
 

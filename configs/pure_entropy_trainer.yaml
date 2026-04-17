@@ -1,3 +1,6 @@
+# DEPRECATED — use configs/adpo_unified.yaml with pipeline_reward: attention
+# Kept for backward compatibility only.
+#
 # Pure-Entropy Trainer Config
 # Inherits from verl's ppo_trainer.yaml, only overrides what's needed.
 #
@@ -26,6 +29,7 @@ algorithm:
 
   # Attention reconstruction
   attention_layer: -1            # Layer L for attention reconstruction (-1 = auto: 3/4 depth)
+  attention_use_direct: false    # false = reconstruct from hidden states; true = use outputs.attentions (requires eager)
   attention_norm_mode: row       # Normalization for matrix A: "none", "row", "col", "matrix"
 
   # Reward for last phase (from exact matching)

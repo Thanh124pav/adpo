@@ -304,8 +304,50 @@ class _EarlyStopForward(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Attention Reconstruction (from hidden states + model weights)
+# Attention Extraction / Reconstruction
 # ---------------------------------------------------------------------------
+
+def extract_attention_at_layer_hf(
+    model,
+    input_ids: torch.Tensor,
+    layer_idx: int,
+    attention_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Extract raw attention weights from a HuggingFace forward pass.
+
+    This requires the model to be loaded with attn_implementation="eager"
+    and output_attentions support enabled by the architecture.
+
+    Args:
+        model: HuggingFace AutoModelForCausalLM.
+        input_ids: (batch, seq_len) token IDs.
+        layer_idx: Layer index to extract.
+        attention_mask: Optional attention mask for padded inputs.
+
+    Returns:
+        attn_weights: (batch, num_heads, seq_len, seq_len) attention tensor.
+    """
+    device = next(model.parameters()).device
+    with torch.no_grad():
+        outputs = model(
+            input_ids=input_ids.to(device),
+            attention_mask=attention_mask.to(device) if attention_mask is not None else None,
+            output_attentions=True,
+            output_hidden_states=False,
+            use_cache=False,
+        )
+
+    if not hasattr(outputs, "attentions") or outputs.attentions is None:
+        raise RuntimeError(
+            "Model did not return attentions. Load it with attn_implementation='eager' "
+            "and ensure the architecture supports output_attentions=True."
+        )
+
+    attn_weights = outputs.attentions[layer_idx]
+    if attn_weights is None:
+        raise RuntimeError(f"No attention tensor returned for layer {layer_idx}")
+
+    return attn_weights
 
 def reconstruct_attention_at_layer(
     model,
@@ -336,13 +378,12 @@ def reconstruct_attention_at_layer(
     """
     import sys
     import os
-    # Add reasoning_analysis to path for importing reconstruct module
+    # Add project root to path so the sibling reasoning_analysis package resolves.
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    ra_path = os.path.join(project_root, "reasoning_analysis")
-    if ra_path not in sys.path:
-        sys.path.insert(0, ra_path)
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
 
-    from attention_analysis.reconstruct import reconstruct_attention
+    from reasoning_analysis.attention_analysis.reconstruct import reconstruct_attention
 
     with torch.no_grad():
         attn = reconstruct_attention(
@@ -489,8 +530,16 @@ def solve_phase_rewards(
     A: np.ndarray,
     r_last: float,
     n_phases: int,
+    fixed_first_reward: Optional[float] = None,
 ) -> np.ndarray:
-    """Solve for phase rewards using the system A * r[0:m-2] = r[1:m-1].
+    """Solve for phase rewards.
+
+    Modes:
+        1. Default: solve A * r[0:m-2] = r[1:m-1] with the last reward fixed
+           to r_last.
+        2. Variant: if fixed_first_reward is provided, solve the shifted system
+              with r[0] fixed to that value and solve for the remaining rewards
+              using an explicit bias vector b.
 
     Given:
         A: (m-1, m-1) lower triangular matrix (diagonal included).
@@ -515,11 +564,68 @@ def solve_phase_rewards(
     """
     m = n_phases
     if m <= 1:
+        if fixed_first_reward is not None:
+            return np.array([fixed_first_reward]), 0.0
         return np.array([r_last]), 0.0
 
     n = m - 1  # size of the system
     if A.shape[0] == 0:
+        if fixed_first_reward is not None:
+            return np.array([fixed_first_reward]), 0.0
         return np.array([r_last]), 0.0
+
+    if fixed_first_reward is not None:
+        r0 = fixed_first_reward
+
+        # Form b: fix r[0]=r0, inject r_last as additive bias at the last row.
+        #
+        # System M @ y = rhs, where y = [r_1, ..., r_{m-1}]:
+        #   row 0:         r_1 = A[0,0]*r_0
+        #   row i (i>=1): r_{i+1} - sum_{j=1..i} A[i,j]*r_j = A[i,0]*r_0
+        #   last row only: rhs[-1] += r_last  (outcome as additive bias)
+        #
+        # This means r[m-1] = A[m-2]*r[0:m-1] + r_last  (NOT fixed, but biased)
+        # vs. form a where r[m-1] == r_last  (fixed exactly).
+        M = np.zeros((n, n))
+        M[0, 0] = 1.0
+        for i in range(1, n):
+            M[i, :i] = -A[i, 1:i + 1]
+            M[i, i] = 1.0
+
+        b = A[:, 0] * r0       # contribution from fixed r[0]
+        b[-1] += r_last        # inject outcome reward as bias at last phase
+
+        try:
+            det_B = np.linalg.det(M)
+
+            if abs(det_B) < 1e-12:
+                logger.warning(
+                    f"[PureEntropy Solve] B near-singular (det={det_B:.6e}), using lstsq"
+                )
+                y, residuals, rank, sv = np.linalg.lstsq(M, b, rcond=None)
+            else:
+                y = np.linalg.solve(M, b)
+        except np.linalg.LinAlgError as e:
+            logger.error(f"[PureEntropy Solve] LinAlgError: {e}, falling back to uniform")
+            y = np.full(n, r0)
+
+        rewards = np.zeros(m)
+        rewards[0] = r0
+        rewards[1:] = y
+
+        reward_abs_max = max(abs(r0) * 10, abs(r_last) * 10, 5.0)
+        rewards_clamped = np.clip(rewards, -reward_abs_max, reward_abs_max)
+        if not np.allclose(rewards, rewards_clamped):
+            logger.warning(
+                f"[PureEntropy Solve] Clamped: {rewards} -> {rewards_clamped}"
+            )
+            rewards = rewards_clamped
+
+        residual = 0.0
+        if n > 0:
+            residual = np.abs(M @ rewards[1:] - b).max()
+
+        return rewards, residual
 
     # Build B = A (copy), then subtract 1 from superdiagonal for rows 0..n-2
     B = A.copy()

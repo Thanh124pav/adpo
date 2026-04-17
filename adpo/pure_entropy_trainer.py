@@ -30,6 +30,7 @@ from adpo.pure_entropy_algorithm import (
     build_phase_mask,
     build_phase_attention_matrix,
     build_influence_matrix_A,
+    extract_attention_at_layer_hf,
     solve_phase_rewards,
     reconstruct_attention_at_layer,
     compute_pure_entropy_advantages,
@@ -71,7 +72,7 @@ def _pick_best_gpu() -> torch.device:
     return device
 
 
-def _load_hf_model(model_path: str):
+def _load_hf_model(model_path: str, use_direct_attention: bool = False):
     """Load HuggingFace model for hidden state extraction + attention reconstruction.
 
     Automatically selects the GPU with the most free memory to avoid OOM
@@ -97,7 +98,7 @@ def _load_hf_model(model_path: str):
     if torch.cuda.is_available():
         # Pick the GPU with the most free memory (avoid the one used by actor/rollout)
         device = _pick_best_gpu()
-        attn_impls = ["flash_attention_2", "eager"]
+        attn_impls = ["eager"] if use_direct_attention else ["flash_attention_2", "eager"]
     else:
         device = torch.device("cpu")
         attn_impls = ["eager"]
@@ -138,6 +139,7 @@ def _load_hf_model(model_path: str):
 def patch_verl_grpo_with_pure_entropy(
     tokenizer=None,
     model_path: str = "",
+    use_direct_attention: bool = False,
     # Phase detection params
     entropy_window_size: int = 10,
     entropy_percentile: float = 75.0,
@@ -150,6 +152,8 @@ def patch_verl_grpo_with_pure_entropy(
     correct_reward: float = 1.0,
     incorrect_reward: float = 0.0,
     partial_reward: float = 0.1,
+    # Solve mode
+    first_phase_reward: float = 0.5,  # form b default; set to None for form a
 ):
     """Monkey-patch verl's compute_advantage with pure-entropy algorithm.
 
@@ -162,6 +166,9 @@ def patch_verl_grpo_with_pure_entropy(
         phase_max_K: Maximum phases per response.
         attention_layer: Layer index L for attention reconstruction.
             -1 = auto (3/4 of total layers).
+        use_direct_attention: If True, read attention directly from the
+            model forward pass with output_attentions=True. Requires eager
+            attention implementation.
         attention_norm_mode: Normalization for influence matrix A.
             "none" - raw attention values.
             "row"  - each row sums to 1 (r_{i+1} = weighted avg of earlier r).
@@ -178,7 +185,7 @@ def patch_verl_grpo_with_pure_entropy(
 
     def _get_hf_model():
         if _hf_model[0] is None:
-            _hf_model[0] = _load_hf_model(model_path)
+            _hf_model[0] = _load_hf_model(model_path, use_direct_attention=use_direct_attention)
         return _hf_model[0]
 
     def pure_entropy_compute_advantage(
@@ -437,44 +444,64 @@ def patch_verl_grpo_with_pure_entropy(
             sub_ids = token_ids[b:b+1].to(hf_device)
             pos_ids = torch.arange(seq_len, device=hf_device).unsqueeze(0)
 
-            with torch.no_grad():
-                from adpo.pure_entropy_algorithm import _partial_forward
-                hs_full = _partial_forward(hf_model, sub_ids, pos_ids, layer_L)
-                # hs_full: (1, seq_len, hidden_dim)
+            if use_direct_attention:
+                with torch.no_grad():
+                    try:
+                        attn_full = extract_attention_at_layer_hf(
+                            hf_model,
+                            sub_ids,
+                            layer_L,
+                        )
+                    except Exception as e:
+                        logger.error(f"[PureEntropy] Direct attention extraction failed for b={b}: {e}")
+                        print(f"[PureEntropy] ERROR: Direct attention extraction failed for b={b}: {e}", flush=True)
+                        phase_rewards_batch.append(np.full(n_phases, last_phase_rewards[b]))
+                        del sub_ids
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        continue
 
-                # --- Slice to response tokens only ---
-                # This reduces attention reconstruction from O(seq_len²)
-                # to O(resp_len²). For seq_len=5120, resp_len~2048: ~6x speedup.
-                hs_resp = hs_full[:, resp_start:resp_end, :]
-                pos_resp = torch.arange(
-                    resp_start, resp_end, device=hf_device,
-                ).unsqueeze(0)
+                attn_weights = attn_full[0, :, resp_start:resp_end, resp_start:resp_end].contiguous()
+                del attn_full, sub_ids
+            else:
+                with torch.no_grad():
+                    from adpo.pure_entropy_algorithm import _partial_forward
+                    hs_full = _partial_forward(hf_model, sub_ids, pos_ids, layer_L)
+                    # hs_full: (1, seq_len, hidden_dim)
 
-                del hs_full, sub_ids
+                    # --- Slice to response tokens only ---
+                    # This reduces attention reconstruction from O(seq_len²)
+                    # to O(resp_len²). For seq_len=5120, resp_len~2048: ~6x speedup.
+                    hs_resp = hs_full[:, resp_start:resp_end, :]
+                    pos_resp = torch.arange(
+                        resp_start, resp_end, device=hf_device,
+                    ).unsqueeze(0)
 
-                # --- Reconstruct attention (response tokens only) ---
-                # matmul_on_cpu=True: Steps 1-5 (LayerNorm, Q/K proj, RoPE)
-                # run on GPU, then Q/K move to CPU for the large matmul.
-                # GPU never allocates the O(num_heads × resp_len²) tensor.
-                try:
-                    attn_weights = reconstruct_attention_at_layer(
-                        model=hf_model,
-                        layer_idx=layer_L,
-                        hidden_state=hs_resp,
-                        position_ids=pos_resp,
-                        output_dtype=torch.float32,
-                        matmul_on_cpu=True,
-                    )  # (num_heads, resp_len, resp_len) float32, on CPU
-                except Exception as e:
-                    logger.error(f"[PureEntropy] Attention reconstruction failed for b={b}: {e}")
-                    print(f"[PureEntropy] ERROR: Attention reconstruction failed for b={b}: {e}", flush=True)
-                    phase_rewards_batch.append(np.full(n_phases, last_phase_rewards[b]))
+                    del hs_full, sub_ids
+
+                    # --- Reconstruct attention (response tokens only) ---
+                    # matmul_on_cpu=True: Steps 1-5 (LayerNorm, Q/K proj, RoPE)
+                    # run on GPU, then Q/K move to CPU for the large matmul.
+                    # GPU never allocates the O(num_heads × resp_len²) tensor.
+                    try:
+                        attn_weights = reconstruct_attention_at_layer(
+                            model=hf_model,
+                            layer_idx=layer_L,
+                            hidden_state=hs_resp,
+                            position_ids=pos_resp,
+                            output_dtype=torch.float32,
+                            matmul_on_cpu=True,
+                        )  # (num_heads, resp_len, resp_len) float32, on CPU
+                    except Exception as e:
+                        logger.error(f"[PureEntropy] Attention reconstruction failed for b={b}: {e}")
+                        print(f"[PureEntropy] ERROR: Attention reconstruction failed for b={b}: {e}", flush=True)
+                        phase_rewards_batch.append(np.full(n_phases, last_phase_rewards[b]))
+                        del hs_resp, pos_resp
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        continue
+
                     del hs_resp, pos_resp
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    continue
-
-                del hs_resp, pos_resp
 
             # --- Build phase attention matrix ---
             # Boundaries are in absolute coords; shift to response-relative
@@ -516,6 +543,7 @@ def patch_verl_grpo_with_pure_entropy(
                 A=A,
                 r_last=last_phase_rewards[b],
                 n_phases=n_phases,
+                fixed_first_reward=first_phase_reward,  # form b default
             )
             phase_rewards_batch.append(rewards)
 
@@ -529,12 +557,8 @@ def patch_verl_grpo_with_pure_entropy(
 
                 print(
                     f"[PureEntropy Solve] resp=0: {n_phases} phases, "
-                    f"det(B)={det_B:.6e}, residual={residual:.6e}",
-                    flush=True,
-                )
-                print(
-                    f"[PureEntropy Solve] B matrix:\n"
-                    f"{np.array2string(B_demo, precision=6, suppress_small=True)}",
+                    f"det(B)={det_B:.6e}, residual={residual:.6e}, "
+                    f"rewards={[f'{v:.4f}' for v in rewards[:n]]}",
                     flush=True,
                 )
 
@@ -571,83 +595,32 @@ def patch_verl_grpo_with_pure_entropy(
             data.batch["returns"] = torch.zeros_like(token_advantages)
 
         # =====================================================================
-        # DEMO: Response 0 — full text, phases, A, rewards, advantages
-        # (tham khảo adpo_trainer.py)
+        # DEMO: Response 0 — compact summary of rewards & advantages
         # =====================================================================
         if batch_size > 0:
-            active0 = response_mask[0].nonzero(as_tuple=True)[0]
-            resp_start0 = active0[0].item() if len(active0) > 0 else 0
-            resp_end0 = active0[-1].item() + 1 if len(active0) > 0 else 0
-
-            # -- Full response text --
-            full_text_0 = tokenizer.decode(
-                token_ids[0][resp_start0:resp_end0].tolist(),
-                skip_special_tokens=True,
-            )
-            print(f"[PureEntropy Demo] ===== Response 0 =====", flush=True)
-            print(f"[PureEntropy Demo] Question: \"{questions[0][:200]}\"", flush=True)
-            print(f"[PureEntropy Demo] Golden answer: \"{golden_answers[0]}\"", flush=True)
+            # -- Basic info --
+            print(f"[PureEntropy Demo] Q: {questions[0][:80]}... | A: {golden_answers[0]}", flush=True)
             print(f"[PureEntropy Demo] Outcome: {outcome_rewards[0]:.2f} "
-                  f"(last_phase_reward={last_phase_rewards[0]:.2f})", flush=True)
-            print(f"[PureEntropy Demo] Full response ({len(full_text_0)} chars):", flush=True)
-            print(full_text_0[:500], flush=True)
-            if len(full_text_0) > 500:
-                print("...(truncated)", flush=True)
+                  f"(last_phase={last_phase_rewards[0]:.2f})", flush=True)
 
-            # -- Phase boundaries & texts --
-            n_phases_0 = len(boundaries_batch[0])
-            demo_bounds = boundaries_batch[0]
-            print(f"[PureEntropy Demo] {n_phases_0} phases, boundaries={demo_bounds}", flush=True)
-
-            phases_0 = segment_response_into_phases(
-                boundaries=demo_bounds,
-                response_length=resp_end0,
-                token_ids=token_ids[0],
-                tokenizer=tokenizer,
-            )
-            for k, phase in enumerate(phases_0):
-                b_start = demo_bounds[k] if k < len(demo_bounds) else "?"
-                b_end = demo_bounds[k + 1] if k + 1 < len(demo_bounds) else "end"
-                preview = phase.text[:150].replace('\n', '\\n')
-                print(f"  phase {k} (tok {b_start}-{b_end}): \"{preview}\"", flush=True)
-
-            # -- Phase rewards (solved) --
+            # -- Phase rewards summary --
             r0 = phase_rewards_t[0][phase_mask_t[0] > 0]
-            print(
-                f"[PureEntropy Demo] Phase rewards: "
-                f"{[f'{v:.4f}' for v in r0.tolist()]}",
-                flush=True,
-            )
+            if r0.numel() > 0:
+                print(
+                    f"[PureEntropy Demo] Phase rewards: "
+                    f"n={r0.numel()}, mean={r0.mean():.4f}, min={r0.min():.4f}, max={r0.max():.4f}",
+                    flush=True,
+                )
 
-            # -- Phase advantages --
-            a0 = phase_advantages[0][phase_mask_t[0] > 0]
-            print(
-                f"[PureEntropy Demo] Phase advantages: "
-                f"{[f'{v:.4f}' for v in a0.tolist()]}",
-                flush=True,
-            )
-
-            # -- Token advantage stats for resp 0 --
+            # -- Token advantage stats --
             tok_adv_0 = token_advantages[0][response_mask[0] > 0]
             if tok_adv_0.numel() > 0:
                 print(
-                    f"[PureEntropy Demo] Token adv resp=0: "
+                    f"[PureEntropy Demo] Token adv: "
                     f"mean={tok_adv_0.mean():.4f}, std={tok_adv_0.std():.4f}, "
                     f"min={tok_adv_0.min():.4f}, max={tok_adv_0.max():.4f}",
                     flush=True,
                 )
-
-            # -- Group info --
-            idx0 = index[0].item()
-            group0_mask = (index == idx0)
-            group0_outcomes = [outcome_rewards[i] for i in range(batch_size) if group0_mask[i]]
-            group0_correct = sum(1 for r in group0_outcomes if r >= 1.0)
-            print(
-                f"[PureEntropy Demo] Group uid={idx0}: "
-                f"{group0_correct}/{len(group0_outcomes)} correct",
-                flush=True,
-            )
-            print(f"[PureEntropy Demo] ===== End Response 0 =====", flush=True)
 
         # =====================================================================
         # Diagnostics (batch-level summary)
@@ -693,7 +666,8 @@ def patch_verl_grpo_with_pure_entropy(
     ray_trainer_module.compute_advantage = pure_entropy_compute_advantage
     patch_msg = (
         f"[PureEntropy] Patched verl compute_advantage with pure-entropy algorithm "
-        f"(window={entropy_window_size}, pct={entropy_percentile}, layer={attention_layer})"
+        f"(window={entropy_window_size}, pct={entropy_percentile}, layer={attention_layer}, "
+        f"direct_attention={use_direct_attention})"
     )
     print(patch_msg, flush=True)
     logger.info(patch_msg)
@@ -726,6 +700,7 @@ class PureEntropyTaskRunner:
         patch_verl_grpo_with_pure_entropy(
             tokenizer=tokenizer,
             model_path=local_path,
+            use_direct_attention=algo.get("attention_use_direct", False),
             # Phase detection
             entropy_window_size=algo.get("entropy_window_size", 10),
             entropy_percentile=algo.get("entropy_percentile", 75.0),
@@ -738,6 +713,8 @@ class PureEntropyTaskRunner:
             correct_reward=algo.get("correct_reward", 1.0),
             incorrect_reward=algo.get("incorrect_reward", 0.0),
             partial_reward=algo.get("partial_reward", 0.1),
+            # Solve mode: form b (default) vs form a (legacy)
+            first_phase_reward=algo.get("attention_fixed_first_reward", 0.5),
         )
 
         # Delegate to standard TaskRunner
