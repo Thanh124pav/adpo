@@ -5,34 +5,43 @@ select_hard_questions.py — Filter dataset to keep only "hard" questions.
 A question is "hard" if ALL N rollouts produce a wrong answer (score < threshold).
 Useful for building a curriculum dataset focused on the model's weakest points.
 
+Two inference backends (--backend):
+    local     — load model via vLLM on local GPUs
+    endpoint  — send requests to an OpenAI-compatible API (vLLM server, etc.)
+
+Output:
+    --output  <file>.parquet   — hard questions, original columns only (no extra)
+    --meta    <file>.jsonl     — one JSON line per hard question with rollout metadata:
+                                 {dataset_index, data_source, ground_truth,
+                                  responses, scores, n_correct, n_rollouts}
+
 Usage:
+    # Local vLLM
     python scripts/select_hard_questions.py \
-        --model /path/to/model \
-        --input data/processed/train/math.parquet \
+        --backend local \
+        --model /raid/models/R1-Distill-1.5B \
+        --input  data/processed/train/math.parquet \
         --output data/processed/train/math_hard.parquet \
+        --meta   data/processed/train/math_hard_meta.jsonl \
         --n-rollouts 8
 
-    # With 4 GPUs, batched:
-    NUM_GPUS=4 python scripts/select_hard_questions.py \
-        --model /path/to/model \
-        --input data/processed/train/math.parquet \
+    # Remote endpoint (vLLM OpenAI-compatible server)
+    python scripts/select_hard_questions.py \
+        --backend endpoint \
+        --endpoint http://localhost:8000 \
+        --endpoint-model Qwen3-4B \
+        --input  data/processed/train/math.parquet \
         --output data/processed/train/math_hard.parquet \
-        --n-rollouts 16 --tensor-parallel 4 --batch-size 64
-
-Output parquet preserves all original columns and adds:
-    responses      List[str]   — the N generated rollouts
-    scores         List[float] — score for each rollout (0.0 / 0.1 / 1.0)
-    n_correct      int         — number of correct rollouts (always 0 for hard questions)
-    n_rollouts     int         — total rollouts attempted
+        --meta   data/processed/train/math_hard_meta.jsonl \
+        --n-rollouts 16 --batch-size 64
 """
 
 import argparse
 import json
 import logging
-import sys
 import time
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import pandas as pd
 
@@ -62,48 +71,102 @@ def score_response(data_source: str, response: str, ground_truth: str) -> float:
 
 
 # ---------------------------------------------------------------------------
-# vLLM generation
+# Backend: local vLLM
 # ---------------------------------------------------------------------------
 
-def load_model(model_path: str, tensor_parallel: int, gpu_memory_utilization: float):
-    from vllm import LLM
-    logger.info(f"Loading model {model_path} (tp={tensor_parallel}, gpu_mem={gpu_memory_utilization})")
-    return LLM(
-        model=model_path,
-        tensor_parallel_size=tensor_parallel,
-        trust_remote_code=True,
-        gpu_memory_utilization=gpu_memory_utilization,
-    )
+class LocalBackend:
+    def __init__(self, args):
+        from vllm import LLM
+        from transformers import AutoTokenizer
+        logger.info(
+            f"Loading model {args.model} "
+            f"(tp={args.tensor_parallel}, gpu_mem={args.gpu_memory_utilization})"
+        )
+        self.tokenizer = AutoTokenizer.from_pretrained(args.model)
+        self.llm = LLM(
+            model=args.model,
+            tensor_parallel_size=args.tensor_parallel,
+            trust_remote_code=True,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+        )
+        self.args = args
+
+    def generate(self, prompts: List[List[dict]]) -> List[List[str]]:
+        """Returns List[List[str]]: n_rollouts responses per prompt."""
+        from vllm import SamplingParams
+        a = self.args
+        sampling_params = SamplingParams(
+            temperature=a.temperature,
+            max_tokens=a.max_tokens,
+            n=a.n_rollouts,
+            top_p=a.top_p,
+            repetition_penalty=a.repetition_penalty,
+        )
+        formatted = [
+            self.tokenizer.apply_chat_template(p, tokenize=False, add_generation_prompt=True)
+            for p in prompts
+        ]
+        outputs = self.llm.generate(formatted, sampling_params)
+        return [[o.text for o in out.outputs] for out in outputs]
 
 
-def generate_rollouts(
-    llm,
-    tokenizer,
-    prompts: List[List[dict]],
-    n_rollouts: int,
-    temperature: float,
-    max_tokens: int,
-    top_p: float,
-    repetition_penalty: float,
-) -> List[List[str]]:
-    """Generate n_rollouts responses per prompt. Returns List[List[str]]."""
-    from vllm import SamplingParams
+# ---------------------------------------------------------------------------
+# Backend: OpenAI-compatible endpoint
+# ---------------------------------------------------------------------------
 
-    sampling_params = SamplingParams(
-        temperature=temperature,
-        max_tokens=max_tokens,
-        n=n_rollouts,
-        top_p=top_p,
-        repetition_penalty=repetition_penalty,
-    )
+class EndpointBackend:
+    """Calls an OpenAI-compatible /v1/chat/completions endpoint.
 
-    formatted = [
-        tokenizer.apply_chat_template(p, tokenize=False, add_generation_prompt=True)
-        for p in prompts
-    ]
+    Sends one request per prompt (n=N_rollouts). Concurrent requests via
+    ThreadPoolExecutor for throughput.
+    """
 
-    outputs = llm.generate(formatted, sampling_params)
-    return [[o.text for o in out.outputs] for out in outputs]
+    def __init__(self, args):
+        import urllib.request  # stdlib only for health check
+        self.endpoint = args.endpoint.rstrip("/")
+        self.model_name = args.endpoint_model
+        self.args = args
+        logger.info(f"Using endpoint {self.endpoint}  model={self.model_name}")
+
+    def _call_one(self, messages: List[dict]) -> List[str]:
+        """Single /v1/chat/completions call, returns list of n_rollouts responses."""
+        import urllib.request, urllib.error
+        a = self.args
+        payload = json.dumps({
+            "model": self.model_name,
+            "messages": messages,
+            "n": a.n_rollouts,
+            "temperature": a.temperature,
+            "max_tokens": a.max_tokens,
+            "top_p": a.top_p,
+        }).encode()
+
+        req = urllib.request.Request(
+            f"{self.endpoint}/v1/chat/completions",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        for attempt in range(4):
+            try:
+                with urllib.request.urlopen(req, timeout=300) as resp:
+                    data = json.loads(resp.read())
+                return [choice["message"]["content"] for choice in data["choices"]]
+            except urllib.error.URLError as e:
+                wait = 2 ** attempt
+                logger.warning(f"Request failed ({e}), retrying in {wait}s...")
+                time.sleep(wait)
+        logger.error("All retries exhausted for one prompt, returning empty responses.")
+        return [""] * a.n_rollouts
+
+    def generate(self, prompts: List[List[dict]]) -> List[List[str]]:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        results = [None] * len(prompts)
+        with ThreadPoolExecutor(max_workers=self.args.endpoint_workers) as pool:
+            futures = {pool.submit(self._call_one, p): i for i, p in enumerate(prompts)}
+            for fut in as_completed(futures):
+                results[futures[fut]] = fut.result()
+        return results
 
 
 # ---------------------------------------------------------------------------
@@ -128,11 +191,9 @@ def get_data_source(row) -> str:
 
 
 def get_prompt(row) -> List[dict]:
-    """Return prompt as list of message dicts."""
     p = row.get("prompt", [])
     if isinstance(p, list):
         return p
-    # numpy array of dicts
     try:
         return list(p)
     except Exception:
@@ -144,98 +205,102 @@ def get_prompt(row) -> List[dict]:
 # ---------------------------------------------------------------------------
 
 def run(args):
-    # --- Load model ---
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
-    llm = load_model(args.model, args.tensor_parallel, args.gpu_memory_utilization)
+    # --- Backend ---
+    if args.backend == "local":
+        backend = LocalBackend(args)
+    else:
+        if not args.endpoint:
+            raise ValueError("--endpoint is required for --backend endpoint")
+        if not args.endpoint_model:
+            raise ValueError("--endpoint-model is required for --backend endpoint")
+        backend = EndpointBackend(args)
 
-    # --- Load dataset ---
+    # --- Dataset ---
     df = load_dataset(args.input)
     total = len(df)
 
-    hard_rows = []
+    hard_df_indices: List[int] = []   # row positions in df → for parquet output
+    meta_records: List[dict] = []     # rollout metadata → for JSONL output
+
     n_processed = 0
     n_hard = 0
     t0 = time.time()
 
-    # Process in batches
-    indices = list(range(total))
-    batch_size = args.batch_size
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+    meta_path = Path(args.meta)
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    meta_fh = meta_path.open("a", encoding="utf-8")
 
-    for batch_start in range(0, total, batch_size):
-        batch_idx = indices[batch_start: batch_start + batch_size]
-        batch = df.iloc[batch_idx]
+    try:
+        for batch_start in range(0, total, args.batch_size):
+            batch_idx = list(range(batch_start, min(batch_start + args.batch_size, total)))
+            batch = df.iloc[batch_idx]
 
-        prompts = [get_prompt(row) for _, row in batch.iterrows()]
-        ground_truths = [get_ground_truth(row) for _, row in batch.iterrows()]
-        data_sources = [get_data_source(row) for _, row in batch.iterrows()]
+            prompts = [get_prompt(row) for _, row in batch.iterrows()]
+            ground_truths = [get_ground_truth(row) for _, row in batch.iterrows()]
+            data_sources = [get_data_source(row) for _, row in batch.iterrows()]
 
-        # Skip rows with no prompt or no ground truth
-        valid_mask = [bool(p) and bool(gt) for p, gt in zip(prompts, ground_truths)]
-        if not any(valid_mask):
+            # Only process rows with both prompt and ground truth
+            valid_indices = [
+                i for i, (p, gt) in enumerate(zip(prompts, ground_truths))
+                if bool(p) and bool(gt)
+            ]
+            if not valid_indices:
+                n_processed += len(batch_idx)
+                continue
+
+            rollouts_batch = backend.generate([prompts[i] for i in valid_indices])
+
+            for local_i, batch_local_i in enumerate(valid_indices):
+                df_row_idx = batch_idx[batch_local_i]
+                responses = rollouts_batch[local_i]
+                gt = ground_truths[batch_local_i]
+                src = data_sources[batch_local_i]
+
+                scores = [score_response(src, r, gt) for r in responses]
+                n_correct = sum(1 for s in scores if s >= args.correct_threshold)
+
+                if n_correct == 0:  # hard question
+                    hard_df_indices.append(df_row_idx)
+
+                    meta = {
+                        "dataset_index": df_row_idx,
+                        "data_source": src,
+                        "ground_truth": gt,
+                        "responses": responses,
+                        "scores": scores,
+                        "n_correct": n_correct,
+                        "n_rollouts": args.n_rollouts,
+                    }
+                    meta_fh.write(json.dumps(meta, ensure_ascii=False) + "\n")
+                    meta_fh.flush()
+                    n_hard += 1
+
             n_processed += len(batch_idx)
-            continue
+            elapsed = time.time() - t0
+            rate = n_processed / max(elapsed, 1e-6)
+            eta = (total - n_processed) / rate
+            logger.info(
+                f"[{n_processed}/{total}] hard={n_hard} "
+                f"({100 * n_hard / max(n_processed, 1):.1f}%)  "
+                f"elapsed={elapsed:.0f}s  ETA={eta:.0f}s"
+            )
+    finally:
+        meta_fh.close()
 
-        # Generate rollouts for valid rows only
-        valid_indices = [i for i, v in enumerate(valid_mask) if v]
-        valid_prompts = [prompts[i] for i in valid_indices]
-
-        rollouts_batch = generate_rollouts(
-            llm=llm,
-            tokenizer=tokenizer,
-            prompts=valid_prompts,
-            n_rollouts=args.n_rollouts,
-            temperature=args.temperature,
-            max_tokens=args.max_tokens,
-            top_p=args.top_p,
-            repetition_penalty=args.repetition_penalty,
-        )
-
-        # Score and filter
-        for local_i, global_i in enumerate(valid_indices):
-            df_row_idx = batch_idx[global_i]
-            row = df.iloc[df_row_idx]
-            responses = rollouts_batch[local_i]
-            gt = ground_truths[global_i]
-            src = data_sources[global_i]
-
-            scores = [score_response(src, r, gt) for r in responses]
-            n_correct = sum(1 for s in scores if s >= args.correct_threshold)
-
-            if n_correct == 0:  # all wrong → hard question
-                record = row.to_dict()
-                record["responses"] = responses
-                record["scores"] = scores
-                record["n_correct"] = n_correct
-                record["n_rollouts"] = args.n_rollouts
-                hard_rows.append(record)
-                n_hard += 1
-
-        n_processed += len(batch_idx)
-        elapsed = time.time() - t0
-        rate = n_processed / elapsed
-        eta = (total - n_processed) / rate if rate > 0 else 0
-
-        logger.info(
-            f"[{n_processed}/{total}] hard={n_hard} "
-            f"({100*n_hard/max(n_processed,1):.1f}%)  "
-            f"elapsed={elapsed:.0f}s  ETA={eta:.0f}s"
-        )
-
-    # --- Save ---
-    if not hard_rows:
-        logger.warning("No hard questions found. Output file not written.")
+    # --- Save parquet (original columns only) ---
+    if not hard_df_indices:
+        logger.warning("No hard questions found. Parquet not written.")
         return
 
-    out_df = pd.DataFrame(hard_rows)
-    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-    out_df.to_parquet(args.output, index=False)
+    hard_df = df.iloc[hard_df_indices].reset_index(drop=True)
+    hard_df.to_parquet(args.output, index=False)
 
     logger.info(
-        f"\nDone. {n_hard}/{total} hard questions "
-        f"({100*n_hard/total:.1f}%) saved to {args.output}"
+        f"\nDone. {n_hard}/{total} hard questions ({100 * n_hard / total:.1f}%)"
     )
-    logger.info(f"Output columns: {list(out_df.columns)}")
+    logger.info(f"  Parquet → {args.output}  ({list(hard_df.columns)})")
+    logger.info(f"  Meta    → {args.meta}")
 
 
 # ---------------------------------------------------------------------------
@@ -248,37 +313,45 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # Required
-    parser.add_argument("--model", required=True,
-                        help="Path to model (HF or local)")
-    parser.add_argument("--input", required=True,
-                        help="Input parquet file (verl format)")
-    parser.add_argument("--output", required=True,
-                        help="Output parquet file for hard questions")
+    # I/O
+    parser.add_argument("--input",  required=True, help="Input parquet file (verl format)")
+    parser.add_argument("--output", required=True, help="Output parquet (original columns only)")
+    parser.add_argument("--meta",   required=True, help="Output JSONL for rollout metadata")
 
-    # Rollout
-    parser.add_argument("--n-rollouts", type=int, default=8,
-                        help="Number of rollouts per question")
-    parser.add_argument("--temperature", type=float, default=0.7,
-                        help="Sampling temperature")
-    parser.add_argument("--max-tokens", type=int, default=4096,
-                        help="Max tokens per rollout")
-    parser.add_argument("--top-p", type=float, default=0.95,
-                        help="Top-p nucleus sampling")
-    parser.add_argument("--repetition-penalty", type=float, default=1.05,
-                        help="Repetition penalty")
+    # Backend
+    parser.add_argument("--backend", choices=["local", "endpoint"], default="local",
+                        help="local = vLLM on GPUs; endpoint = OpenAI-compatible API")
+
+    # Local backend
+    parser.add_argument("--model", default="",
+                        help="[local] Model path (HF or local dir)")
+    parser.add_argument("--tensor-parallel", type=int, default=1,
+                        help="[local] Tensor parallel size")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.85,
+                        help="[local] vLLM GPU memory utilization")
+
+    # Endpoint backend
+    parser.add_argument("--endpoint", default="",
+                        help="[endpoint] Base URL, e.g. http://localhost:8000")
+    parser.add_argument("--endpoint-model", default="",
+                        help="[endpoint] Model name registered at the endpoint")
+    parser.add_argument("--endpoint-workers", type=int, default=16,
+                        help="[endpoint] Concurrent requests to the endpoint")
+
+    # Sampling
+    parser.add_argument("--n-rollouts",          type=int,   default=8)
+    parser.add_argument("--temperature",          type=float, default=0.7)
+    parser.add_argument("--max-tokens",           type=int,   default=4096)
+    parser.add_argument("--top-p",                type=float, default=0.95)
+    parser.add_argument("--repetition-penalty",   type=float, default=1.05)
 
     # Scoring
     parser.add_argument("--correct-threshold", type=float, default=1.0,
-                        help="Score >= this is considered correct (e.g. 1.0 for exact match)")
+                        help="score >= this counts as correct")
 
-    # Hardware
-    parser.add_argument("--tensor-parallel", type=int, default=1,
-                        help="Tensor parallel size for vLLM")
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.85,
-                        help="vLLM GPU memory utilization")
+    # Batching
     parser.add_argument("--batch-size", type=int, default=32,
-                        help="Number of prompts to send to vLLM per batch")
+                        help="Prompts per batch")
 
     return parser.parse_args()
 
