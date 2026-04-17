@@ -114,6 +114,24 @@ class LocalBackend:
 # Backend: OpenAI-compatible endpoint
 # ---------------------------------------------------------------------------
 
+def _extract_text(message: dict) -> str:
+    """Extract full response text from a chat completion message.
+
+    Handles thinking models (Qwen3, DeepSeek-R1, etc.) where the final answer
+    is in 'content' and chain-of-thought is in 'reasoning' / 'reasoning_content'.
+    Wraps thinking in <think>...</think> so compute_score can find \boxed{} in content.
+    """
+    content = message.get("content") or ""
+    # Different APIs use different field names for chain-of-thought
+    reasoning = message.get("reasoning") or message.get("reasoning_content") or ""
+    if reasoning and content:
+        return f"<think>{reasoning}</think>{content}"
+    if reasoning:
+        # Model hit max_tokens mid-think — return raw thinking so scorer can still try
+        return reasoning
+    return content
+
+
 class EndpointBackend:
     """Calls an OpenAI-compatible /v1/chat/completions endpoint.
 
@@ -153,7 +171,7 @@ class EndpointBackend:
                     data = json.loads(resp.read())
                 elapsed = time.time() - t0
                 logger.debug(f"  req {idx+1}/{total} done in {elapsed:.1f}s")
-                return idx, [choice["message"]["content"] for choice in data["choices"]]
+                return idx, [_extract_text(choice["message"]) for choice in data["choices"]]
             except urllib.error.URLError as e:
                 wait = 2 ** attempt
                 logger.warning(f"  req {idx+1}/{total} failed ({e}), retry in {wait}s...")
