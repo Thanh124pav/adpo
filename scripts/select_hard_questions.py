@@ -122,14 +122,13 @@ class EndpointBackend:
     """
 
     def __init__(self, args):
-        import urllib.request  # stdlib only for health check
         self.endpoint = args.endpoint.rstrip("/")
         self.model_name = args.endpoint_model
         self.args = args
         logger.info(f"Using endpoint {self.endpoint}  model={self.model_name}")
 
-    def _call_one(self, messages: List[dict]) -> List[str]:
-        """Single /v1/chat/completions call, returns list of n_rollouts responses."""
+    def _call_one(self, idx: int, messages: List[dict], total: int) -> tuple:
+        """Single /v1/chat/completions call. Returns (idx, List[str])."""
         import urllib.request, urllib.error
         a = self.args
         payload = json.dumps({
@@ -147,25 +146,39 @@ class EndpointBackend:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
+        t0 = time.time()
         for attempt in range(4):
             try:
                 with urllib.request.urlopen(req, timeout=300) as resp:
                     data = json.loads(resp.read())
-                return [choice["message"]["content"] for choice in data["choices"]]
+                elapsed = time.time() - t0
+                logger.debug(f"  req {idx+1}/{total} done in {elapsed:.1f}s")
+                return idx, [choice["message"]["content"] for choice in data["choices"]]
             except urllib.error.URLError as e:
                 wait = 2 ** attempt
-                logger.warning(f"Request failed ({e}), retrying in {wait}s...")
+                logger.warning(f"  req {idx+1}/{total} failed ({e}), retry in {wait}s...")
                 time.sleep(wait)
-        logger.error("All retries exhausted for one prompt, returning empty responses.")
-        return [""] * a.n_rollouts
+        logger.error(f"  req {idx+1}/{total} exhausted all retries, returning empty.")
+        return idx, [""] * a.n_rollouts
 
     def generate(self, prompts: List[List[dict]]) -> List[List[str]]:
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        results = [None] * len(prompts)
+        total = len(prompts)
+        results = [None] * total
+        n_done = 0
+        t0 = time.time()
+        logger.info(f"  Sending {total} requests (workers={self.args.endpoint_workers}, n_rollouts={self.args.n_rollouts})...")
         with ThreadPoolExecutor(max_workers=self.args.endpoint_workers) as pool:
-            futures = {pool.submit(self._call_one, p): i for i, p in enumerate(prompts)}
+            futures = {pool.submit(self._call_one, i, p, total): i for i, p in enumerate(prompts)}
             for fut in as_completed(futures):
-                results[futures[fut]] = fut.result()
+                idx, responses = fut.result()
+                results[idx] = responses
+                n_done += 1
+                if n_done % max(1, total // 10) == 0 or n_done == total:
+                    elapsed = time.time() - t0
+                    rate = n_done / max(elapsed, 1e-6)
+                    eta = (total - n_done) / rate
+                    logger.info(f"  [{n_done}/{total}] {elapsed:.0f}s elapsed  ETA={eta:.0f}s")
         return results
 
 
