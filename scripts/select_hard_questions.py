@@ -158,23 +158,26 @@ class EndpointBackend:
             "top_p": a.top_p,
         }).encode()
 
+        url = f"{self.endpoint}/v1/chat/completions"
         req = urllib.request.Request(
-            f"{self.endpoint}/v1/chat/completions",
+            url,
             data=payload,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
         t0 = time.time()
+        logger.info(f"  req {idx+1}/{total} → sending (n={a.n_rollouts}, max_tokens={a.max_tokens})...")
         for attempt in range(4):
             try:
-                with urllib.request.urlopen(req, timeout=300) as resp:
+                with urllib.request.urlopen(req, timeout=a.request_timeout) as resp:
                     data = json.loads(resp.read())
                 elapsed = time.time() - t0
-                logger.debug(f"  req {idx+1}/{total} done in {elapsed:.1f}s")
+                logger.info(f"  req {idx+1}/{total} ✓ {elapsed:.1f}s")
                 return idx, [_extract_text(choice["message"]) for choice in data["choices"]]
             except urllib.error.URLError as e:
+                elapsed = time.time() - t0
                 wait = 2 ** attempt
-                logger.warning(f"  req {idx+1}/{total} failed ({e}), retry in {wait}s...")
+                logger.warning(f"  req {idx+1}/{total} ✗ {elapsed:.1f}s — {e} — retry in {wait}s...")
                 time.sleep(wait)
         logger.error(f"  req {idx+1}/{total} exhausted all retries, returning empty.")
         return idx, [""] * a.n_rollouts
@@ -369,6 +372,8 @@ def parse_args():
                         help="[endpoint] Model name registered at the endpoint")
     parser.add_argument("--endpoint-workers", type=int, default=16,
                         help="[endpoint] Concurrent requests to the endpoint")
+    parser.add_argument("--request-timeout", type=int, default=600,
+                        help="[endpoint] Per-request HTTP timeout in seconds (default 600 — thinking models are slow)")
 
     # Sampling
     parser.add_argument("--n-rollouts",          type=int,   default=8)
