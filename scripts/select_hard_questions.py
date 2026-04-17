@@ -280,6 +280,7 @@ def run(args):
                         "dataset_index": df_row_idx,
                         "data_source": src,
                         "ground_truth": gt,
+                        "prompt": prompts[batch_local_i],
                         "responses": responses,
                         "scores": scores,
                         "n_correct": n_correct,
