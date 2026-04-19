@@ -169,6 +169,7 @@ class VLLMServer(FromParams):
         self.port = port
         self.server_running_check_url = server_running_check_url
         self.process: Optional[subprocess.Popen] = None
+        self._gpu_idx: Optional[int] = None
 
     def _wait_for_server(
         self,
@@ -234,6 +235,8 @@ class VLLMServer(FromParams):
 
         if self.port is None:
             self.port = get_free_port()
+
+        self._gpu_idx = gpu_idx
 
         def launch_func():
             self._launch_process(gpu_idx, hf_ckpt_path_or_model, log_path)
@@ -319,7 +322,32 @@ class VLLMServer(FromParams):
 
             time.sleep(1)
 
-        # find_and_kill_process(self.port)
-
         self.process.kill()
         self.process.wait()
+
+        # On B200/newer GPUs, vllm worker processes can hold CUDA memory even after
+        # the main process is killed. Force-kill all processes using the GPU device.
+        if self._gpu_idx is not None:
+            self._force_free_gpu_memory(self._gpu_idx)
+
+    def _force_free_gpu_memory(self, gpu_idx: int):
+        """Kill all remaining processes holding CUDA memory on a specific GPU."""
+        device_files = [f"/dev/nvidia{gpu_idx}", f"/dev/nvidia-caps/nvidia-cap{gpu_idx}"]
+        for dev in device_files:
+            try:
+                result = subprocess.run(
+                    ["fuser", dev], text=True, capture_output=True
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    pids = result.stdout.strip().split()
+                    logger.info(
+                        f"Force-killing {len(pids)} process(es) still holding GPU {gpu_idx}: {pids}"
+                    )
+                    subprocess.run(["fuser", "-k", "-9", dev], capture_output=True)
+            except FileNotFoundError:
+                pass  # fuser not available
+            except Exception as e:
+                logger.warning(f"Could not force-free GPU {gpu_idx} memory: {e}")
+
+        # Give the driver time to reclaim memory after process termination
+        time.sleep(5)
