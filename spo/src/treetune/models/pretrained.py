@@ -100,10 +100,11 @@ class DIPreTrainedModelForCasualLM(Model, PreTrainedModel):
                 )
             hf_model_name = runtime_hf_model_name
 
+        use_flash_attn = pretrained_args.pop(
+            "use_flash_attention_2", is_flash_attention_available()
+        )
         kwargs = {
-            "use_flash_attention_2": pretrained_args.pop(
-                "use_flash_attention_2", is_flash_attention_available()
-            ),
+            "attn_implementation": "flash_attention_2" if use_flash_attn else "eager",
             "torch_dtype": pretrained_args.pop("torch_dtype", torch.bfloat16),
             "trust_remote_code": True,
         }
@@ -243,14 +244,14 @@ class DIPreTrainedModel(Model, PreTrainedModel):
             pretrained_args = {}
         # We don't need this as HuggingFace takes care of it
         _ = pretrained_args.pop("device", None)
-        use_flash_attention_2 = pretrained_args.pop(
+        use_flash_attn = pretrained_args.pop(
             "use_flash_attention_2", is_flash_attention_available()
         )
         torch_dtype = pretrained_args.pop("torch_dtype", torch.bfloat16)
         model = AutoModel.from_pretrained(
             hf_model_name,
             **pretrained_args,
-            use_flash_attention_2=use_flash_attention_2,
+            attn_implementation="flash_attention_2" if use_flash_attn else "eager",
             torch_dtype=torch_dtype,
         )
         return model
