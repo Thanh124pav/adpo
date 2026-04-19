@@ -332,22 +332,34 @@ class VLLMServer(FromParams):
 
     def _force_free_gpu_memory(self, gpu_idx: int):
         """Kill all remaining processes holding CUDA memory on a specific GPU."""
-        device_files = [f"/dev/nvidia{gpu_idx}", f"/dev/nvidia-caps/nvidia-cap{gpu_idx}"]
-        for dev in device_files:
-            try:
-                result = subprocess.run(
-                    ["fuser", dev], text=True, capture_output=True
-                )
-                if result.returncode == 0 and result.stdout.strip():
-                    pids = result.stdout.strip().split()
-                    logger.info(
-                        f"Force-killing {len(pids)} process(es) still holding GPU {gpu_idx}: {pids}"
-                    )
-                    subprocess.run(["fuser", "-k", "-9", dev], capture_output=True)
-            except FileNotFoundError:
-                pass  # fuser not available
-            except Exception as e:
-                logger.warning(f"Could not force-free GPU {gpu_idx} memory: {e}")
+        import os
+        import signal
+
+        try:
+            result = subprocess.run(
+                [
+                    "nvidia-smi",
+                    f"--id={gpu_idx}",
+                    "--query-compute-apps=pid",
+                    "--format=csv,noheader",
+                ],
+                text=True,
+                capture_output=True,
+            )
+            pids = [int(p.strip()) for p in result.stdout.splitlines() if p.strip().isdigit()]
+        except Exception as e:
+            logger.warning(f"Could not query GPU {gpu_idx} processes: {e}")
+            pids = []
+
+        if pids:
+            logger.info(f"Force-killing {len(pids)} process(es) still on GPU {gpu_idx}: {pids}")
+            for pid in pids:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass  # already gone
+                except Exception as e:
+                    logger.warning(f"Could not kill PID {pid}: {e}")
 
         # Give the driver time to reclaim memory after process termination
         time.sleep(5)
