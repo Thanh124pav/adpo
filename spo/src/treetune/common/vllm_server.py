@@ -330,63 +330,36 @@ class VLLMServer(FromParams):
         if self._gpu_idx is not None:
             self._force_free_gpu_memory(self._gpu_idx)
 
-    def _force_free_gpu_memory(self, gpu_idx: int, poll_timeout: int = 120, threshold_mb: int = 1024):
-        """Kill all remaining processes on a GPU and wait until memory is actually freed."""
+    def _force_free_gpu_memory(self, gpu_idx: int):
+        """Kill all remaining processes holding CUDA memory on a specific GPU."""
         import os
         import signal
 
-        def get_gpu_pids():
-            try:
-                r = subprocess.run(
-                    ["nvidia-smi", f"--id={gpu_idx}", "--query-compute-apps=pid", "--format=csv,noheader"],
-                    text=True, capture_output=True,
-                )
-                return [int(p.strip()) for p in r.stdout.splitlines() if p.strip().isdigit()]
-            except Exception:
-                return []
+        try:
+            result = subprocess.run(
+                [
+                    "nvidia-smi",
+                    f"--id={gpu_idx}",
+                    "--query-compute-apps=pid",
+                    "--format=csv,noheader",
+                ],
+                text=True,
+                capture_output=True,
+            )
+            pids = [int(p.strip()) for p in result.stdout.splitlines() if p.strip().isdigit()]
+        except Exception as e:
+            logger.warning(f"Could not query GPU {gpu_idx} processes: {e}")
+            pids = []
 
-        def get_gpu_used_mb():
-            try:
-                r = subprocess.run(
-                    ["nvidia-smi", f"--id={gpu_idx}", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
-                    text=True, capture_output=True,
-                )
-                return int(r.stdout.strip())
-            except Exception:
-                return 0
-
-        # Kill all processes still on this GPU
-        for attempt in range(3):
-            pids = get_gpu_pids()
-            if not pids:
-                break
-            logger.info(f"[attempt {attempt+1}] Force-killing {len(pids)} process(es) on GPU {gpu_idx}: {pids}")
+        if pids:
+            logger.info(f"Force-killing {len(pids)} process(es) still on GPU {gpu_idx}: {pids}")
             for pid in pids:
                 try:
                     os.kill(pid, signal.SIGKILL)
                 except ProcessLookupError:
-                    pass
+                    pass  # already gone
                 except Exception as e:
                     logger.warning(f"Could not kill PID {pid}: {e}")
-            time.sleep(2)
 
-        # Poll until memory actually drops below threshold
-        deadline = time.time() + poll_timeout
-        while time.time() < deadline:
-            used_mb = get_gpu_used_mb()
-            logger.info(f"GPU {gpu_idx} memory after vllm stop: {used_mb} MB")
-            if used_mb <= threshold_mb:
-                logger.info(f"GPU {gpu_idx} memory freed successfully.")
-                return
-            # Re-kill any stragglers
-            for pid in get_gpu_pids():
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            time.sleep(3)
-
-        logger.warning(
-            f"GPU {gpu_idx} memory did not drop below {threshold_mb} MB "
-            f"within {poll_timeout}s. Proceeding anyway."
-        )
+        # Give the driver time to reclaim memory after process termination
+        time.sleep(5)
