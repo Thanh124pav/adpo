@@ -33,11 +33,12 @@ Quick start (HuggingFace backend)
 
 Node fields after analysis
 --------------------------
-    name     – hierarchical name ("root", "n1", "n1.2", …)
-    V        – mean fraction of correct leaves reachable from this node  [0, 1]
-    P        – log P(gold_answer | trajectory to node)   [negative float]
-    JSD      – {sibling_name: JSD(V_self, V_sibling)}  ({} for root)
-    correct  – bool (leaves only)
+    name         – hierarchical name ("root", "n1", "n1.2", …)
+    V            – mean fraction of correct leaves reachable from this node  [0, 1]
+    P            – log P(gold_answer | trajectory to node)   [negative float]
+    top_logprobs – [(token, log_prob), …]  top-K next-token distribution
+    JSD          – {sibling_name: JSD(top_logprobs_self, top_logprobs_sibling)}
+    correct      – bool (leaves only)
 """
 
 # ── pipeline ──────────────────────────────────────────────────────────────────
@@ -74,6 +75,8 @@ from .hf_helpers import (
     compute_sequence_logprob_hf,
     build_tree_hf,
     build_tree_hf_async,
+    get_next_token_logprobs_hf,
+    annotate_top_logprobs_hf,
 )
 
 from .vllm_helpers import (
@@ -84,6 +87,9 @@ from .vllm_helpers import (
     extract_leaves,
     extract_all_paths,
     cumulative_logprob,
+    get_next_token_logprobs,
+    annotate_top_logprobs,
+    annotate_top_logprobs_async,
 )
 
 __all__ = [
@@ -108,6 +114,8 @@ __all__ = [
     "compute_sequence_logprob_hf",
     "build_tree_hf",
     "build_tree_hf_async",
+    "get_next_token_logprobs_hf",
+    "annotate_top_logprobs_hf",
     # vLLM backend
     "rollout_with_alpha",
     "compute_sequence_logprob",
@@ -116,4 +124,7 @@ __all__ = [
     "extract_leaves",
     "extract_all_paths",
     "cumulative_logprob",
+    "get_next_token_logprobs",
+    "annotate_top_logprobs",
+    "annotate_top_logprobs_async",
 ]

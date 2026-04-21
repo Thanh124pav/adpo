@@ -1,7 +1,7 @@
 """
 Tree annotation: naming, V (SPO value), P (log-prob), JSD (pairwise, named).
 """
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -46,47 +46,73 @@ def compute_v(
     return node["V"]
 
 
-# ── JSD: pairwise, keyed by sibling name ─────────────────────────────────────
+# ── JSD: pairwise between top-K next-token distributions ─────────────────────
 
-def _binary_jsd(p: float, q: float) -> float:
+def _topk_jsd(
+    dist_i: List[Tuple[str, float]],
+    dist_j: List[Tuple[str, float]],
+) -> float:
     """
-    Jensen-Shannon divergence between Bernoulli(p) and Bernoulli(q).
+    Jensen-Shannon divergence between two top-K next-token log-prob distributions.
 
-    JSD = H(M) − ½[H(P) + H(Q)],  M = (P+Q)/2,  H = binary entropy.
-    Normalised by ln(2) → result in [0, 1].
+    Each distribution is a list of (token_string, log_prob) pairs.
+    Probability mass not covered by the top-K tokens is collected into a
+    shared '<UNK>' bucket so the result is a valid JSD in [0, 1]
+    (normalised by log 2).
     """
-    def _h(x: float) -> float:
-        x = float(np.clip(x, _EPS, 1.0 - _EPS))
-        return -x * np.log(x) - (1.0 - x) * np.log(1.0 - x)
+    def to_prob_dict(dist: List[Tuple[str, float]]) -> Dict[str, float]:
+        d: Dict[str, float] = {}
+        for tok, lp in dist:
+            d[tok] = float(np.exp(lp))
+        total = sum(d.values())
+        if total < 1.0 - _EPS:
+            d["<UNK>"] = 1.0 - total
+        return d
 
-    if abs(p - q) < _EPS:
-        return 0.0
+    pi = to_prob_dict(dist_i)
+    pj = to_prob_dict(dist_j)
+    vocab = sorted(set(pi) | set(pj))
+
+    p = np.array([pi.get(t, 0.0) for t in vocab], dtype=float)
+    q = np.array([pj.get(t, 0.0) for t in vocab], dtype=float)
+
+    p /= p.sum()
+    q /= q.sum()
     m = (p + q) / 2.0
-    return float(np.clip((_h(m) - (_h(p) + _h(q)) / 2.0) / np.log(2.0), 0.0, 1.0))
+
+    def _kl(a: np.ndarray, b: np.ndarray) -> float:
+        mask = a > _EPS
+        return float(np.sum(a[mask] * np.log(a[mask] / b[mask])))
+
+    jsd = (_kl(p, m) + _kl(q, m)) / 2.0
+    return float(np.clip(jsd / np.log(2.0), 0.0, 1.0))
 
 
 def compute_jsd(node: Node) -> None:
     """
     For every node N with siblings S_1 … S_{K-1}, store:
 
-        N["JSD"] = { S_j["name"]: JSD(V_N, V_{S_j})  for j ≠ i }
+        N["JSD"] = { S_j["name"]: JSD(top_logprobs_N, top_logprobs_{S_j})  for j ≠ i }
+
+    JSD is computed between the top-K next-token log-prob distributions stored
+    in node["top_logprobs"] (list of (token, log_prob) pairs).  Call
+    annotate_top_logprobs / annotate_top_logprobs_hf before this function.
 
     Root has no siblings → root["JSD"] = {}.
-    JSD is based on Bernoulli(V) distributions, normalised to [0, 1].
     """
-    node.setdefault("JSD", {})          # root: empty dict
+    node.setdefault("JSD", {})
 
     children = node.get("children", [])
     if not children:
         return
 
     names = [c["name"] for c in children]
-    vs    = [c["V"]    for c in children]
+    dists = [c.get("top_logprobs", []) for c in children]
     k = len(children)
 
     for i, child in enumerate(children):
         child["JSD"] = {
-            names[j]: _binary_jsd(vs[i], vs[j])
+            names[j]: _topk_jsd(dists[i], dists[j])
             for j in range(k) if j != i
         }
 

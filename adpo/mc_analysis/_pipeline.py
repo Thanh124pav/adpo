@@ -12,11 +12,12 @@ Full MC-analysis pipeline.
 Each function returns the annotated tree root Node with the following
 fields set on every node:
 
-    name   – hierarchical name ("root", "n1", "n1.2", …)
-    V      – mean fraction of correct leaves reachable from this node
-    P      – log P(gold_answer | trajectory to this node)  [negative float]
-    JSD    – {sibling_name: JSD(V_self, V_sibling)}  ({} for root)
-    correct – bool (leaves only)
+    name         – hierarchical name ("root", "n1", "n1.2", …)
+    V            – mean fraction of correct leaves reachable from this node
+    P            – log P(gold_answer | trajectory to this node)  [negative float]
+    top_logprobs – [(token, log_prob), …]  top-K next-token distribution
+    JSD          – {sibling_name: JSD(top_logprobs_self, top_logprobs_sibling)}
+    correct      – bool (leaves only)
 """
 import asyncio
 from typing import Any, Callable, Dict, List, Optional, Union
@@ -35,7 +36,6 @@ def _compute_p_tree_vllm(
     server_url: str,
     model_name: str,
 ) -> None:
-    """Compute P for every node using the vLLM backend (sequential)."""
     from .vllm_helpers import compute_sequence_logprob
 
     def _recurse(node: Node) -> None:
@@ -54,7 +54,6 @@ async def _compute_p_tree_vllm_async(
     model_name: str,
     max_concurrent: int = 8,
 ) -> None:
-    """Compute P for every node using the vLLM backend (async/concurrent)."""
     from .vllm_helpers import compute_sequence_logprob
 
     sem = asyncio.Semaphore(max_concurrent)
@@ -93,18 +92,20 @@ def analyse(
     answer_checker: Optional[Callable[[Optional[str], str], bool]] = None,
     extract_answer_fn: Optional[Callable[[str], Optional[str]]] = None,
     compute_p: bool = True,
-    max_p_concurrent: int = 8,
+    top_k_logprobs: int = 20,
+    max_concurrent: int = 8,
 ) -> Node:
     """
     Full MC-analysis pipeline using a vLLM server.
 
     Steps
     -----
-    1. build_tree    – generate the search tree via vLLM
-    2. assign_names  – give every node a hierarchical name
-    3. compute_v     – bottom-up SPO value (mean rollout correctness)
-    4. compute_p     – log P(gold_answer | trajectory) for every node
-    5. compute_jsd   – pairwise JSD between siblings
+    1. build_tree           – generate the search tree via vLLM
+    2. assign_names         – give every node a hierarchical name
+    3. compute_v            – bottom-up SPO value (mean rollout correctness)
+    4. compute_p            – log P(gold_answer | trajectory) for every node
+    5. annotate_top_logprobs – top-K next-token distributions for every node
+    6. compute_jsd          – pairwise JSD between siblings (token distributions)
 
     Parameters
     ----------
@@ -127,7 +128,9 @@ def analyse(
         Defaults to :func:`~._answer_utils.extract_answer`.
     compute_p : bool
         If False, skip the log-prob scoring step (faster).
-    max_p_concurrent : int
+    top_k_logprobs : int
+        Number of top tokens to fetch per node for JSD computation.
+    max_concurrent : int
         Not used in the synchronous path (kept for API symmetry).
 
     Returns
@@ -135,17 +138,13 @@ def analyse(
     Node
         Annotated tree root.
     """
-    from .vllm_helpers import build_tree
+    from .vllm_helpers import build_tree, annotate_top_logprobs
 
-    checker   = answer_checker  or default_answer_checker
-    ext_fn    = extract_answer_fn or extract_answer
-    tkw       = tree_kwargs or {}
+    checker = answer_checker or default_answer_checker
+    ext_fn  = extract_answer_fn or extract_answer
+    tkw     = tree_kwargs or {}
 
-    root = build_tree(
-        server_url, model_name, question,
-        extract_answer_fn=ext_fn,
-        **tkw,
-    )
+    root = build_tree(server_url, model_name, question, extract_answer_fn=ext_fn, **tkw)
 
     assign_names(root)
     compute_v(root, gold_answer, checker)
@@ -153,6 +152,7 @@ def analyse(
     if compute_p:
         _compute_p_tree_vllm(root, gold_answer, server_url, model_name)
 
+    annotate_top_logprobs(root, server_url, model_name, top_k=top_k_logprobs)
     compute_jsd(root)
     return root
 
@@ -167,19 +167,18 @@ async def analyse_async(
     answer_checker: Optional[Callable[[Optional[str], str], bool]] = None,
     extract_answer_fn: Optional[Callable[[str], Optional[str]]] = None,
     compute_p: bool = True,
-    max_p_concurrent: int = 8,
+    top_k_logprobs: int = 20,
+    max_concurrent: int = 8,
 ) -> Node:
-    """Async version of :func:`analyse` — tree-building and P-scoring run concurrently."""
-    from .vllm_helpers import build_tree_async
+    """Async version of :func:`analyse` — tree-building, P-scoring, and logprob annotation run concurrently."""
+    from .vllm_helpers import build_tree_async, annotate_top_logprobs_async
 
-    checker = answer_checker  or default_answer_checker
+    checker = answer_checker or default_answer_checker
     ext_fn  = extract_answer_fn or extract_answer
     tkw     = tree_kwargs or {}
 
     root = await build_tree_async(
-        server_url, model_name, question,
-        extract_answer_fn=ext_fn,
-        **tkw,
+        server_url, model_name, question, extract_answer_fn=ext_fn, **tkw
     )
 
     assign_names(root)
@@ -187,10 +186,12 @@ async def analyse_async(
 
     if compute_p:
         await _compute_p_tree_vllm_async(
-            root, gold_answer, server_url, model_name,
-            max_concurrent=max_p_concurrent,
+            root, gold_answer, server_url, model_name, max_concurrent=max_concurrent
         )
 
+    await annotate_top_logprobs_async(
+        root, server_url, model_name, top_k=top_k_logprobs, max_concurrent=max_concurrent
+    )
     compute_jsd(root)
     return root
 
@@ -200,13 +201,14 @@ async def analyse_async(
 def analyse_hf(
     question: str,
     gold_answer: str,
-    backend,                       # HFBackend instance
+    backend,
     *,
     tree_kwargs: Optional[Dict[str, Any]] = None,
     answer_checker: Optional[Callable[[Optional[str], str], bool]] = None,
     extract_answer_fn: Optional[Callable[[str], Optional[str]]] = None,
     compute_p: bool = True,
-    max_p_concurrent: int = 4,
+    top_k_logprobs: int = 20,
+    max_concurrent: int = 4,
 ) -> Node:
     """
     Full MC-analysis pipeline using a HuggingFace model.
@@ -217,7 +219,7 @@ def analyse_hf(
         Loaded :class:`~.hf_helpers.HFBackend` instance.
     (other parameters identical to :func:`analyse`)
     """
-    checker = answer_checker  or default_answer_checker
+    checker = answer_checker or default_answer_checker
     ext_fn  = extract_answer_fn or extract_answer
     tkw     = tree_kwargs or {}
 
@@ -229,6 +231,7 @@ def analyse_hf(
     if compute_p:
         backend.compute_p_tree(root, gold_answer)
 
+    backend.annotate_top_logprobs(root, top_k=top_k_logprobs)
     compute_jsd(root)
     return root
 
@@ -236,16 +239,17 @@ def analyse_hf(
 async def analyse_hf_async(
     question: str,
     gold_answer: str,
-    backend,                       # HFBackend instance
+    backend,
     *,
     tree_kwargs: Optional[Dict[str, Any]] = None,
     answer_checker: Optional[Callable[[Optional[str], str], bool]] = None,
     extract_answer_fn: Optional[Callable[[str], Optional[str]]] = None,
     compute_p: bool = True,
-    max_p_concurrent: int = 4,
+    top_k_logprobs: int = 20,
+    max_concurrent: int = 4,
 ) -> Node:
     """Async version of :func:`analyse_hf`."""
-    checker = answer_checker  or default_answer_checker
+    checker = answer_checker or default_answer_checker
     ext_fn  = extract_answer_fn or extract_answer
     tkw     = tree_kwargs or {}
 
@@ -255,7 +259,8 @@ async def analyse_hf_async(
     compute_v(root, gold_answer, checker)
 
     if compute_p:
-        await backend.compute_p_tree_async(root, gold_answer, max_concurrent=max_p_concurrent)
+        await backend.compute_p_tree_async(root, gold_answer, max_concurrent=max_concurrent)
 
+    await backend.annotate_top_logprobs_async(root, top_k=top_k_logprobs, max_concurrent=max_concurrent)
     compute_jsd(root)
     return root

@@ -29,7 +29,7 @@ cumulative_logprob(path)    → float        (sum of sum_logprobs along a path)
 """
 
 import asyncio
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import requests
@@ -622,3 +622,90 @@ def cumulative_logprob(path: List[Node]) -> float:
         Sum of ``sum_logprobs`` across all nodes in the path.
     """
     return sum(node.get("sum_logprobs", 0.0) for node in path)
+
+
+# ---------------------------------------------------------------------------
+# 5. Top-K next-token log-probs  (used for JSD between siblings)
+# ---------------------------------------------------------------------------
+
+def get_next_token_logprobs(
+    server_url: str,
+    model_name: str,
+    text: str,
+    top_k: int = 20,
+) -> List[Tuple[str, float]]:
+    """
+    Query the top-K next-token log-probs from vLLM at the end of *text*.
+
+    Uses ``max_tokens=1`` with ``logprobs=top_k`` so vLLM returns the
+    full top-K distribution without generating meaningful output.
+
+    Returns
+    -------
+    List[Tuple[str, float]]
+        ``[(token_string, log_prob), ...]`` sorted by descending log-prob.
+    """
+    r = requests.post(
+        f"{server_url}/completions",
+        json={
+            "model": model_name,
+            "prompt": text,
+            "max_tokens": 1,
+            "logprobs": top_k,
+            "temperature": 0.0,
+        },
+    )
+    r.raise_for_status()
+    choice = r.json()["choices"][0]
+    # top_logprobs[0] is the distribution at the *first* (and only) generated position,
+    # which equals the model's distribution at the end of `text`.
+    top_lps: Dict[str, float] = choice["logprobs"]["top_logprobs"][0]
+    return sorted(top_lps.items(), key=lambda kv: kv[1], reverse=True)
+
+
+def annotate_top_logprobs(
+    root: Node,
+    server_url: str,
+    model_name: str,
+    top_k: int = 20,
+) -> None:
+    """Store top-K next-token log-probs in ``node["top_logprobs"]`` for every node (sequential DFS)."""
+    def _recurse(node: Node) -> None:
+        node["top_logprobs"] = get_next_token_logprobs(
+            server_url, model_name, node["full_text"], top_k
+        )
+        for child in node.get("children", []):
+            _recurse(child)
+
+    _recurse(root)
+
+
+async def annotate_top_logprobs_async(
+    root: Node,
+    server_url: str,
+    model_name: str,
+    top_k: int = 20,
+    max_concurrent: int = 8,
+) -> None:
+    """Store top-K next-token log-probs for every node concurrently."""
+    sem = asyncio.Semaphore(max_concurrent)
+
+    async def _score(node: Node) -> None:
+        async with sem:
+            loop = asyncio.get_event_loop()
+            node["top_logprobs"] = await loop.run_in_executor(
+                None,
+                lambda: get_next_token_logprobs(
+                    server_url, model_name, node["full_text"], top_k
+                ),
+            )
+
+    all_nodes: List[Node] = []
+
+    def _collect(n: Node) -> None:
+        all_nodes.append(n)
+        for c in n.get("children", []):
+            _collect(c)
+
+    _collect(root)
+    await asyncio.gather(*[_score(n) for n in all_nodes])

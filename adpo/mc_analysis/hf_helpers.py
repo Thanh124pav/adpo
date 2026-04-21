@@ -16,7 +16,7 @@ Standalone helpers (require model + tokenizer passed explicitly):
 
 import asyncio
 import textwrap
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -408,6 +408,56 @@ async def build_tree_hf_async(
 
 
 # =============================================================================
+# Top-K next-token log-probs  (used for JSD between siblings)
+# =============================================================================
+
+def get_next_token_logprobs_hf(
+    model,
+    tokenizer,
+    text: str,
+    top_k: int = 20,
+) -> List[Tuple[str, float]]:
+    """
+    Get top-K next-token log-probs at the end of *text* using a HF model.
+
+    Returns
+    -------
+    List[Tuple[str, float]]
+        ``[(token_string, log_prob), ...]`` sorted by descending log-prob.
+    """
+    import torch
+
+    device = next(model.parameters()).device
+    enc = tokenizer(text, return_tensors="pt").to(device)
+    with torch.no_grad():
+        out = model(**enc)
+    log_probs = torch.log_softmax(out.logits[0, -1, :], dim=-1)
+    k = min(top_k, log_probs.shape[-1])
+    top_lps, top_ids = torch.topk(log_probs, k)
+    return [
+        (tokenizer.decode([int(tid)]), float(lp))
+        for tid, lp in zip(top_ids.tolist(), top_lps.tolist())
+    ]
+
+
+def annotate_top_logprobs_hf(
+    model,
+    tokenizer,
+    root: Node,
+    top_k: int = 20,
+) -> None:
+    """Store top-K next-token log-probs in ``node["top_logprobs"]`` for every node (sequential DFS)."""
+    def _recurse(node: Node) -> None:
+        node["top_logprobs"] = get_next_token_logprobs_hf(
+            model, tokenizer, node["full_text"], top_k
+        )
+        for child in node.get("children", []):
+            _recurse(child)
+
+    _recurse(root)
+
+
+# =============================================================================
 # HFBackend class — convenient wrapper that holds model + tokenizer
 # =============================================================================
 
@@ -526,6 +576,43 @@ class HFBackend:
                 await loop.run_in_executor(
                     None,
                     lambda: self.compute_p_for_node(node, gold_answer),
+                )
+
+        all_nodes: List[Node] = []
+
+        def _collect(n: Node) -> None:
+            all_nodes.append(n)
+            for c in n.get("children", []):
+                _collect(c)
+
+        _collect(root)
+        await asyncio.gather(*[_score(n) for n in all_nodes])
+
+    def get_next_token_logprobs(self, text: str, top_k: int = 20) -> List[Tuple[str, float]]:
+        """See :func:`get_next_token_logprobs_hf`."""
+        return get_next_token_logprobs_hf(self.model, self.tokenizer, text, top_k=top_k)
+
+    def annotate_top_logprobs(self, root: Node, top_k: int = 20) -> None:
+        """See :func:`annotate_top_logprobs_hf`."""
+        annotate_top_logprobs_hf(self.model, self.tokenizer, root, top_k=top_k)
+
+    async def annotate_top_logprobs_async(
+        self,
+        root: Node,
+        top_k: int = 20,
+        max_concurrent: int = 4,
+    ) -> None:
+        """Annotate top-K next-token log-probs concurrently (thread-pool)."""
+        sem = asyncio.Semaphore(max_concurrent)
+
+        async def _score(node: Node) -> None:
+            async with sem:
+                loop = asyncio.get_event_loop()
+                node["top_logprobs"] = await loop.run_in_executor(
+                    None,
+                    lambda: get_next_token_logprobs_hf(
+                        self.model, self.tokenizer, node["full_text"], top_k
+                    ),
                 )
 
         all_nodes: List[Node] = []
