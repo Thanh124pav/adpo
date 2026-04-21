@@ -21,13 +21,10 @@ Given a (question, gold_answer) pair:
    Computed via a single ``/v1/completions`` call per node using
    ``vllm_helpers.compute_sequence_logprob``.
 
-4. **Compute JSD** — diversity of the sibling group.  For each set of siblings
-   {S_0, …, S_{k-1}} (children of the same parent), compute the generalised
-   Jensen-Shannon divergence of the group (a single real number shared by
-   every sibling in that group):
-       JSD_group = H( mean_V ) - mean( H(V_i) )    (normalised to [0, 1])
-   where H is binary entropy and V_i = V(S_i).
-   Root node (no siblings) receives JSD = 0.0.
+4. **Compute JSD** — for every node N with siblings S_1, …, S_{K-1}, store
+   K-1 pairwise Jensen-Shannon divergences:
+       N["JSD"] = [ JSD( Bernoulli(V_N), Bernoulli(V_{S_j}) )  for j=1..K-1 ]
+   Each JSD value is normalised to [0, 1].  Root (no siblings) → JSD = [].
 
 5. **Visualise** — draw the annotated tree with matplotlib.  Every node box
    shows: name, truncated text, V, P, JSD.  Node colour encodes V via a
@@ -221,57 +218,48 @@ async def _compute_p_tree_async(
 
 
 # =============================================================================
-# Step 4 — JSD: diversity of sibling group  (single real number per group)
+# Step 4 — JSD: pairwise JSD with each sibling  (K-1 numbers per node)
 # =============================================================================
 
-def _binary_entropy(x: float) -> float:
-    """Binary entropy H(x) = -x log x - (1-x) log(1-x), in nats."""
-    x = float(np.clip(x, _EPS, 1.0 - _EPS))
-    return -x * np.log(x) - (1.0 - x) * np.log(1.0 - x)
+def _binary_jsd(p: float, q: float) -> float:
+    """Jensen-Shannon divergence between Bernoulli(p) and Bernoulli(q).
 
+    JSD(P ‖ Q) = H(M) − ½[H(P) + H(Q)],   M = (P+Q)/2
+    Normalised by ln(2) → result in [0, 1].
 
-def multi_bernoulli_jsd(vs: List[float]) -> float:
-    """Generalised Jensen-Shannon divergence for a group of Bernoulli(V_i).
-
-    JSD_group = H( mean(V_i) ) - mean( H(V_i) )
-
-    Normalised by ln(2) so the result lies in [0, 1]:
-    - 0   → all siblings have identical V  (no diversity)
-    - 1   → maximally diverse (half correct, half incorrect)
-
-    Parameters
-    ----------
-    vs : list of float
-        V values of the siblings (each V ∈ [0, 1]).
-
-    Returns
-    -------
-    float in [0, 1]
+    - 0   when p == q  (identical distributions)
+    - 1   when {p, q} = {0, 1}  (maximally divergent)
     """
-    if len(vs) <= 1:
+    def _h(x: float) -> float:
+        x = float(np.clip(x, _EPS, 1.0 - _EPS))
+        return -x * np.log(x) - (1.0 - x) * np.log(1.0 - x)
+
+    if abs(p - q) < _EPS:
         return 0.0
-    mean_v = float(np.mean(vs))
-    jsd_nats = _binary_entropy(mean_v) - float(np.mean([_binary_entropy(v) for v in vs]))
+    m = (p + q) / 2.0
+    jsd_nats = _h(m) - (_h(p) + _h(q)) / 2.0
     return float(np.clip(jsd_nats / np.log(2.0), 0.0, 1.0))
 
 
 def _compute_jsd(node: Node) -> None:
-    """Assign JSD to every node (in-place, single real number per node).
+    """Assign JSD to every node (in-place).
 
-    All siblings in the same group receive the same JSD value (it is a
-    property of the group, not of an individual node).
-    Root has no siblings → JSD = 0.0.
+    For a node N that is the i-th child among K siblings:
+        N["JSD"] = [ JSD(V_N, V_{S_j})  for j ≠ i ]   (K-1 floats, sibling order)
+
+    JSD is computed between Bernoulli(V_N) and Bernoulli(V_{S_j}).
+    Root has no siblings → root["JSD"] = [].
     """
-    node.setdefault("JSD", 0.0)   # root
+    node.setdefault("JSD", [])   # root
 
     children = node.get("children", [])
     if not children:
         return
 
     vs = [c["V"] for c in children]
-    jsd_val = multi_bernoulli_jsd(vs)
-    for child in children:
-        child["JSD"] = jsd_val
+    k = len(vs)
+    for i, child in enumerate(children):
+        child["JSD"] = [_binary_jsd(vs[i], vs[j]) for j in range(k) if j != i]
 
     for child in children:
         _compute_jsd(child)
@@ -408,12 +396,14 @@ def print_tree(node: Node, indent: int = 0, max_text: int = 60) -> None:
 
     Example::
 
-        [root]      V=0.667  P=0.031  JSD=0.000
+        [root]      V=0.667  P=0.031  JSD=[]
           text: "What is 2+2?"
-          [n1] ✓   V=1.000  P=0.842  JSD=0.918
+          [n1] ✓   V=1.000  P=0.842  JSD=[0.918, 0.000]
             text: "2+2=4, so the answer is \\boxed{4}."
-          [n2] ✗   V=0.000  P=0.003  JSD=0.918
+          [n2] ✗   V=0.000  P=0.003  JSD=[0.918, 0.918]
             text: "I think it's \\boxed{5}."
+          [n3] ✓   V=1.000  P=0.756  JSD=[0.000, 0.918]
+            text: "Clearly 2+2=4."
     """
     name = node.get("name", "?")
     v = node.get("V", 0.0)
@@ -428,8 +418,9 @@ def print_tree(node: Node, indent: int = 0, max_text: int = 60) -> None:
     is_leaf = "answer" in node
     mark = (" ✓" if node.get("correct") else " ✗") if is_leaf else ""
 
+    jsd_str = "[" + ", ".join(f"{j:.3f}" for j in jsd) + "]"
     pad = "  " * indent
-    print(f"{pad}[{name}]{mark:<3}  V={v:.3f}  P={p:.4f}  JSD={jsd:.3f}")
+    print(f"{pad}[{name}]{mark:<3}  V={v:.3f}  P={p:.4f}  JSD={jsd_str}")
     print(f'{pad}  text: "{disp}"')
 
     for child in node.get("children", []):
@@ -490,7 +481,7 @@ def _draw_node(ax, node: Node, x: float, y: float) -> None:
 
     v    = node.get("V", 0.0)
     p    = node.get("P", 0.0)
-    jsd  = node.get("JSD", 0.0)
+    jsd  = node.get("JSD", [])      # list of K-1 floats
     name = node.get("name", "?")
     is_leaf = "answer" in node
 
@@ -532,12 +523,25 @@ def _draw_node(ax, node: Node, x: float, y: float) -> None:
             ha="center", va="top",
             fontsize=_FS - 1, style="italic", color="#2a2a2a", zorder=3)
 
-    # ── V, P, JSD ─────────────────────────────────────────────────────────────
-    stats_y = y - _NH / 2 + 0.82
+    # ── V and P ───────────────────────────────────────────────────────────────
+    stats_y = y - _NH / 2 + 0.88
     ax.text(x, stats_y,
-            f"V: {v:.3f}   P: {p:.4f}   JSD: {jsd:.3f}",
+            f"V: {v:.3f}   P: {p:.4f}",
             ha="center", va="top",
             fontsize=_FS, family="monospace", color="black", zorder=3)
+
+    # ── JSD: list of K-1 pairwise scores ─────────────────────────────────────
+    if jsd:
+        jsd_vals = ", ".join(f"{j:.3f}" for j in jsd)
+        jsd_line = f"JSD:[{jsd_vals}]"
+        # wrap if too wide
+        if len(jsd_line) > _MAX_T + 4:
+            jsd_line = "JSD:[\n " + textwrap.fill(jsd_vals, width=_MAX_T) + "]"
+        ax.text(x, stats_y - 0.38,
+                jsd_line,
+                ha="center", va="top",
+                fontsize=max(_FS - 1, 5), family="monospace",
+                color="#111111", zorder=3)
 
 
 def _all_nodes(root: Node) -> List[Node]:
