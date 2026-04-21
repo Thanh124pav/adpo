@@ -56,17 +56,25 @@ def _topk_jsd(
     Jensen-Shannon divergence between two top-K next-token log-prob distributions.
 
     Each distribution is a list of (token_string, log_prob) pairs.
-    Probability mass not covered by the top-K tokens is collected into a
-    shared '<UNK>' bucket so the result is a valid JSD in [0, 1]
-    (normalised by log 2).
+
+    Union approach: every token that appears in either top-K is included
+    explicitly; tokens absent from one distribution get probability 0 in that
+    distribution (a small approximation: their true probability is non-zero
+    but ≤ the K-th ranked token, typically tiny at K=20).
+
+    Each distribution also has an UNK bucket = 1 − Σ(top-K probs), which
+    captures residual mass for tokens outside both top-K sets.
+
+    The intersection approach (shared tokens only) is NOT used because it
+    collapses to JSD=0 when the two top-K sets are disjoint, which is worse.
+
+    Result is normalised by log 2 → [0, 1].
     """
     def to_prob_dict(dist: List[Tuple[str, float]]) -> Dict[str, float]:
-        d: Dict[str, float] = {}
-        for tok, lp in dist:
-            d[tok] = float(np.exp(lp))
-        total = sum(d.values())
-        if total < 1.0 - _EPS:
-            d["<UNK>"] = 1.0 - total
+        d: Dict[str, float] = {tok: float(np.exp(lp)) for tok, lp in dist}
+        residual = max(0.0, 1.0 - sum(d.values()))
+        if residual > _EPS:
+            d["<UNK>"] = residual
         return d
 
     pi = to_prob_dict(dist_i)
