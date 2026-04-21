@@ -15,11 +15,13 @@ Given a (question, gold_answer) pair:
    - Leaf: V = 1.0 if extracted answer matches gold_answer, else 0.0
    - Internal node: V = mean(V of children)
 
-3. **Compute P** — language-model probability of the gold answer given the
-   trajectory that leads to this node:
-       P(node) = exp( mean_log_prob( gold_answer | full_trajectory_to_node ) )
-   Computed via a single ``/v1/completions`` call per node using
-   ``vllm_helpers.compute_sequence_logprob``.
+3. **Compute P** — log-probability of the gold answer given the trajectory
+   that leads to this node (but NOT including the answer itself):
+       P(node) = log P( gold_answer | trajectory_to_node )
+               = Σ log p(token_i | trajectory_to_node + answer_tokens_<i)
+   Computed via a single ``/v1/completions`` (echo) call per node.
+   P is a negative real number; less negative means the model is more
+   likely to generate the correct answer from this point.
 
 4. **Compute JSD** — for every node N with siblings S_1, …, S_{K-1}, store
    K-1 pairwise Jensen-Shannon divergences:
@@ -151,23 +153,25 @@ def _compute_p_node(
     server_url: str,
     model_name: str,
 ) -> None:
-    """Compute P for a single node via compute_sequence_logprob.
+    """Compute P for a single node.
 
-    P(node) = exp( mean_log_prob(gold_answer | full_trajectory_to_node) )
+    P(node) = log P(gold_answer | trajectory_to_node)
+            = sum of log-probs of gold_answer tokens,
+              conditioned on node["full_text"]  (trajectory up to this node,
+              NOT including the answer itself).
 
-    This is the per-token geometric-mean probability of the gold answer string
-    given everything the model has generated up to and including this node.
-    It is a real number in (0, 1].
+    P is a negative real number; less negative = model assigns higher
+    probability to generating the correct answer from this trajectory.
     """
     from adpo.vllm_helpers import compute_sequence_logprob
 
     result = compute_sequence_logprob(
         server_url=server_url,
         model_name=model_name,
-        prompt=node["full_text"],
-        completion=gold_answer,
+        prompt=node["full_text"],   # trajectory to this node (condition)
+        completion=gold_answer,     # answer string being scored
     )
-    node["P"] = float(np.exp(result["mean_logprob"]))
+    node["P"] = float(result["sum_logprob"])
 
 
 def _compute_p_tree(
@@ -204,7 +208,7 @@ async def _compute_p_tree_async(
                     completion=gold_answer,
                 ),
             )
-            n["P"] = float(np.exp(result["mean_logprob"]))
+            n["P"] = float(result["sum_logprob"])
 
     all_nodes: List[Node] = []
 
@@ -420,7 +424,7 @@ def print_tree(node: Node, indent: int = 0, max_text: int = 60) -> None:
 
     jsd_str = "[" + ", ".join(f"{j:.3f}" for j in jsd) + "]"
     pad = "  " * indent
-    print(f"{pad}[{name}]{mark:<3}  V={v:.3f}  P={p:.4f}  JSD={jsd_str}")
+    print(f"{pad}[{name}]{mark:<3}  V={v:.3f}  P={p:.2f}  JSD={jsd_str}")
     print(f'{pad}  text: "{disp}"')
 
     for child in node.get("children", []):
@@ -526,7 +530,7 @@ def _draw_node(ax, node: Node, x: float, y: float) -> None:
     # ── V and P ───────────────────────────────────────────────────────────────
     stats_y = y - _NH / 2 + 0.88
     ax.text(x, stats_y,
-            f"V: {v:.3f}   P: {p:.4f}",
+            f"V: {v:.3f}   P: {p:.2f}",
             ha="center", va="top",
             fontsize=_FS, family="monospace", color="black", zorder=3)
 
