@@ -15,32 +15,25 @@ Tree structures
   6-6-6  →  branch_factor=6, max_depth=3  ( 259 nodes, 216 leaves)
   8-8-8  →  branch_factor=8, max_depth=3  ( 585 nodes, 512 leaves)
 
-Prerequisites
--------------
-  Start vLLM with prefix-caching enabled (in a separate terminal):
-
-    vllm serve deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \\
-        --port 8000 \\
-        --enable-prefix-caching \\
-        --max-model-len 8192
-
-    vllm serve microsoft/rho-math-1.1b-v0.1 \\
-        --port 8001 \\
-        --enable-prefix-caching \\
-        --max-model-len 8192
-
-  Install: pip install requests numpy
+Install
+-------
+  pip install requests numpy vllm
 
 Usage
 -----
-  # DeepSeek, all three tree configs, save to ./results/
+  # Script starts/stops vLLM automatically
   python run_tree_analysis.py \\
       --model deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \\
       --save-dir ./results/deepseek
 
+  # vLLM already running → skip auto-start
+  python run_tree_analysis.py \\
+      --server http://localhost:8000/v1 \\
+      --no-auto-server \\
+      --model deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+
   # Rho-Math, only 6-6-6, question 0
   python run_tree_analysis.py \\
-      --server http://localhost:8001/v1 \\
       --model microsoft/rho-math-1.1b-v0.1 \\
       --tree 6-6-6 --question-idx 0 \\
       --save-dir ./results/rho
@@ -49,11 +42,15 @@ Usage
 import argparse
 import asyncio
 import json
+import os
+import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
 
-# ── allow running from repo root without installing the package ───────────────
+import requests as _requests
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mc_analysis import analyse_async, print_tree, visualise_html
@@ -86,24 +83,72 @@ SAMPLE_QUESTIONS = [
     },
 ]
 
-# ── tree configurations ───────────────────────────────────────────────────────
 TREE_CONFIGS = {
     "4-4-4": {"branch_factor": 4, "max_depth": 3},
     "6-6-6": {"branch_factor": 6, "max_depth": 3},
     "8-8-8": {"branch_factor": 8, "max_depth": 3},
 }
 
-# ── models ────────────────────────────────────────────────────────────────────
 MODELS = {
     "deepseek": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
     "rho":      "microsoft/rho-math-1.1b-v0.1",
 }
 
 
+# ── vLLM server lifecycle ─────────────────────────────────────────────────────
+
+def _server_ready(url: str, timeout: int = 300) -> bool:
+    """Poll GET /health until the server responds OK, or timeout expires."""
+    health = url.rstrip("/v1").rstrip("/") + "/health"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            r = _requests.get(health, timeout=3)
+            if r.status_code == 200:
+                return True
+        except Exception:
+            pass
+        time.sleep(3)
+    return False
+
+
+def start_vllm(model: str, port: int, max_model_len: int, gpu_memory_utilization: float) -> subprocess.Popen:
+    """Launch `vllm serve` and return the Popen handle."""
+    cmd = [
+        "vllm", "serve", model,
+        "--port",                    str(port),
+        "--enable-prefix-caching",
+        "--max-model-len",           str(max_model_len),
+        "--gpu-memory-utilization",  str(gpu_memory_utilization),
+        "--trust-remote-code",
+    ]
+    print(f"\n[server] Starting: {' '.join(cmd)}\n")
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        preexec_fn=os.setsid,   # new process group so we can kill the whole tree
+    )
+    return proc
+
+
+def stop_vllm(proc: subprocess.Popen) -> None:
+    """Terminate the vLLM server process group."""
+    if proc.poll() is None:
+        print("\n[server] Stopping vLLM...")
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        try:
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        print("[server] Stopped.")
+
+
+# ── analysis ──────────────────────────────────────────────────────────────────
+
 def node_count(b: int, d: int) -> int:
-    if b == 1:
-        return d + 1
-    return (b ** (d + 1) - 1) // (b - 1)
+    return (b ** (d + 1) - 1) // (b - 1) if b > 1 else d + 1
 
 
 async def run_one(
@@ -113,25 +158,20 @@ async def run_one(
     model_name: str,
     tree_config: dict,
     tree_label: str,
-    max_tokens: int = 512,
-    temperature: float = 0.8,
-    top_p: float = 0.95,
-    max_concurrent: int = 16,
-    save_dir: Path = None,
+    max_tokens: int,
+    temperature: float,
+    max_concurrent: int,
+    save_dir: Path,
 ) -> dict:
     bf    = tree_config["branch_factor"]
     depth = tree_config["max_depth"]
-    n_nodes  = node_count(bf, depth)
-    n_leaves = bf ** depth
-
     print(f"\n{'='*64}")
     print(f"  Model : {model_name.split('/')[-1]}")
-    print(f"  Tree  : {tree_label}  ({n_nodes} nodes, {n_leaves} leaves)")
+    print(f"  Tree  : {tree_label}  ({node_count(bf, depth)} nodes, {bf**depth} leaves)")
     print(f"  Q     : {question[:72]}...")
     print(f"{'='*64}")
 
-    t0 = time.perf_counter()
-
+    t0   = time.perf_counter()
     root = await analyse_async(
         question    = question,
         gold_answer = gold_answer,
@@ -142,16 +182,13 @@ async def run_one(
             "branch_factor": bf,
             "max_tokens":    max_tokens,
             "temperature":   temperature,
-            "top_p":         top_p,
         },
         top_k_logprobs = 20,
         max_concurrent = max_concurrent,
     )
-
     elapsed = time.perf_counter() - t0
-    print(f"\n  Done in {elapsed:.1f}s")
-    print(f"  Root V = {root['V']:.3f}   Root P = {root.get('P', float('nan')):.2f}")
-    print()
+
+    print(f"\n  Done in {elapsed:.1f}s  |  V={root['V']:.3f}  P={root.get('P', float('nan')):.2f}")
     print_tree(root)
 
     result = {
@@ -165,56 +202,47 @@ async def run_one(
         "root":        root,
     }
 
-    if save_dir is not None:
-        save_dir.mkdir(parents=True, exist_ok=True)
-        model_short = model_name.split("/")[-1]
-        stem = f"{model_short}_{tree_label}"
+    save_dir.mkdir(parents=True, exist_ok=True)
+    stem  = f"{model_name.split('/')[-1]}_{tree_label}"
 
-        # ── JSON ──────────────────────────────────────────────────────────────
-        json_path = save_dir / f"{stem}.json"
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(result, f, indent=2, default=str)
-        print(f"  JSON  → {json_path}")
+    json_path = save_dir / f"{stem}.json"
+    json_path.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
+    print(f"  JSON  → {json_path}")
 
-        # ── HTML (interactive D3 tree) ─────────────────────────────────────────
-        html_path = save_dir / f"{stem}.html"
-        visualise_html(
-            root,
-            path  = str(html_path),
-            title = f"{model_short} | {tree_label} | V={root['V']:.3f} | {question[:60]}…",
-        )
-        print(f"  HTML  → {html_path}  (open in browser)")
+    html_path = save_dir / f"{stem}.html"
+    visualise_html(
+        root,
+        path  = str(html_path),
+        title = f"{model_name.split('/')[-1]} | {tree_label} | V={root['V']:.3f} | {question[:60]}…",
+    )
+    print(f"  HTML  → {html_path}")
 
     return result
 
 
-async def main(args):
-    server_url = args.server
-    model_name = args.model
-    save_dir   = Path(args.save_dir) if args.save_dir else Path("./results")
-
+async def run_all(args, server_url: str) -> None:
     configs   = {args.tree: TREE_CONFIGS[args.tree]} if args.tree else TREE_CONFIGS
     questions = (
         [SAMPLE_QUESTIONS[int(args.question_idx)]]
         if args.question_idx is not None
         else SAMPLE_QUESTIONS
     )
+    save_dir = Path(args.save_dir)
 
-    print(f"\nvLLM server  : {server_url}")
-    print(f"Model        : {model_name}")
-    print(f"Tree configs : {list(configs)}")
-    print(f"Questions    : {len(questions)}")
-    print(f"Save dir     : {save_dir}")
-    print(f"\n  (server must be running with --enable-prefix-caching)")
+    print(f"\n  server       : {server_url}")
+    print(f"  model        : {args.model}")
+    print(f"  tree configs : {list(configs)}")
+    print(f"  questions    : {len(questions)}")
+    print(f"  save dir     : {save_dir}")
 
-    all_results = []
+    results = []
     for q in questions:
         for label, cfg in configs.items():
             r = await run_one(
                 question      = q["question"],
                 gold_answer   = q["gold_answer"],
                 server_url    = server_url,
-                model_name    = model_name,
+                model_name    = args.model,
                 tree_config   = cfg,
                 tree_label    = label,
                 max_tokens    = args.max_tokens,
@@ -222,33 +250,58 @@ async def main(args):
                 max_concurrent= args.max_concurrent,
                 save_dir      = save_dir,
             )
-            all_results.append(r)
+            results.append(r)
 
     print("\n" + "="*64)
     print(f"{'Tree':<8}  {'V':>6}  {'P':>8}  {'Time(s)':>9}")
     print("-"*64)
-    for r in all_results:
+    for r in results:
         p_str = f"{r['root_P']:.1f}" if r["root_P"] is not None else "N/A"
         print(f"{r['tree_config']:<8}  {r['root_V']:>6.3f}  {p_str:>8}  {r['elapsed_s']:>9.1f}")
     print("="*64)
 
 
+# ── entry point ───────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="mc_analysis — tree analysis script")
-
+    ap.add_argument("--model",   default=MODELS["deepseek"])
     ap.add_argument("--server",  default="http://localhost:8000/v1",
-                    help="vLLM server URL  (default: http://localhost:8000/v1)")
-    ap.add_argument("--model",   default=MODELS["deepseek"],
-                    help=f"Model name on the vLLM server  (default: {MODELS['deepseek']})")
-    ap.add_argument("--tree",    choices=list(TREE_CONFIGS), default=None,
-                    help="Single tree config to run  (default: all three)")
-    ap.add_argument("--question-idx", default=None,
-                    help="Sample question index 0/1/2  (default: all)")
+                    help="vLLM base URL (used when --no-auto-server)")
+    ap.add_argument("--port",    type=int,   default=8000)
+    ap.add_argument("--no-auto-server", action="store_true",
+                    help="Skip auto-start; assume server is already running at --server")
+    ap.add_argument("--max-model-len",  type=int,   default=8192)
+    ap.add_argument("--gpu-memory-utilization", type=float, default=0.90)
+    ap.add_argument("--tree",    choices=list(TREE_CONFIGS), default=None)
+    ap.add_argument("--question-idx", default=None)
     ap.add_argument("--max-tokens",   type=int,   default=512)
     ap.add_argument("--temperature",  type=float, default=0.8)
-    ap.add_argument("--max-concurrent", type=int, default=16,
-                    help="Max concurrent vLLM requests  (default: 16)")
-    ap.add_argument("--save-dir", default="./results",
-                    help="Output directory for JSON + HTML  (default: ./results)")
+    ap.add_argument("--max-concurrent", type=int, default=16)
+    ap.add_argument("--save-dir", default="./results")
+    args = ap.parse_args()
 
-    asyncio.run(main(ap.parse_args()))
+    server_proc = None
+    server_url  = args.server
+
+    try:
+        if not args.no_auto_server:
+            server_proc = start_vllm(
+                model                  = args.model,
+                port                   = args.port,
+                max_model_len          = args.max_model_len,
+                gpu_memory_utilization = args.gpu_memory_utilization,
+            )
+            server_url = f"http://localhost:{args.port}/v1"
+            print(f"[server] Waiting for {server_url} to be ready...")
+            if not _server_ready(server_url):
+                print("[server] ERROR: timed out waiting for vLLM to start.")
+                stop_vllm(server_proc)
+                sys.exit(1)
+            print("[server] Ready.\n")
+
+        asyncio.run(run_all(args, server_url))
+
+    finally:
+        if server_proc is not None:
+            stop_vllm(server_proc)
