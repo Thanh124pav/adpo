@@ -687,7 +687,13 @@ async def annotate_top_logprobs_async(
     top_k: int = 20,
     max_concurrent: int = 8,
 ) -> None:
-    """Store top-K next-token log-probs for every node concurrently."""
+    """Store top-K next-token log-probs for every node concurrently.
+
+    Nodes are processed in ascending order of ``full_text`` length (shallowest
+    first) so that, when vLLM prefix-caching is enabled
+    (``--enable-prefix-caching``), the KV state for each prefix is already
+    cached before deeper nodes that share that prefix are processed.
+    """
     sem = asyncio.Semaphore(max_concurrent)
 
     async def _score(node: Node) -> None:
@@ -708,4 +714,6 @@ async def annotate_top_logprobs_async(
             _collect(c)
 
     _collect(root)
+    # Shallowest nodes first → warms prefix cache for deeper siblings/children
+    all_nodes.sort(key=lambda n: len(n.get("full_text", "")))
     await asyncio.gather(*[_score(n) for n in all_nodes])

@@ -77,6 +77,8 @@ async def _compute_p_tree_vllm_async(
             _collect(c)
 
     _collect(root)
+    # Shallowest first → maximises prefix-cache hits when --enable-prefix-caching is on
+    all_nodes.sort(key=lambda n: len(n.get("full_text", "")))
     await asyncio.gather(*[_score(n) for n in all_nodes])
 
 
