@@ -1,7 +1,8 @@
 """
 run_tree_analysis.py
 ====================
-Sample script: run mc_analysis on two small models with three tree configs.
+Sample script: run mc_analysis on DeepSeek-R1-Distill-Qwen-1.5B or
+Rho-Math-1.1B with three tree configs, then save results as HTML.
 
 Models
 ------
@@ -16,27 +17,33 @@ Tree structures
 
 Prerequisites
 -------------
-  1. Start a vLLM server with prefix-caching enabled, e.g.:
-       python -m vllm.entrypoints.openai.api_server \\
-           --model deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \\
-           --port 8000 \\
-           --enable-prefix-caching \\
-           --max-model-len 8192
+  Start vLLM with prefix-caching enabled (in a separate terminal):
 
-  2. Install: pip install requests numpy matplotlib
+    vllm serve deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \\
+        --port 8000 \\
+        --enable-prefix-caching \\
+        --max-model-len 8192
+
+    vllm serve microsoft/rho-math-1.1b-v0.1 \\
+        --port 8001 \\
+        --enable-prefix-caching \\
+        --max-model-len 8192
+
+  Install: pip install requests numpy
 
 Usage
 -----
-  # vLLM server already running on localhost:8000
-  python run_tree_analysis.py
+  # DeepSeek, all three tree configs, save to ./results/
+  python run_tree_analysis.py \\
+      --model deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \\
+      --save-dir ./results/deepseek
 
-  # Custom server / model
-  python run_tree_analysis.py --server http://gpu-node:8001/v1 \\
-                               --model deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \\
-                               --tree 6-6-6
-
-  # Save plots instead of showing them
-  python run_tree_analysis.py --save-dir ./results
+  # Rho-Math, only 6-6-6, question 0
+  python run_tree_analysis.py \\
+      --server http://localhost:8001/v1 \\
+      --model microsoft/rho-math-1.1b-v0.1 \\
+      --tree 6-6-6 --question-idx 0 \\
+      --save-dir ./results/rho
 """
 
 import argparse
@@ -49,7 +56,7 @@ from pathlib import Path
 # ── allow running from repo root without installing the package ───────────────
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from mc_analysis import analyse_async, print_tree, visualise
+from mc_analysis import analyse_async, print_tree, visualise_html
 
 # ── sample questions ──────────────────────────────────────────────────────────
 SAMPLE_QUESTIONS = [
@@ -64,9 +71,7 @@ SAMPLE_QUESTIONS = [
         "source": "GSM8K",
     },
     {
-        "question": (
-            "Find the largest prime factor of $9879$."
-        ),
+        "question": "Find the largest prime factor of $9879$.",
         "gold_answer": "37",
         "source": "MATH",
     },
@@ -95,11 +100,10 @@ MODELS = {
 }
 
 
-def node_count(branch_factor: int, max_depth: int) -> int:
-    """Total nodes in a complete B-ary tree of given depth."""
-    if branch_factor == 1:
-        return max_depth + 1
-    return (branch_factor ** (max_depth + 1) - 1) // (branch_factor - 1)
+def node_count(b: int, d: int) -> int:
+    if b == 1:
+        return d + 1
+    return (b ** (d + 1) - 1) // (b - 1)
 
 
 async def run_one(
@@ -114,54 +118,51 @@ async def run_one(
     top_p: float = 0.95,
     max_concurrent: int = 16,
     save_dir: Path = None,
-    show_plot: bool = True,
 ) -> dict:
-    bf   = tree_config["branch_factor"]
+    bf    = tree_config["branch_factor"]
     depth = tree_config["max_depth"]
-    n_nodes = node_count(bf, depth)
+    n_nodes  = node_count(bf, depth)
     n_leaves = bf ** depth
 
-    print(f"\n{'='*60}")
+    print(f"\n{'='*64}")
     print(f"  Model : {model_name.split('/')[-1]}")
     print(f"  Tree  : {tree_label}  ({n_nodes} nodes, {n_leaves} leaves)")
-    print(f"  Q     : {question[:70]}...")
-    print(f"{'='*60}")
+    print(f"  Q     : {question[:72]}...")
+    print(f"{'='*64}")
 
     t0 = time.perf_counter()
 
     root = await analyse_async(
-        question      = question,
-        gold_answer   = gold_answer,
-        server_url    = server_url,
-        model_name    = model_name,
-        tree_kwargs   = {
+        question    = question,
+        gold_answer = gold_answer,
+        server_url  = server_url,
+        model_name  = model_name,
+        tree_kwargs = {
             "max_depth":     depth,
             "branch_factor": bf,
             "max_tokens":    max_tokens,
             "temperature":   temperature,
             "top_p":         top_p,
         },
-        top_k_logprobs  = 20,
-        max_concurrent  = max_concurrent,
+        top_k_logprobs = 20,
+        max_concurrent = max_concurrent,
     )
 
     elapsed = time.perf_counter() - t0
     print(f"\n  Done in {elapsed:.1f}s")
     print(f"  Root V = {root['V']:.3f}   Root P = {root.get('P', float('nan')):.2f}")
     print()
-
     print_tree(root)
 
-    # ── save JSON ─────────────────────────────────────────────────────────────
     result = {
         "model":       model_name,
-        "tree":        tree_label,
+        "tree_config": tree_label,
         "question":    question,
         "gold_answer": gold_answer,
         "elapsed_s":   round(elapsed, 2),
         "root_V":      root["V"],
         "root_P":      root.get("P"),
-        "tree":        root,   # full annotated tree (JSON-serialisable)
+        "root":        root,
     }
 
     if save_dir is not None:
@@ -169,53 +170,42 @@ async def run_one(
         model_short = model_name.split("/")[-1]
         stem = f"{model_short}_{tree_label}"
 
+        # ── JSON ──────────────────────────────────────────────────────────────
         json_path = save_dir / f"{stem}.json"
-        with open(json_path, "w") as f:
+        with open(json_path, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2, default=str)
-        print(f"  Saved JSON → {json_path}")
+        print(f"  JSON  → {json_path}")
 
-        fig_path = save_dir / f"{stem}.png"
-        visualise(
+        # ── HTML (interactive D3 tree) ─────────────────────────────────────────
+        html_path = save_dir / f"{stem}.html"
+        visualise_html(
             root,
-            title=f"{model_short} | {tree_label} | V={root['V']:.2f}",
-            show=show_plot,
-            save_path=str(fig_path),
+            path  = str(html_path),
+            title = f"{model_short} | {tree_label} | V={root['V']:.3f} | {question[:60]}…",
         )
-        print(f"  Saved plot → {fig_path}")
-    elif show_plot:
-        visualise(
-            root,
-            title=f"{model_name.split('/')[-1]} | {tree_label} | V={root['V']:.2f}",
-            show=True,
-        )
+        print(f"  HTML  → {html_path}  (open in browser)")
 
     return result
 
 
 async def main(args):
-    server_url  = args.server
-    model_name  = args.model
-    save_dir    = Path(args.save_dir) if args.save_dir else None
-    show_plot   = not args.no_plot
+    server_url = args.server
+    model_name = args.model
+    save_dir   = Path(args.save_dir) if args.save_dir else Path("./results")
 
-    # Which tree configs to run
-    if args.tree:
-        if args.tree not in TREE_CONFIGS:
-            print(f"Unknown tree config '{args.tree}'. Choose from: {list(TREE_CONFIGS)}")
-            sys.exit(1)
-        configs = {args.tree: TREE_CONFIGS[args.tree]}
-    else:
-        configs = TREE_CONFIGS
-
-    # Which questions to run
-    questions = SAMPLE_QUESTIONS if not args.question_idx else \
-                [SAMPLE_QUESTIONS[int(args.question_idx)]]
+    configs   = {args.tree: TREE_CONFIGS[args.tree]} if args.tree else TREE_CONFIGS
+    questions = (
+        [SAMPLE_QUESTIONS[int(args.question_idx)]]
+        if args.question_idx is not None
+        else SAMPLE_QUESTIONS
+    )
 
     print(f"\nvLLM server  : {server_url}")
     print(f"Model        : {model_name}")
     print(f"Tree configs : {list(configs)}")
     print(f"Questions    : {len(questions)}")
-    print(f"\n⚠  Ensure the server was started with --enable-prefix-caching")
+    print(f"Save dir     : {save_dir}")
+    print(f"\n  (server must be running with --enable-prefix-caching)")
 
     all_results = []
     for q in questions:
@@ -231,59 +221,34 @@ async def main(args):
                 temperature   = args.temperature,
                 max_concurrent= args.max_concurrent,
                 save_dir      = save_dir,
-                show_plot     = show_plot,
             )
             all_results.append(r)
 
-    # ── summary table ─────────────────────────────────────────────────────────
-    print("\n" + "="*60)
-    print(f"{'Tree':<8} {'V':>6} {'P':>8} {'Time(s)':>9}")
-    print("-"*60)
+    print("\n" + "="*64)
+    print(f"{'Tree':<8}  {'V':>6}  {'P':>8}  {'Time(s)':>9}")
+    print("-"*64)
     for r in all_results:
         p_str = f"{r['root_P']:.1f}" if r["root_P"] is not None else "N/A"
-        print(f"{r['tree']:<8} {r['root_V']:>6.3f} {p_str:>8} {r['elapsed_s']:>9.1f}")
-    print("="*60)
+        print(f"{r['tree_config']:<8}  {r['root_V']:>6.3f}  {p_str:>8}  {r['elapsed_s']:>9.1f}")
+    print("="*64)
 
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="mc_analysis tree analysis script")
+    ap = argparse.ArgumentParser(description="mc_analysis — tree analysis script")
 
-    p.add_argument(
-        "--server", default="http://localhost:8000/v1",
-        help="vLLM server base URL (default: http://localhost:8000/v1)",
-    )
-    p.add_argument(
-        "--model", default=MODELS["deepseek"],
-        help=f"Model name on the vLLM server (default: {MODELS['deepseek']})",
-    )
-    p.add_argument(
-        "--tree", choices=list(TREE_CONFIGS), default=None,
-        help="Run a single tree config (default: run all three)",
-    )
-    p.add_argument(
-        "--question-idx", default=None,
-        help="Index into sample questions (0/1/2). Default: run all.",
-    )
-    p.add_argument(
-        "--max-tokens", type=int, default=512,
-        help="Max tokens per generation step (default: 512)",
-    )
-    p.add_argument(
-        "--temperature", type=float, default=0.8,
-        help="Sampling temperature (default: 0.8)",
-    )
-    p.add_argument(
-        "--max-concurrent", type=int, default=16,
-        help="Max concurrent vLLM requests (default: 16)",
-    )
-    p.add_argument(
-        "--save-dir", default=None,
-        help="Directory to save JSON results and PNG plots",
-    )
-    p.add_argument(
-        "--no-plot", action="store_true",
-        help="Disable interactive matplotlib windows",
-    )
+    ap.add_argument("--server",  default="http://localhost:8000/v1",
+                    help="vLLM server URL  (default: http://localhost:8000/v1)")
+    ap.add_argument("--model",   default=MODELS["deepseek"],
+                    help=f"Model name on the vLLM server  (default: {MODELS['deepseek']})")
+    ap.add_argument("--tree",    choices=list(TREE_CONFIGS), default=None,
+                    help="Single tree config to run  (default: all three)")
+    ap.add_argument("--question-idx", default=None,
+                    help="Sample question index 0/1/2  (default: all)")
+    ap.add_argument("--max-tokens",   type=int,   default=512)
+    ap.add_argument("--temperature",  type=float, default=0.8)
+    ap.add_argument("--max-concurrent", type=int, default=16,
+                    help="Max concurrent vLLM requests  (default: 16)")
+    ap.add_argument("--save-dir", default="./results",
+                    help="Output directory for JSON + HTML  (default: ./results)")
 
-    args = p.parse_args()
-    asyncio.run(main(args))
+    asyncio.run(main(ap.parse_args()))
