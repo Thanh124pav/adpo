@@ -66,6 +66,7 @@ from ._answer_utils import (
 from ._visualise import (
     print_tree,
     visualise,
+    visualise_html,
 )
 
 # ── backends ──────────────────────────────────────────────────────────────────
@@ -108,6 +109,7 @@ __all__ = [
     # visualisation
     "print_tree",
     "visualise",
+    "visualise_html",
     # HF backend
     "HFBackend",
     "rollout_with_alpha_hf",

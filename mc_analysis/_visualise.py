@@ -3,9 +3,11 @@ Tree visualisation helpers.
 
     print_tree(root)              – ASCII/Unicode summary to stdout
     visualise(root, ...)          – matplotlib figure
+    visualise_html(root, path)    – standalone interactive HTML (D3.js)
 """
+import json
 import textwrap
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 Node = Dict[str, Any]
 
@@ -222,3 +224,217 @@ def visualise(
         plt.show()
 
     return fig
+
+
+# ── HTML / D3 visualisation ───────────────────────────────────────────────────
+
+def _node_to_d3(node: Node) -> Dict[str, Any]:
+    """Convert an annotated Node to a plain dict suitable for D3 hierarchy."""
+    name  = node.get("name", "?")
+    v     = node.get("V")
+    p     = node.get("P")
+    jsd   = node.get("JSD", {})
+    text  = textwrap.shorten(node.get("text", "").replace("\n", " "), width=120)
+
+    label_parts = [f"<b>{name}</b>"]
+    if v is not None:
+        label_parts.append(f"V={v:.3f}")
+    if p is not None:
+        label_parts.append(f"P={p:.2f}")
+
+    jsd_lines = "  ".join(f"{k}:{s:.3f}" for k, s in sorted(jsd.items()))
+    if jsd_lines:
+        label_parts.append(f"JSD: {jsd_lines}")
+
+    d: Dict[str, Any] = {
+        "name":    name,
+        "label":   " | ".join(label_parts),
+        "tooltip": text,
+        "V":       round(v, 4) if v is not None else None,
+        "P":       round(p, 4) if p is not None else None,
+        "correct": node.get("correct"),
+    }
+    children = node.get("children", [])
+    if children:
+        d["children"] = [_node_to_d3(c) for c in children]
+    return d
+
+
+_HTML_TEMPLATE = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{title}</title>
+<style>
+  body {{ margin: 0; background: #1a1a2e; font-family: monospace; color: #eee; }}
+  h2   {{ text-align: center; padding: 10px; margin: 0;
+          font-size: 14px; color: #a0c4ff; }}
+  #tree-container {{ width: 100vw; overflow-x: auto; }}
+  svg  {{ display: block; }}
+  .node circle {{
+    stroke-width: 1.5px;
+    cursor: pointer;
+  }}
+  .node text {{
+    font-size: 11px;
+    fill: #ddd;
+  }}
+  .link {{
+    fill: none;
+    stroke: #555;
+    stroke-width: 1px;
+  }}
+  .tooltip {{
+    position: absolute;
+    background: rgba(0,0,0,.85);
+    border: 1px solid #444;
+    padding: 6px 10px;
+    font-size: 11px;
+    pointer-events: none;
+    max-width: 400px;
+    word-wrap: break-word;
+    border-radius: 4px;
+    color: #eee;
+    display: none;
+  }}
+  .legend {{ text-align: center; font-size: 12px; padding: 4px; color: #aaa; }}
+</style>
+</head>
+<body>
+<h2>{title}</h2>
+<div class="legend">Node colour: <span style="color:#d73027">V=0 (wrong)</span>
+ → <span style="color:#fee08b">V=0.5</span>
+ → <span style="color:#1a9850">V=1 (correct)</span></div>
+<div id="tree-container"></div>
+<div class="tooltip" id="tt"></div>
+
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<script>
+const DATA = {data_json};
+
+// ── colour scale: 0→red, 0.5→yellow, 1→green ────────────────────────────────
+const colour = d3.scaleSequential()
+  .domain([0, 1])
+  .interpolator(d3.interpolateRdYlGn);
+
+// ── layout ───────────────────────────────────────────────────────────────────
+const nodeW = 200, nodeH = 70, hGap = 40, vGap = 90;
+
+const root = d3.hierarchy(DATA);
+const treeLayout = d3.tree()
+  .nodeSize([nodeW + hGap, vGap]);
+
+treeLayout(root);
+
+// Shift so leftmost x >= 0
+const xs = root.descendants().map(d => d.x);
+const xMin = Math.min(...xs);
+root.descendants().forEach(d => {{ d.x -= xMin; }});
+
+const xMax = Math.max(...root.descendants().map(d => d.x));
+const yMax = Math.max(...root.descendants().map(d => d.y));
+const svgW = xMax + nodeW + 60;
+const svgH = yMax + nodeH + 60;
+
+const svg = d3.select("#tree-container").append("svg")
+  .attr("width",  svgW)
+  .attr("height", svgH);
+
+const g = svg.append("g").attr("transform", "translate(30,30)");
+
+// ── links ────────────────────────────────────────────────────────────────────
+g.selectAll(".link")
+  .data(root.links())
+  .join("path")
+  .attr("class", "link")
+  .attr("d", d3.linkVertical()
+    .x(d => d.x + nodeW / 2)
+    .y(d => d.y + nodeH / 2));
+
+// ── nodes ────────────────────────────────────────────────────────────────────
+const node = g.selectAll(".node")
+  .data(root.descendants())
+  .join("g")
+  .attr("class", "node")
+  .attr("transform", d => `translate(${{d.x}},${{d.y}})`);
+
+// Box
+node.append("rect")
+  .attr("width",  nodeW)
+  .attr("height", nodeH)
+  .attr("rx", 6)
+  .attr("fill",   d => d.data.V != null ? colour(d.data.V) : "#555")
+  .attr("stroke", d => {{
+    if (d.data.correct === true)  return "#00ff88";
+    if (d.data.correct === false) return "#ff4444";
+    return "#888";
+  }})
+  .attr("stroke-width", d => d.data.correct != null ? 2.5 : 1);
+
+// Label (HTML via foreignObject for multi-line)
+node.append("foreignObject")
+  .attr("width",  nodeW)
+  .attr("height", nodeH)
+  .append("xhtml:div")
+  .style("font-size",   "10px")
+  .style("padding",     "4px 6px")
+  .style("line-height", "1.4")
+  .style("color",       d => (d.data.V != null && d.data.V > 0.45 && d.data.V < 0.85) ? "#222" : "#111")
+  .style("overflow",    "hidden")
+  .html(d => d.data.label);
+
+// ── tooltip ──────────────────────────────────────────────────────────────────
+const tt = d3.select("#tt");
+node
+  .on("mouseover", (evt, d) => {{
+    tt.style("display", "block")
+      .html(`<b>${{d.data.name}}</b><br>${{d.data.tooltip}}`);
+  }})
+  .on("mousemove", evt => {{
+    tt.style("left", (evt.pageX + 12) + "px")
+      .style("top",  (evt.pageY - 20) + "px");
+  }})
+  .on("mouseout", () => tt.style("display", "none"));
+</script>
+</body>
+</html>
+"""
+
+
+def visualise_html(
+    root: Node,
+    path: str,
+    title: Optional[str] = None,
+) -> str:
+    """
+    Save the annotated tree as a self-contained interactive HTML file.
+
+    Uses D3.js (loaded from CDN) to render a vertical tree layout.
+    Nodes are colour-coded by V (red→yellow→green), leaf borders are
+    green (correct) or red (wrong).  Hover a node to see its full text.
+
+    Parameters
+    ----------
+    root : Node
+        Annotated tree root (output of any ``analyse*`` function).
+    path : str
+        Output file path, e.g. ``"./results/tree.html"``.
+    title : str, optional
+        Page / chart title.
+
+    Returns
+    -------
+    str
+        Absolute path to the saved file.
+    """
+    from pathlib import Path as _Path
+
+    title   = title or f"mc_analysis — {root.get('name', 'root')}  V={root.get('V', '?'):.3f}"
+    d3_data = json.dumps(_node_to_d3(root), ensure_ascii=False)
+    html    = _HTML_TEMPLATE.format(title=title, data_json=d3_data)
+
+    out = _Path(path).expanduser().resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(html, encoding="utf-8")
+    return str(out)
