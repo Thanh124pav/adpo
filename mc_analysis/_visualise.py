@@ -23,7 +23,7 @@ def _jsd_str(node: Node) -> str:
     return f"JSD={{{inner}}}"
 
 
-def print_tree(root: Node, indent: int = 0, width: int = 80) -> None:
+def print_tree(node: Node, indent: int = 0, width: int = 80) -> None:
     """
     Print a compact ASCII representation of the annotated tree.
 
