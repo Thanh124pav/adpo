@@ -302,6 +302,9 @@ def _sample_completions(
             "text": text,
             "full_text": prefix + text,
             "finish_reason": finish_reason,
+            # stop_reason: the actual stop string matched, or None for EOS/length.
+            # vLLM sets this field; it's None when the model stopped naturally.
+            "stop_reason": choice.get("stop_reason"),
         }
 
         if get_logprobs and choice.get("logprobs"):
@@ -320,18 +323,21 @@ def _sample_completions(
 def _is_terminal_node(node: Node, stop: Optional[List[str]]) -> bool:
     """Return True when a node should not be expanded further.
 
-    A node is terminal if:
-    • The model was truncated (finish_reason == "length"), or
-    • Stop sequences were NOT provided (no intermediate stops defined), or
-    • The generated text does NOT end with any of the defined stop sequences
-      (meaning the model stopped naturally → treat as leaf).
+    Logic
+    -----
+    • length  → always terminal (hit max_tokens, can't continue)
+    • no stop sequences defined → always terminal (single-step generation)
+    • stop_reason is not None → model hit one of our stop strings → NOT terminal
+                                (vLLM strips the stop string from text by default,
+                                 so we cannot use text.endswith(); use stop_reason)
+    • stop_reason is None     → model hit natural EOS → terminal (leaf)
     """
     if node["finish_reason"] == "length":
         return True
-    if stop and any(node["text"].endswith(s) for s in stop):
-        # Stopped on an intermediate sequence → continue expanding
-        return False
-    return True  # stopped naturally or no stop sequences → leaf
+    if not stop:
+        return True
+    # stop_reason is the matched stop string (set by vLLM), None means natural EOS
+    return node.get("stop_reason") is None
 
 
 def _assign_answer(

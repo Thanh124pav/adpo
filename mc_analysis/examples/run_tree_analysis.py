@@ -48,6 +48,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import List
 
 import requests as _requests
 
@@ -160,6 +161,7 @@ async def run_one(
     tree_label: str,
     max_tokens: int,
     temperature: float,
+    stop: List[str],
     max_concurrent: int,
     save_dir: Path,
 ) -> dict:
@@ -182,6 +184,9 @@ async def run_one(
             "branch_factor": bf,
             "max_tokens":    max_tokens,
             "temperature":   temperature,
+            # "\n\n" marks end of a reasoning step → expand further at next depth.
+            # Without stop sequences every child is immediately a leaf (flat tree).
+            "stop":          stop or None,
         },
         top_k_logprobs = 20,
         max_concurrent = max_concurrent,
@@ -247,6 +252,7 @@ async def run_all(args, server_url: str) -> None:
                 tree_label    = label,
                 max_tokens    = args.max_tokens,
                 temperature   = args.temperature,
+                stop          = args.stop,
                 max_concurrent= args.max_concurrent,
                 save_dir      = save_dir,
             )
@@ -277,6 +283,9 @@ if __name__ == "__main__":
     ap.add_argument("--question-idx", default=None)
     ap.add_argument("--max-tokens",   type=int,   default=512)
     ap.add_argument("--temperature",  type=float, default=0.8)
+    ap.add_argument("--stop", nargs="+", default=["\n\n"],
+                    help="Stop sequences that mark end of a reasoning step "
+                         "(default: '\\n\\n'). Pass --stop '' to disable.")
     ap.add_argument("--max-concurrent", type=int, default=16)
     ap.add_argument("--save-dir", default="./results")
     args = ap.parse_args()
