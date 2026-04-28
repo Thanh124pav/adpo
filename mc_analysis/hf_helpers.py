@@ -544,10 +544,14 @@ class HFBackend:
 
     def build_tree(self, prompt: str, **kwargs) -> Node:
         """See :func:`build_tree_hf`."""
+        if "max_tokens" in kwargs:
+            kwargs["max_new_tokens"] = kwargs.pop("max_tokens")
         return build_tree_hf(self.model, self.tokenizer, prompt, **kwargs)
 
     async def build_tree_async(self, prompt: str, **kwargs) -> Node:
         """See :func:`build_tree_hf_async`."""
+        if "max_tokens" in kwargs:
+            kwargs["max_new_tokens"] = kwargs.pop("max_tokens")
         return await build_tree_hf_async(self.model, self.tokenizer, prompt, **kwargs)
 
     def compute_p_for_node(self, node: Node, gold_answer: str) -> float:
