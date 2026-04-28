@@ -159,6 +159,22 @@ def find_gpu_pids() -> List[int]:
         return []
 
 
+def _vllm_zombie_pids(pgid: int) -> List[int]:
+    """Return GPU PIDs that belong to a specific process group (our vLLM's pgid).
+
+    Cross-references nvidia-smi output with os.getpgid() so we never touch
+    GPU processes that belong to other jobs on the same machine.
+    """
+    result = []
+    for pid in find_gpu_pids():
+        try:
+            if os.getpgid(pid) == pgid:
+                result.append(pid)
+        except ProcessLookupError:
+            pass
+    return result
+
+
 def restart_vllm_server(
     old_proc: Optional[subprocess.Popen],
     model: str,
@@ -168,20 +184,28 @@ def restart_vllm_server(
 ) -> subprocess.Popen:
     """Kill old vLLM, clear zombie GPU processes via nvidia-smi, start fresh."""
     print("\n[restart] Stopping old vLLM server...")
+    pgid = None
     if old_proc is not None:
+        try:
+            pgid = os.getpgid(old_proc.pid)
+        except ProcessLookupError:
+            pass
         stop_vllm(old_proc)
 
+    # Only kill GPU PIDs that are still in vLLM's own process group.
+    # os.getpgid() filters out any unrelated GPU jobs on the same machine.
     time.sleep(1)
-    zombie_pids = find_gpu_pids()
-    if zombie_pids:
-        print(f"[restart] nvidia-smi found {len(zombie_pids)} zombie GPU PID(s): {zombie_pids}")
-        for pid in zombie_pids:
-            try:
-                os.kill(pid, signal.SIGKILL)
-                print(f"[restart]   killed PID {pid}")
-            except ProcessLookupError:
-                pass
-        time.sleep(2)  # give GPU memory time to be released
+    if pgid is not None:
+        zombie_pids = _vllm_zombie_pids(pgid)
+        if zombie_pids:
+            print(f"[restart] nvidia-smi: killing {len(zombie_pids)} vLLM zombie PID(s) "
+                  f"(pgid={pgid}): {zombie_pids}")
+            for pid in zombie_pids:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            time.sleep(2)  # wait for GPU memory to be released
 
     print("[restart] Starting fresh vLLM server...")
     new_proc = start_vllm(model, port, max_model_len, gpu_memory_utilization)
