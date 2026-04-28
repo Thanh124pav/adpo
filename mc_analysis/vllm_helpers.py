@@ -115,7 +115,7 @@ def rollout_with_alpha(
     if seed is not None:
         payload["seed"] = seed
 
-    response = requests.post(f"{server_url}/completions", json=payload)
+    response = requests.post(f"{server_url}/completions", json=payload, timeout=300)
     response.raise_for_status()
     choice = response.json()["choices"][0]
 
@@ -219,6 +219,7 @@ def compute_sequence_logprob(
                 "logprobs": 1,
                 "echo": True,         # include prompt tokens in the response
             },
+            timeout=120,
         )
         r.raise_for_status()
         return r.json()["choices"][0]["logprobs"]
@@ -290,7 +291,7 @@ def _sample_completions(
     if seed is not None:
         payload["seed"] = seed
 
-    r = requests.post(f"{server_url}/completions", json=payload)
+    r = requests.post(f"{server_url}/completions", json=payload, timeout=300)
     r.raise_for_status()
 
     nodes: List[Node] = []
@@ -670,6 +671,7 @@ def get_next_token_logprobs(
             "logprobs": top_k,
             "temperature": 0.0,
         },
+        timeout=120,
     )
     r.raise_for_status()
     choice = r.json()["choices"][0]
