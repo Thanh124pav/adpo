@@ -302,6 +302,9 @@ def _sample_completions(
             "text": text,
             "full_text": prefix + text,
             "finish_reason": finish_reason,
+            # stop_reason: the actual stop string matched, or None for EOS/length.
+            # vLLM sets this field; it's None when the model stopped naturally.
+            "stop_reason": choice.get("stop_reason"),
         }
 
         if get_logprobs and choice.get("logprobs"):
@@ -320,18 +323,31 @@ def _sample_completions(
 def _is_terminal_node(node: Node, stop: Optional[List[str]]) -> bool:
     """Return True when a node should not be expanded further.
 
-    A node is terminal if:
-    • The model was truncated (finish_reason == "length"), or
-    • Stop sequences were NOT provided (no intermediate stops defined), or
-    • The generated text does NOT end with any of the defined stop sequences
-      (meaning the model stopped naturally → treat as leaf).
+    Two splitting modes
+    ------------------
+    M-token mode  (stop=None, default — same as SPO):
+        max_tokens is the step size.  A node is expanded further unless the
+        model produced a natural EOS before hitting max_tokens.
+        • finish_reason == "length"  → hit M tokens = step boundary → NOT terminal
+        • finish_reason == "stop", stop_reason is None → natural EOS → terminal
+
+    Stop-sequence mode  (stop=[...]):
+        A node is a step boundary only when it ends with a stop string.
+        • stop_reason is not None  → hit stop string → NOT terminal
+        • stop_reason is None      → natural EOS → terminal
+        • finish_reason == "length" → truncated mid-step → terminal
     """
+    if node["finish_reason"] == "stop":
+        # Natural EOS (stop_reason is None) → always a leaf
+        # Hit a stop string (stop_reason is not None) → step boundary → expand
+        return node.get("stop_reason") is None
+
     if node["finish_reason"] == "length":
-        return True
-    if stop and any(node["text"].endswith(s) for s in stop):
-        # Stopped on an intermediate sequence → continue expanding
-        return False
-    return True  # stopped naturally or no stop sequences → leaf
+        # M-token mode: length = step complete → expand further
+        # Stop-seq mode: length = truncated mid-step → treat as leaf
+        return bool(stop)
+
+    return True  # unknown finish_reason → safe default
 
 
 def _assign_answer(
