@@ -5,9 +5,21 @@ import datetime
 import hashlib
 import json
 import random
+import re
 import sys
 from pathlib import Path
 from typing import Dict, List
+
+
+# Patterns appended by MCQ/benchmark datasets that confuse open-ended generation
+_MCQ_NOISE = re.compile(
+    r'\s*[\(\*]*\s*(?:Please\s+answer\s+with\s+an?\s+option|'
+    r'Your\s+answer\s+should\s+be\s+correct|'
+    r'answer\s+with\s+one\s+of\s+the\s+following|'
+    r'\(A\)\s*[\w\s]+\(B\)|'
+    r'Options?:\s*\(A\)).*$',
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def load_parquet_examples(path: str, n: int, seed: int = 42) -> List[Dict]:
@@ -43,6 +55,8 @@ def load_parquet_examples(path: str, n: int, seed: int = 42) -> List[Dict]:
             if isinstance(msg, dict) and msg.get("role") == "user":
                 question = msg["content"]
                 break
+
+        question = _MCQ_NOISE.sub("", question).strip()
 
         rm = row["reward_model"]
         gold_answer = str(rm.get("ground_truth", "")) if isinstance(rm, dict) else str(rm)
