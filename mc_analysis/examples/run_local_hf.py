@@ -40,7 +40,6 @@ Usage
 
 import argparse
 import json
-import random
 import sys
 import time
 from pathlib import Path
@@ -49,6 +48,7 @@ from typing import List
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mc_analysis import HFBackend, analyse_hf, print_tree, visualise_html
+from _utils import append_summary, load_parquet_examples, make_stem
 
 # ── sample questions ──────────────────────────────────────────────────────────
 SAMPLE_QUESTIONS = [
@@ -90,49 +90,6 @@ MODELS = {
 }
 
 
-# ── parquet loader ────────────────────────────────────────────────────────────
-
-def load_parquet_examples(path: str, n: int, seed: int = 42) -> List[dict]:
-    """Load *n* random examples from a verl-format parquet file."""
-    try:
-        import pandas as pd
-    except ImportError:
-        print("[error] pandas not installed. Run: pip install pandas pyarrow")
-        sys.exit(1)
-
-    df = pd.read_parquet(path)
-    if len(df) == 0:
-        print(f"[warn] Parquet file is empty: {path}")
-        return []
-
-    rng = random.Random(seed)
-    indices = rng.sample(range(len(df)), min(n, len(df)))
-    rows = df.iloc[indices]
-
-    examples = []
-    for _, row in rows.iterrows():
-        prompt = row["prompt"]
-        if hasattr(prompt, "tolist"):
-            prompt = prompt.tolist()
-        question = ""
-        for msg in reversed(prompt):
-            if isinstance(msg, dict) and msg.get("role") == "user":
-                question = msg["content"]
-                break
-
-        rm = row["reward_model"]
-        gold_answer = str(rm.get("ground_truth", "")) if isinstance(rm, dict) else str(rm)
-
-        examples.append({
-            "question":    question,
-            "gold_answer": gold_answer,
-            "source":      str(row.get("data_source", "parquet")),
-        })
-
-    print(f"[parquet] Loaded {len(examples)} examples from {path}  (seed={seed})")
-    return examples
-
-
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def node_count(b: int, d: int) -> int:
@@ -142,6 +99,7 @@ def node_count(b: int, d: int) -> int:
 def run_one(
     question:    str,
     gold_answer: str,
+    source:      str,
     backend:     HFBackend,
     model_name:  str,
     tree_config: dict,
@@ -180,6 +138,7 @@ def run_one(
     result = {
         "model":       model_name,
         "tree_config": tree_label,
+        "source":      source,
         "question":    question,
         "gold_answer": gold_answer,
         "elapsed_s":   round(elapsed, 2),
@@ -189,7 +148,7 @@ def run_one(
     }
 
     save_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"{model_name.split('/')[-1]}_{tree_label}"
+    stem = make_stem(model_name, tree_label, question)
 
     json_path = save_dir / f"{stem}.json"
     json_path.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
@@ -203,6 +162,7 @@ def run_one(
     )
     print(f"  HTML  → {html_path}")
 
+    append_summary(save_dir, result, stem)
     return result
 
 
@@ -241,6 +201,7 @@ def run_all(args) -> None:
             r = run_one(
                 question    = q["question"],
                 gold_answer = q["gold_answer"],
+                source      = q.get("source", ""),
                 backend     = backend,
                 model_name  = args.model,
                 tree_config = cfg,

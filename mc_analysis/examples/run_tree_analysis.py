@@ -43,7 +43,6 @@ import argparse
 import asyncio
 import json
 import os
-import random
 import signal
 import subprocess
 import sys
@@ -56,6 +55,7 @@ import requests as _requests
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mc_analysis import analyse_async, print_tree, visualise_html
+from _utils import append_summary, load_parquet_examples, make_stem
 
 # ── sample questions ──────────────────────────────────────────────────────────
 SAMPLE_QUESTIONS = [
@@ -95,57 +95,6 @@ MODELS = {
     "deepseek": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
     "rho":      "microsoft/rho-math-1.1b-v0.1",
 }
-
-
-# ── parquet loader ────────────────────────────────────────────────────────────
-
-def load_parquet_examples(path: str, n: int, seed: int = 42) -> List[dict]:
-    """Load *n* random examples from a verl-format parquet file.
-
-    Schema expected (from data/prepare_datasets.py):
-        prompt        – np.ndarray of {"role":…,"content":…} dicts
-        reward_model  – dict with key "ground_truth"
-        data_source   – str
-    """
-    try:
-        import pandas as pd
-    except ImportError:
-        print("[error] pandas not installed. Run: pip install pandas pyarrow")
-        sys.exit(1)
-
-    df = pd.read_parquet(path)
-    if len(df) == 0:
-        print(f"[warn] Parquet file is empty: {path}")
-        return []
-
-    rng = random.Random(seed)
-    indices = rng.sample(range(len(df)), min(n, len(df)))
-    rows = df.iloc[indices]
-
-    examples = []
-    for _, row in rows.iterrows():
-        # prompt: ndarray or list of message dicts; pick last "user" message
-        prompt = row["prompt"]
-        if hasattr(prompt, "tolist"):
-            prompt = prompt.tolist()
-        question = ""
-        for msg in reversed(prompt):
-            if isinstance(msg, dict) and msg.get("role") == "user":
-                question = msg["content"]
-                break
-
-        # reward_model: dict with "ground_truth" key
-        rm = row["reward_model"]
-        gold_answer = str(rm.get("ground_truth", "")) if isinstance(rm, dict) else str(rm)
-
-        examples.append({
-            "question":    question,
-            "gold_answer": gold_answer,
-            "source":      str(row.get("data_source", "parquet")),
-        })
-
-    print(f"[parquet] Loaded {len(examples)} examples from {path}  (seed={seed})")
-    return examples
 
 
 # ── vLLM server lifecycle ─────────────────────────────────────────────────────
@@ -207,6 +156,7 @@ def node_count(b: int, d: int) -> int:
 async def run_one(
     question: str,
     gold_answer: str,
+    source: str,
     server_url: str,
     model_name: str,
     tree_config: dict,
@@ -253,6 +203,7 @@ async def run_one(
     result = {
         "model":       model_name,
         "tree_config": tree_label,
+        "source":      source,
         "question":    question,
         "gold_answer": gold_answer,
         "elapsed_s":   round(elapsed, 2),
@@ -262,7 +213,7 @@ async def run_one(
     }
 
     save_dir.mkdir(parents=True, exist_ok=True)
-    stem  = f"{model_name.split('/')[-1]}_{tree_label}"
+    stem = make_stem(model_name, tree_label, question)
 
     json_path = save_dir / f"{stem}.json"
     json_path.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
@@ -276,6 +227,7 @@ async def run_one(
     )
     print(f"  HTML  → {html_path}")
 
+    append_summary(save_dir, result, stem)
     return result
 
 
@@ -303,6 +255,7 @@ async def run_all(args, server_url: str) -> None:
             r = await run_one(
                 question      = q["question"],
                 gold_answer   = q["gold_answer"],
+                source        = q.get("source", ""),
                 server_url    = server_url,
                 model_name    = args.model,
                 tree_config   = cfg,
