@@ -21,6 +21,7 @@
 #   --max-len      INT         max_model_len for vLLM (default: 8192)
 #   --gpu-mem      FLOAT       gpu_memory_utilization (default: 0.90)
 #   --no-server                assume vLLM already running at --port
+#   --score-concurrent INT     concurrency for echo/scoring requests (default: 4)
 #   --save-dir     DIR         (default: ./results/server/<model>)
 #
 # Examples:
@@ -55,6 +56,7 @@ PORT=8000
 MAX_LEN=8192
 GPU_MEM=0.90
 NO_SERVER=0
+SCORE_CONCURRENT=4
 SAVE_DIR=""
 
 # ── parse args ────────────────────────────────────────────────────────────────
@@ -69,8 +71,9 @@ while [[ $# -gt 0 ]]; do
     --port)         PORT="$2";         shift 2 ;;
     --max-len)      MAX_LEN="$2";      shift 2 ;;
     --gpu-mem)      GPU_MEM="$2";      shift 2 ;;
-    --no-server)    NO_SERVER=1;       shift   ;;
-    --save-dir)     SAVE_DIR="$2";     shift 2 ;;
+    --no-server)         NO_SERVER=1;            shift   ;;
+    --score-concurrent)  SCORE_CONCURRENT="$2";  shift 2 ;;
+    --save-dir)          SAVE_DIR="$2";           shift 2 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done
@@ -99,10 +102,11 @@ PY_ARGS=(
   --max-model-len "$MAX_LEN"
   --gpu-memory-utilization "$GPU_MEM"
   --save-dir     "$SAVE_DIR"
-  --max-tokens   512
-  --temperature  0.8
-  --max-concurrent 16
-  --num-examples "$NUM_EXAMPLES"
+  --max-tokens        512
+  --temperature       0.8
+  --max-concurrent    8
+  --score-concurrent  "$SCORE_CONCURRENT"
+  --num-examples      "$NUM_EXAMPLES"
   --seed         "$SEED"
   # M-token mode by default (no --stop = SPO default)
 )

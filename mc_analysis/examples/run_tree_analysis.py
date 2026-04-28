@@ -165,6 +165,7 @@ async def run_one(
     temperature: float,
     stop: List[str],
     max_concurrent: int,
+    score_concurrent: int,
     save_dir: Path,
 ) -> dict:
     bf    = tree_config["branch_factor"]
@@ -192,8 +193,9 @@ async def run_one(
             # Pass --stop "\n\n" to use delimiter-based splitting instead.
             "stop":          args.stop or None,
         },
-        top_k_logprobs = 20,
-        max_concurrent = max_concurrent,
+        top_k_logprobs   = 20,
+        max_concurrent   = max_concurrent,
+        score_concurrent = score_concurrent,
     )
     elapsed = time.perf_counter() - t0
 
@@ -253,18 +255,19 @@ async def run_all(args, server_url: str) -> None:
     for q in questions:
         for label, cfg in configs.items():
             r = await run_one(
-                question      = q["question"],
-                gold_answer   = q["gold_answer"],
-                source        = q.get("source", ""),
-                server_url    = server_url,
-                model_name    = args.model,
-                tree_config   = cfg,
-                tree_label    = label,
-                max_tokens    = args.max_tokens,
-                temperature   = args.temperature,
-                stop          = args.stop,
-                max_concurrent= args.max_concurrent,
-                save_dir      = save_dir,
+                question         = q["question"],
+                gold_answer      = q["gold_answer"],
+                source           = q.get("source", ""),
+                server_url       = server_url,
+                model_name       = args.model,
+                tree_config      = cfg,
+                tree_label       = label,
+                max_tokens       = args.max_tokens,
+                temperature      = args.temperature,
+                stop             = args.stop,
+                max_concurrent   = args.max_concurrent,
+                score_concurrent = args.score_concurrent,
+                save_dir         = save_dir,
             )
             results.append(r)
 
@@ -296,7 +299,11 @@ if __name__ == "__main__":
     ap.add_argument("--stop", nargs="*", default=[],
                     help="Stop sequences for delimiter-based step splitting "
                          "(e.g. --stop '\\n\\n'). Default: empty = M-token mode (like SPO).")
-    ap.add_argument("--max-concurrent", type=int, default=16)
+    ap.add_argument("--max-concurrent",   type=int, default=8,
+                    help="Concurrency for tree-building (generation) requests (default 8).")
+    ap.add_argument("--score-concurrent", type=int, default=4,
+                    help="Concurrency for echo/scoring requests — keep low (2–4) to avoid "
+                         "KV-cache exhaustion (default 4).")
     ap.add_argument("--save-dir", default="./results")
     ap.add_argument("--parquet", default=None,
                     help="Path to a verl-format parquet file. "

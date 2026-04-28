@@ -171,8 +171,21 @@ async def analyse_async(
     compute_p: bool = True,
     top_k_logprobs: int = 20,
     max_concurrent: int = 8,
+    score_concurrent: int = 4,
 ) -> Node:
-    """Async version of :func:`analyse` — tree-building, P-scoring, and logprob annotation run concurrently."""
+    """Async version of :func:`analyse` — tree-building, P-scoring, and logprob annotation run concurrently.
+
+    Parameters
+    ----------
+    max_concurrent : int
+        Concurrency for tree-building (generation requests). vLLM handles
+        these well via continuous batching. Default 8.
+    score_concurrent : int
+        Concurrency for echo/scoring requests (compute_p, annotate_top_logprobs).
+        Each scoring call sends long-prompt echo requests that are heavy on the
+        KV cache. Keep this low (2–4) to avoid exhausting the cache and stalling.
+        Default 4.
+    """
     from .vllm_helpers import build_tree_async, annotate_top_logprobs_async
 
     checker = answer_checker or default_answer_checker
@@ -188,11 +201,11 @@ async def analyse_async(
 
     if compute_p:
         await _compute_p_tree_vllm_async(
-            root, gold_answer, server_url, model_name, max_concurrent=max_concurrent
+            root, gold_answer, server_url, model_name, max_concurrent=score_concurrent
         )
 
     await annotate_top_logprobs_async(
-        root, server_url, model_name, top_k=top_k_logprobs, max_concurrent=max_concurrent
+        root, server_url, model_name, top_k=top_k_logprobs, max_concurrent=score_concurrent
     )
     compute_jsd(root)
     return root
