@@ -323,21 +323,31 @@ def _sample_completions(
 def _is_terminal_node(node: Node, stop: Optional[List[str]]) -> bool:
     """Return True when a node should not be expanded further.
 
-    Logic
-    -----
-    • length  → always terminal (hit max_tokens, can't continue)
-    • no stop sequences defined → always terminal (single-step generation)
-    • stop_reason is not None → model hit one of our stop strings → NOT terminal
-                                (vLLM strips the stop string from text by default,
-                                 so we cannot use text.endswith(); use stop_reason)
-    • stop_reason is None     → model hit natural EOS → terminal (leaf)
+    Two splitting modes
+    ------------------
+    M-token mode  (stop=None, default — same as SPO):
+        max_tokens is the step size.  A node is expanded further unless the
+        model produced a natural EOS before hitting max_tokens.
+        • finish_reason == "length"  → hit M tokens = step boundary → NOT terminal
+        • finish_reason == "stop", stop_reason is None → natural EOS → terminal
+
+    Stop-sequence mode  (stop=[...]):
+        A node is a step boundary only when it ends with a stop string.
+        • stop_reason is not None  → hit stop string → NOT terminal
+        • stop_reason is None      → natural EOS → terminal
+        • finish_reason == "length" → truncated mid-step → terminal
     """
+    if node["finish_reason"] == "stop":
+        # Natural EOS (stop_reason is None) → always a leaf
+        # Hit a stop string (stop_reason is not None) → step boundary → expand
+        return node.get("stop_reason") is None
+
     if node["finish_reason"] == "length":
-        return True
-    if not stop:
-        return True
-    # stop_reason is the matched stop string (set by vLLM), None means natural EOS
-    return node.get("stop_reason") is None
+        # M-token mode: length = step complete → expand further
+        # Stop-seq mode: length = truncated mid-step → treat as leaf
+        return bool(stop)
+
+    return True  # unknown finish_reason → safe default
 
 
 def _assign_answer(

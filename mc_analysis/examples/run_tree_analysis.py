@@ -182,11 +182,13 @@ async def run_one(
         tree_kwargs = {
             "max_depth":     depth,
             "branch_factor": bf,
-            "max_tokens":    max_tokens,
+            "max_tokens":    max_tokens,   # tokens per step (SPO default: 256–512)
             "temperature":   temperature,
-            # "\n\n" marks end of a reasoning step → expand further at next depth.
-            # Without stop sequences every child is immediately a leaf (flat tree).
-            "stop":          stop or None,
+            # stop=None → M-token splitting mode (same as SPO):
+            #   generate max_tokens per step, branch at step boundary,
+            #   stop only when model hits natural EOS.
+            # Pass --stop "\n\n" to use delimiter-based splitting instead.
+            "stop":          args.stop or None,
         },
         top_k_logprobs = 20,
         max_concurrent = max_concurrent,
@@ -283,9 +285,9 @@ if __name__ == "__main__":
     ap.add_argument("--question-idx", default=None)
     ap.add_argument("--max-tokens",   type=int,   default=512)
     ap.add_argument("--temperature",  type=float, default=0.8)
-    ap.add_argument("--stop", nargs="+", default=["\n\n"],
-                    help="Stop sequences that mark end of a reasoning step "
-                         "(default: '\\n\\n'). Pass --stop '' to disable.")
+    ap.add_argument("--stop", nargs="*", default=[],
+                    help="Stop sequences for delimiter-based step splitting "
+                         "(e.g. --stop '\\n\\n'). Default: empty = M-token mode (like SPO).")
     ap.add_argument("--max-concurrent", type=int, default=16)
     ap.add_argument("--save-dir", default="./results")
     args = ap.parse_args()
