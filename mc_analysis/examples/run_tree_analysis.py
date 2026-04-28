@@ -43,6 +43,7 @@ import argparse
 import asyncio
 import json
 import os
+import random
 import signal
 import subprocess
 import sys
@@ -94,6 +95,57 @@ MODELS = {
     "deepseek": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
     "rho":      "microsoft/rho-math-1.1b-v0.1",
 }
+
+
+# ── parquet loader ────────────────────────────────────────────────────────────
+
+def load_parquet_examples(path: str, n: int, seed: int = 42) -> List[dict]:
+    """Load *n* random examples from a verl-format parquet file.
+
+    Schema expected (from data/prepare_datasets.py):
+        prompt        – np.ndarray of {"role":…,"content":…} dicts
+        reward_model  – dict with key "ground_truth"
+        data_source   – str
+    """
+    try:
+        import pandas as pd
+    except ImportError:
+        print("[error] pandas not installed. Run: pip install pandas pyarrow")
+        sys.exit(1)
+
+    df = pd.read_parquet(path)
+    if len(df) == 0:
+        print(f"[warn] Parquet file is empty: {path}")
+        return []
+
+    rng = random.Random(seed)
+    indices = rng.sample(range(len(df)), min(n, len(df)))
+    rows = df.iloc[indices]
+
+    examples = []
+    for _, row in rows.iterrows():
+        # prompt: ndarray or list of message dicts; pick last "user" message
+        prompt = row["prompt"]
+        if hasattr(prompt, "tolist"):
+            prompt = prompt.tolist()
+        question = ""
+        for msg in reversed(prompt):
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                question = msg["content"]
+                break
+
+        # reward_model: dict with "ground_truth" key
+        rm = row["reward_model"]
+        gold_answer = str(rm.get("ground_truth", "")) if isinstance(rm, dict) else str(rm)
+
+        examples.append({
+            "question":    question,
+            "gold_answer": gold_answer,
+            "source":      str(row.get("data_source", "parquet")),
+        })
+
+    print(f"[parquet] Loaded {len(examples)} examples from {path}  (seed={seed})")
+    return examples
 
 
 # ── vLLM server lifecycle ─────────────────────────────────────────────────────
@@ -228,12 +280,15 @@ async def run_one(
 
 
 async def run_all(args, server_url: str) -> None:
-    configs   = {args.tree: TREE_CONFIGS[args.tree]} if args.tree else TREE_CONFIGS
-    questions = (
-        [SAMPLE_QUESTIONS[int(args.question_idx)]]
-        if args.question_idx is not None
-        else SAMPLE_QUESTIONS
-    )
+    configs = {args.tree: TREE_CONFIGS[args.tree]} if args.tree else TREE_CONFIGS
+
+    if args.parquet:
+        questions = load_parquet_examples(args.parquet, args.num_examples, args.seed)
+    elif args.question_idx is not None:
+        questions = [SAMPLE_QUESTIONS[int(args.question_idx)]]
+    else:
+        questions = SAMPLE_QUESTIONS
+
     save_dir = Path(args.save_dir)
 
     print(f"\n  server       : {server_url}")
@@ -290,6 +345,13 @@ if __name__ == "__main__":
                          "(e.g. --stop '\\n\\n'). Default: empty = M-token mode (like SPO).")
     ap.add_argument("--max-concurrent", type=int, default=16)
     ap.add_argument("--save-dir", default="./results")
+    ap.add_argument("--parquet", default=None,
+                    help="Path to a verl-format parquet file. "
+                         "Randomly sample --num-examples rows from it.")
+    ap.add_argument("--num-examples", type=int, default=5,
+                    help="Number of random examples to sample from --parquet (default: 5).")
+    ap.add_argument("--seed", type=int, default=42,
+                    help="Random seed for parquet sampling (default: 42).")
     args = ap.parse_args()
 
     server_proc = None

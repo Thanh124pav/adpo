@@ -5,174 +5,111 @@
 # so the model fits in 4 GB VRAM.
 #
 # Requirements:
-#   pip install torch transformers bitsandbytes accelerate numpy
+#   pip install torch transformers bitsandbytes accelerate numpy pandas pyarrow
 #
 # Usage:
-#   bash run_local.sh [deepseek|rho] [4-4-4|6-6-6|8-8-8] [question_idx]
+#   bash run_local.sh [OPTIONS]
+#
+# Options:
+#   --model    deepseek | rho | <full HF model id>   (default: deepseek)
+#   --tree     4-4-4 | 6-6-6 | 8-8-8                (default: 4-4-4)
+#   --question 0 | 1 | 2                             (default: all built-in)
+#   --parquet  PATH                                   load questions from file
+#   --num-examples N                                  random examples from parquet (default: 5)
+#   --seed     INT                                    sampling seed (default: 42)
+#   --int8                                            use 8-bit instead of 4-bit
+#   --fp16                                            no quantization (needs ≥4 GB free)
+#   --save-dir DIR                                    (default: ./results/local/<model>)
 #
 # Examples:
-#   bash run_local.sh                     # deepseek, all trees, all questions
-#   bash run_local.sh deepseek 4-4-4 0   # deepseek, 4-4-4 tree, question 0 only
-#   bash run_local.sh rho 4-4-4           # rho-math, 4-4-4 tree, all questions
+#   # Built-in questions, 4-4-4 tree
+#   bash run_local.sh
+#
+#   # Load 10 random examples from a parquet dataset
+#   bash run_local.sh --parquet ./data/processed/train/gsm8k.parquet --num-examples 10
+#
+#   # Rho-Math, 6-6-6 tree, parquet, seed 123
+#   bash run_local.sh --model rho --tree 6-6-6 \
+#       --parquet ./data/processed/train/math.parquet --num-examples 5 --seed 123
 #
 # Notes:
 #   - 4-4-4 tree (85 nodes)  ≈ 5–15 min on a single consumer GPU
 #   - 6-6-6 tree (259 nodes) ≈ 20–60 min
-#   - 8-8-8 tree (585 nodes) ≈ 1–3 hours  ← only attempt if time permits
-#   - All results saved as JSON + HTML under ./results/local/<model>/
+#   - 8-8-8 tree (585 nodes) ≈ 1–3 hours
 
 set -euo pipefail
 
-# ── args ─────────────────────────────────────────────────────────────────────
-MODEL_KEY="${1:-deepseek}"
-TREE="${2:-4-4-4}"           # single tree; run all three by looping (see below)
-QUESTION_IDX="${3:-}"        # empty = all questions
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# ── model map ────────────────────────────────────────────────────────────────
+# ── defaults ─────────────────────────────────────────────────────────────────
+MODEL_KEY="deepseek"
+TREE="4-4-4"
+QUESTION=""
+PARQUET=""
+NUM_EXAMPLES=5
+SEED=42
+QUANT="--load-in-4bit"
+SAVE_DIR=""
+
+# ── parse args ────────────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --model)        MODEL_KEY="$2";    shift 2 ;;
+    --tree)         TREE="$2";         shift 2 ;;
+    --question)     QUESTION="$2";     shift 2 ;;
+    --parquet)      PARQUET="$2";      shift 2 ;;
+    --num-examples) NUM_EXAMPLES="$2"; shift 2 ;;
+    --seed)         SEED="$2";         shift 2 ;;
+    --int8)         QUANT="--load-in-8bit"; shift ;;
+    --fp16)         QUANT="";          shift ;;
+    --save-dir)     SAVE_DIR="$2";     shift 2 ;;
+    *) echo "Unknown option: $1"; exit 1 ;;
+  esac
+done
+
+# ── model map ─────────────────────────────────────────────────────────────────
 case "$MODEL_KEY" in
   deepseek) MODEL="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B" ;;
   rho)      MODEL="microsoft/rho-math-1.1b-v0.1" ;;
-  *)        echo "Unknown model key '$MODEL_KEY'. Use: deepseek | rho"; exit 1 ;;
+  *)        MODEL="$MODEL_KEY" ;;   # accept full HF model id directly
 esac
 
-SAVE_DIR="./results/local/${MODEL_KEY}"
+[[ -z "$SAVE_DIR" ]] && SAVE_DIR="./results/local/${MODEL_KEY}"
 
-echo "============================================================"
-echo "  Backend  : HuggingFace (local, 4-bit quantization)"
-echo "  Model    : $MODEL"
-echo "  Tree     : $TREE"
-echo "  Save dir : $SAVE_DIR"
-echo "============================================================"
-
-# ── check bitsandbytes ───────────────────────────────────────────────────────
+# ── check deps ────────────────────────────────────────────────────────────────
 python3 -c "import bitsandbytes" 2>/dev/null || {
-  echo "[warn] bitsandbytes not found — installing..."
-  pip install bitsandbytes accelerate --quiet
+  if [[ "$QUANT" == "--load-in-4bit" || "$QUANT" == "--load-in-8bit" ]]; then
+    echo "[warn] bitsandbytes not found — installing..."
+    pip install bitsandbytes accelerate --quiet
+  fi
 }
 
-# ── run via inline Python ────────────────────────────────────────────────────
-# (avoids a separate driver script; all config is right here)
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-python3 - <<PYEOF
-import sys, json, time, asyncio
-from pathlib import Path
-
-sys.path.insert(0, str(Path("$SCRIPT_DIR").resolve().parents[1]))
-
-from mc_analysis import HFBackend, analyse_hf, print_tree, visualise_html
-
-SAMPLE_QUESTIONS = [
-    {
-        "question": (
-            "Janet's ducks lay 16 eggs per day. She eats 3 for breakfast every morning "
-            "and bakes muffins for her friends every day with 4. She sells the remainder "
-            "at the farmers' market daily for \$2 per fresh duck egg. "
-            "How much in dollars does she make every day at the farmers' market?"
-        ),
-        "gold_answer": "18",
-        "source": "GSM8K",
-    },
-    {
-        "question": "Find the largest prime factor of \$9879\$.",
-        "gold_answer": "37",
-        "source": "MATH",
-    },
-    {
-        "question": (
-            "A rectangular garden has a perimeter of 54 meters. "
-            "The length is 3 meters more than twice the width. "
-            "What is the area of the garden in square meters?"
-        ),
-        "gold_answer": "168",
-        "source": "custom",
-    },
-]
-
-TREE_CONFIGS = {
-    "4-4-4": {"branch_factor": 4, "max_depth": 3},
-    "6-6-6": {"branch_factor": 6, "max_depth": 3},
-    "8-8-8": {"branch_factor": 8, "max_depth": 3},
-}
-
-model_name  = "$MODEL"
-tree_label  = "$TREE"
-save_dir    = Path("$SAVE_DIR")
-q_idx_str   = "$QUESTION_IDX"
-
-tree_cfg    = TREE_CONFIGS[tree_label]
-questions   = ([SAMPLE_QUESTIONS[int(q_idx_str)]] if q_idx_str else SAMPLE_QUESTIONS)
-
-print(f"\n[local] Loading model {model_name} in 4-bit...")
-t_load = time.perf_counter()
-backend = HFBackend(
-    model_name,
-    device="cuda",
-    load_in_4bit=True,   # fits 1.5B / 1.1B in ~0.75 / 0.55 GB VRAM
+# ── build args ────────────────────────────────────────────────────────────────
+PY_ARGS=(
+  "$SCRIPT_DIR/run_local_hf.py"
+  --model       "$MODEL"
+  --tree        "$TREE"
+  --save-dir    "$SAVE_DIR"
+  --num-examples "$NUM_EXAMPLES"
+  --seed        "$SEED"
 )
-print(f"[local] Model loaded in {time.perf_counter()-t_load:.1f}s\n")
 
-bf    = tree_cfg["branch_factor"]
-depth = tree_cfg["max_depth"]
-nodes = (bf**(depth+1) - 1) // (bf - 1)
+[[ -n "$QUANT" ]]    && PY_ARGS+=($QUANT)
+[[ -n "$QUESTION" ]] && PY_ARGS+=(--question-idx "$QUESTION")
+[[ -n "$PARQUET" ]]  && PY_ARGS+=(--parquet "$PARQUET")
 
-results = []
-for q in questions:
-    print(f"\n{'='*60}")
-    print(f"  Tree : {tree_label}  ({nodes} nodes, {bf**depth} leaves)")
-    print(f"  Q    : {q['question'][:72]}...")
-    print(f"{'='*60}")
+echo "============================================================"
+echo "  Backend      : HuggingFace (${QUANT:-fp16})"
+echo "  Model        : $MODEL"
+echo "  Tree         : $TREE"
+if [[ -n "$PARQUET" ]]; then
+  echo "  Questions    : $NUM_EXAMPLES random from $PARQUET (seed=$SEED)"
+elif [[ -n "$QUESTION" ]]; then
+  echo "  Question     : #$QUESTION"
+else
+  echo "  Questions    : built-in (3)"
+fi
+echo "  Save dir     : $SAVE_DIR"
+echo "============================================================"
 
-    t0 = time.perf_counter()
-    root = analyse_hf(
-        question    = q["question"],
-        gold_answer = q["gold_answer"],
-        backend     = backend,
-        tree_kwargs = {
-            "max_depth":     depth,
-            "branch_factor": bf,
-            "max_tokens":    256,   # shorter steps → faster on CPU/small GPU
-            "temperature":   0.8,
-            # M-token mode: stop=None (same default as SPO / vLLM script)
-        },
-        top_k_logprobs = 20,
-    )
-    elapsed = time.perf_counter() - t0
-
-    print(f"\n  Done in {elapsed:.1f}s  |  V={root['V']:.3f}")
-    print_tree(root)
-
-    save_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"{model_name.split('/')[-1]}_{tree_label}"
-
-    result = {
-        "model":       model_name,
-        "tree_config": tree_label,
-        "question":    q["question"],
-        "gold_answer": q["gold_answer"],
-        "elapsed_s":   round(elapsed, 2),
-        "root_V":      root["V"],
-        "root_P":      root.get("P"),
-    }
-    results.append(result)
-
-    json_path = save_dir / f"{stem}.json"
-    json_path.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
-    print(f"  JSON → {json_path}")
-
-    html_path = save_dir / f"{stem}.html"
-    visualise_html(
-        root,
-        path  = str(html_path),
-        title = f"{model_name.split('/')[-1]} | {tree_label} | V={root['V']:.3f} | {q['question'][:60]}…",
-    )
-    print(f"  HTML → {html_path}")
-
-print("\n" + "="*60)
-print(f"{'Tree':<8}  {'V':>6}  {'Time(s)':>9}")
-print("-"*60)
-for r in results:
-    print(f"{r['tree_config']:<8}  {r['root_V']:>6.3f}  {r['elapsed_s']:>9.1f}")
-print("="*60)
-PYEOF
+python3 "${PY_ARGS[@]}"
