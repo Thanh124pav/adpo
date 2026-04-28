@@ -496,7 +496,7 @@ class HFBackend:
         **kwargs,
     ):
         import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
         if dtype is None:
             dtype = torch.float16 if "cuda" in device else torch.float32
@@ -508,15 +508,22 @@ class HFBackend:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         load_kw: Dict[str, Any] = dict(
-            torch_dtype=dtype,
             trust_remote_code=True,
             **kwargs,
         )
-        if load_in_8bit:
-            load_kw["load_in_8bit"] = True
-        elif load_in_4bit:
-            load_kw["load_in_4bit"] = True
+
+        # transformers ≥ 4.30 (including 5.x): quantization via BitsAndBytesConfig
+        if load_in_4bit:
+            load_kw["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=dtype,
+            )
+            load_kw["device_map"] = device
+        elif load_in_8bit:
+            load_kw["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+            load_kw["device_map"] = device
         else:
+            load_kw["torch_dtype"] = dtype
             load_kw["device_map"] = device
 
         self.model = AutoModelForCausalLM.from_pretrained(
