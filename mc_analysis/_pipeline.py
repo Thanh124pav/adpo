@@ -193,7 +193,10 @@ async def analyse_async(
     tkw     = tree_kwargs or {}
 
     root = await build_tree_async(
-        server_url, model_name, question, extract_answer_fn=ext_fn, **tkw
+        server_url, model_name, question,
+        extract_answer_fn=ext_fn,
+        max_concurrent=max_concurrent,
+        **tkw,
     )
 
     assign_names(root)
