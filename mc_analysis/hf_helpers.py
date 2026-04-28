@@ -41,10 +41,14 @@ def _resolve_branch_factor(branch_factor: Union[int, List[int]], depth: int) -> 
 
 
 def _is_terminal(node: Node, stop: Optional[List[str]]) -> bool:
+    if node["finish_reason"] == "stop":
+        # stop_reason is None  → natural EOS → leaf
+        # stop_reason is set   → hit stop string → step boundary → expand
+        return node.get("stop_reason") is None
     if node["finish_reason"] == "length":
-        return True
-    if stop and any(node["text"].endswith(s) for s in stop):
-        return False
+        # M-token mode (stop=None): length = step complete → expand
+        # Stop-seq mode (stop=[...]): length = truncated mid-step → leaf
+        return bool(stop)
     return True
 
 
@@ -264,19 +268,27 @@ def _sample_completions_hf(
         gen_ids = out.sequences[seq_idx][prefix_len:]
         text    = tokenizer.decode(gen_ids, skip_special_tokens=True)
 
-        # Determine finish reason
+        # Determine finish reason and stop_reason (mirrors vllm_helpers)
         last_tok = gen_ids[-1].item() if len(gen_ids) > 0 else -1
+        stop_reason: Optional[str] = None
         if last_tok == eos_id:
             finish_reason = "stop"
-        elif stop and any(text.endswith(s) for s in stop):
-            finish_reason = "stop"
+            stop_reason   = None       # natural EOS
+        elif stop:
+            matched = next((s for s in stop if s in text), None)
+            if matched is not None:
+                finish_reason = "stop"
+                stop_reason   = matched  # hit a stop string → step boundary
+            else:
+                finish_reason = "length"
         else:
             finish_reason = "length"
 
         node: Node = {
-            "text": text,
-            "full_text": prefix + text,
+            "text":         text,
+            "full_text":    prefix + text,
             "finish_reason": finish_reason,
+            "stop_reason":  stop_reason,
         }
 
         if get_logprobs and out.scores:
