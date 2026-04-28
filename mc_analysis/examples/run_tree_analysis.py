@@ -236,6 +236,7 @@ async def run_one(
     stop: List[str],
     max_concurrent: int,
     score_concurrent: int,
+    compute_p: bool,
     save_dir: Path,
 ) -> dict:
     bf    = tree_config["branch_factor"]
@@ -266,6 +267,7 @@ async def run_one(
         top_k_logprobs   = 20,
         max_concurrent   = max_concurrent,
         score_concurrent = score_concurrent,
+        compute_p        = compute_p,
     )
     elapsed = time.perf_counter() - t0
 
@@ -351,6 +353,7 @@ def run_all(
             stop             = args.stop,
             max_concurrent   = args.max_concurrent,
             score_concurrent = args.score_concurrent,
+            compute_p        = not args.no_compute_p,
             save_dir         = save_dir,
         ))
         results.append(r)
@@ -410,6 +413,11 @@ if __name__ == "__main__":
                     help="Number of random examples to sample from --parquet (default: 5).")
     ap.add_argument("--seed", type=int, default=42,
                     help="Random seed for parquet sampling (default: 42).")
+    ap.add_argument("--no-compute-p", action="store_true",
+                    help="Skip log P(gold|trajectory) scoring. "
+                         "Saves 2×N echo requests (N=nodes). "
+                         "Recommended for 6-6-6 and larger trees. "
+                         "V and JSD are still computed.")
     args = ap.parse_args()
 
     server_proc = None

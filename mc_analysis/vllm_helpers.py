@@ -219,7 +219,7 @@ def compute_sequence_logprob(
                 "logprobs": 1,
                 "echo": True,         # include prompt tokens in the response
             },
-            timeout=120,
+            timeout=300,
         )
         r.raise_for_status()
         return r.json()["choices"][0]["logprobs"]
@@ -671,7 +671,7 @@ def get_next_token_logprobs(
             "logprobs": top_k,
             "temperature": 0.0,
         },
-        timeout=120,
+        timeout=300,
     )
     r.raise_for_status()
     choice = r.json()["choices"][0]
