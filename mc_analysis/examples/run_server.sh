@@ -23,6 +23,7 @@
 #   --no-server                assume vLLM already running at --port
 #   --score-concurrent INT     concurrency for echo/scoring requests (default: 4)
 #   --no-compute-p             skip P scoring (recommended for 6-6-6 and larger)
+#   --compute-p-inline         compute P inline via answer branch (no echo requests)
 #   --save-dir     DIR         (default: ./results/server/<model>)
 #
 # Examples:
@@ -59,6 +60,7 @@ GPU_MEM=0.90
 NO_SERVER=0
 SCORE_CONCURRENT=4
 NO_COMPUTE_P=""
+COMPUTE_P_INLINE=""
 SAVE_DIR=""
 
 # ── parse args ────────────────────────────────────────────────────────────────
@@ -76,6 +78,7 @@ while [[ $# -gt 0 ]]; do
     --no-server)         NO_SERVER=1;            shift   ;;
     --score-concurrent)  SCORE_CONCURRENT="$2";  shift 2 ;;
     --no-compute-p)      NO_COMPUTE_P="--no-compute-p"; shift ;;
+    --compute-p-inline)  COMPUTE_P_INLINE="--compute-p-inline"; shift ;;
     --save-dir)          SAVE_DIR="$2";           shift 2 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
@@ -117,8 +120,9 @@ PY_ARGS=(
 [[ -n "$TREE" ]]         && PY_ARGS+=(--tree "$TREE")
 [[ -n "$QUESTION" ]]    && PY_ARGS+=(--question-idx "$QUESTION")
 [[ -n "$PARQUET" ]]     && PY_ARGS+=(--parquet "$PARQUET")
-[[ -n "$NO_COMPUTE_P" ]] && PY_ARGS+=($NO_COMPUTE_P)
-[[ "$NO_SERVER" -eq 1 ]] && PY_ARGS+=(--no-auto-server --server "$SERVER_URL")
+[[ -n "$NO_COMPUTE_P" ]]     && PY_ARGS+=($NO_COMPUTE_P)
+[[ -n "$COMPUTE_P_INLINE" ]] && PY_ARGS+=($COMPUTE_P_INLINE)
+[[ "$NO_SERVER" -eq 1 ]]     && PY_ARGS+=(--no-auto-server --server "$SERVER_URL")
 
 echo "============================================================"
 echo "  Backend      : vLLM  (port $PORT)"

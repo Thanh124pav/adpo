@@ -48,7 +48,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import requests as _requests
 
@@ -237,6 +237,7 @@ async def run_one(
     max_concurrent: int,
     score_concurrent: int,
     compute_p: bool,
+    compute_p_inline: bool,
     save_dir: Path,
 ) -> dict:
     bf    = tree_config["branch_factor"]
@@ -268,6 +269,7 @@ async def run_one(
         max_concurrent   = max_concurrent,
         score_concurrent = score_concurrent,
         compute_p        = compute_p,
+        compute_p_inline = compute_p_inline,
     )
     elapsed = time.perf_counter() - t0
 
@@ -354,6 +356,7 @@ def run_all(
             max_concurrent   = args.max_concurrent,
             score_concurrent = args.score_concurrent,
             compute_p        = not args.no_compute_p,
+            compute_p_inline = args.compute_p_inline,
             save_dir         = save_dir,
         ))
         results.append(r)
@@ -418,6 +421,11 @@ if __name__ == "__main__":
                          "Saves 2×N echo requests (N=nodes). "
                          "Recommended for 6-6-6 and larger trees. "
                          "V and JSD are still computed.")
+    ap.add_argument("--compute-p-inline", action="store_true",
+                    help="Compute P inline during tree building via one free-form "
+                         "'answer branch' per expanding node (no echo requests). "
+                         "Faster than post-hoc scoring; automatically disables "
+                         "--no-compute-p echo phase.")
     args = ap.parse_args()
 
     server_proc = None

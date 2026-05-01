@@ -94,6 +94,7 @@ def analyse(
     answer_checker: Optional[Callable[[Optional[str], str], bool]] = None,
     extract_answer_fn: Optional[Callable[[str], Optional[str]]] = None,
     compute_p: bool = True,
+    compute_p_inline: bool = False,
     top_k_logprobs: int = 20,
     max_concurrent: int = 8,
 ) -> Node:
@@ -130,6 +131,10 @@ def analyse(
         Defaults to :func:`~._answer_utils.extract_answer`.
     compute_p : bool
         If False, skip the log-prob scoring step (faster).
+    compute_p_inline : bool
+        If True, compute P during tree building via one free-form "answer
+        branch" per expanding node (no echo requests needed).  Supersedes
+        the post-hoc ``compute_p`` echo scoring when enabled.
     top_k_logprobs : int
         Number of top tokens to fetch per node for JSD computation.
     max_concurrent : int
@@ -146,12 +151,17 @@ def analyse(
     ext_fn  = extract_answer_fn or extract_answer
     tkw     = tree_kwargs or {}
 
-    root = build_tree(server_url, model_name, question, extract_answer_fn=ext_fn, **tkw)
+    root = build_tree(
+        server_url, model_name, question,
+        extract_answer_fn=ext_fn,
+        compute_p_inline=compute_p_inline,
+        **tkw,
+    )
 
     assign_names(root)
     compute_v(root, gold_answer, checker)
 
-    if compute_p:
+    if compute_p and not compute_p_inline:
         _compute_p_tree_vllm(root, gold_answer, server_url, model_name)
 
     annotate_top_logprobs(root, server_url, model_name, top_k=top_k_logprobs)
@@ -169,6 +179,7 @@ async def analyse_async(
     answer_checker: Optional[Callable[[Optional[str], str], bool]] = None,
     extract_answer_fn: Optional[Callable[[str], Optional[str]]] = None,
     compute_p: bool = True,
+    compute_p_inline: bool = False,
     top_k_logprobs: int = 20,
     max_concurrent: int = 8,
     score_concurrent: int = 4,
@@ -185,6 +196,10 @@ async def analyse_async(
         Each scoring call sends long-prompt echo requests that are heavy on the
         KV cache. Keep this low (2–4) to avoid exhausting the cache and stalling.
         Default 4.
+    compute_p_inline : bool
+        If True, compute P during tree building via one free-form "answer
+        branch" per expanding node.  No echo requests are fired; the
+        ``compute_p`` post-hoc scoring phase is skipped automatically.
     """
     from .vllm_helpers import build_tree_async, annotate_top_logprobs_async
 
@@ -196,13 +211,14 @@ async def analyse_async(
         server_url, model_name, question,
         extract_answer_fn=ext_fn,
         max_concurrent=max_concurrent,
+        compute_p_inline=compute_p_inline,
         **tkw,
     )
 
     assign_names(root)
     compute_v(root, gold_answer, checker)
 
-    if compute_p:
+    if compute_p and not compute_p_inline:
         await _compute_p_tree_vllm_async(
             root, gold_answer, server_url, model_name, max_concurrent=score_concurrent
         )

@@ -363,6 +363,28 @@ def _assign_answer(
         node["answer"] = node["text"]
 
 
+def _is_short_answer(text: str) -> bool:
+    """Return True for bare short answers that look like a single value (no whitespace)."""
+    stripped = text.strip()
+    return bool(stripped) and len(stripped.split()) == 1
+
+
+def _normalize_p_answer(raw_answer: str, is_internal: bool) -> str:
+    """Normalize an extracted answer string for the inline-P answer branch.
+
+    - Internal nodes: prefix with '...' so the model treats it as a continuation
+    - Short answers (single token): wrap in LaTeX boxed format for cleaner display
+    """
+    raw_answer = raw_answer.strip()
+    if is_internal:
+        if _is_short_answer(raw_answer):
+            return f"...The final answer is \\boxed{{{raw_answer}}}"
+        return "..." + raw_answer
+    if _is_short_answer(raw_answer):
+        return f"The final answer is \\boxed{{{raw_answer}}}"
+    return raw_answer
+
+
 # ---------------------------------------------------------------------------
 # 3a. build_tree  (synchronous)
 # ---------------------------------------------------------------------------
@@ -380,6 +402,8 @@ def build_tree(
     extract_answer_fn: Optional[Callable[[str], Optional[str]]] = None,
     get_logprobs: bool = True,
     seed: Optional[int] = None,
+    compute_p_inline: bool = False,
+    p_max_tokens: int = 4096,
 ) -> Node:
     """Build a search tree by recursively sampling continuations from vLLM.
 
@@ -440,6 +464,14 @@ def build_tree(
         Whether to request and store per-token log-probs.
     seed : int, optional
         RNG seed passed to vLLM.
+    compute_p_inline : bool
+        If True, for every expanding node fire one extra "answer branch"
+        request (no stop constraints, up to ``p_max_tokens``).  The
+        sum-logprob of that branch is stored as ``node["P"]``, replacing
+        the post-hoc echo scoring.  Terminal leaf nodes get
+        ``P = sum_logprobs`` from their own generation.
+    p_max_tokens : int
+        Max tokens for the inline answer branch (default 4096).
 
     Returns
     -------
@@ -449,6 +481,8 @@ def build_tree(
     def _dfs(node: Node, depth: int) -> None:
         if depth >= max_depth:
             _assign_answer(node, extract_answer_fn)
+            if compute_p_inline:
+                node["P"] = node.get("sum_logprobs", 0.0)
             return
 
         bf = _resolve_branch_factor(branch_factor, depth)
@@ -465,10 +499,31 @@ def build_tree(
             seed=seed,
         )
 
+        if compute_p_inline:
+            ans_nodes = _sample_completions(
+                server_url=server_url,
+                model_name=model_name,
+                prefix=node["full_text"],
+                n=1,
+                max_tokens=p_max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stop=None,
+                get_logprobs=True,
+                seed=seed,
+            )
+            ans_branch = ans_nodes[0]
+            node["P"] = ans_branch.get("sum_logprobs", 0.0)
+            raw_ans = extract_answer_fn(ans_branch["text"]) if extract_answer_fn else ans_branch["text"]
+            if raw_ans is not None:
+                node["p_answer"] = _normalize_p_answer(raw_ans, is_internal=True)
+
         for child in children:
             child["depth"] = depth + 1
             if _is_terminal_node(child, stop):
                 _assign_answer(child, extract_answer_fn)
+                if compute_p_inline:
+                    child["P"] = child.get("sum_logprobs", 0.0)
             else:
                 _dfs(child, depth + 1)
 
@@ -501,6 +556,8 @@ async def build_tree_async(
     get_logprobs: bool = True,
     seed: Optional[int] = None,
     max_concurrent: int = 64,
+    compute_p_inline: bool = False,
+    p_max_tokens: int = 4096,
 ) -> Node:
     """Async version of :func:`build_tree` with concurrent node expansion.
 
@@ -524,8 +581,6 @@ async def build_tree_async(
     async def _async_sample(prefix: str, n: int) -> List[Node]:
         async with sem:
             loop = asyncio.get_event_loop()
-            # Run the blocking HTTP call in a thread-pool executor so we don't
-            # block the event loop.
             return await loop.run_in_executor(
                 None,
                 lambda: _sample_completions(
@@ -535,19 +590,48 @@ async def build_tree_async(
                 ),
             )
 
+    async def _async_ans_branch(prefix: str) -> List[Node]:
+        """Sample one free-form answer branch (no stop, p_max_tokens) for inline P."""
+        async with sem:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                None,
+                lambda: _sample_completions(
+                    server_url, model_name, prefix, 1,
+                    p_max_tokens, temperature, top_p, None,
+                    True, seed,
+                ),
+            )
+
     async def _dfs(node: Node, depth: int) -> None:
         if depth >= max_depth:
             _assign_answer(node, extract_answer_fn)
+            if compute_p_inline:
+                node["P"] = node.get("sum_logprobs", 0.0)
             return
 
         bf = _resolve_branch_factor(branch_factor, depth)
-        children = await _async_sample(node["full_text"], bf)
+
+        if compute_p_inline:
+            children, ans_nodes = await asyncio.gather(
+                _async_sample(node["full_text"], bf),
+                _async_ans_branch(node["full_text"]),
+            )
+            ans_branch = ans_nodes[0]
+            node["P"] = ans_branch.get("sum_logprobs", 0.0)
+            raw_ans = extract_answer_fn(ans_branch["text"]) if extract_answer_fn else ans_branch["text"]
+            if raw_ans is not None:
+                node["p_answer"] = _normalize_p_answer(raw_ans, is_internal=True)
+        else:
+            children = await _async_sample(node["full_text"], bf)
 
         expand_tasks = []
         for child in children:
             child["depth"] = depth + 1
             if _is_terminal_node(child, stop):
                 _assign_answer(child, extract_answer_fn)
+                if compute_p_inline:
+                    child["P"] = child.get("sum_logprobs", 0.0)
             else:
                 expand_tasks.append(asyncio.create_task(_dfs(child, depth + 1)))
 
