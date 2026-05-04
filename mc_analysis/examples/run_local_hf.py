@@ -106,6 +106,8 @@ def run_one(
     tree_label:  str,
     max_tokens:  int,
     temperature: float,
+    compute_p:   bool,
+    top_k_logprobs: int,
     save_dir:    Path,
 ) -> dict:
     bf    = tree_config["branch_factor"]
@@ -128,7 +130,8 @@ def run_one(
             "temperature":   temperature,
             # M-token splitting mode (stop=None, same default as SPO / vLLM script)
         },
-        top_k_logprobs = 20,
+        compute_p      = compute_p,
+        top_k_logprobs = top_k_logprobs,
     )
     elapsed = time.perf_counter() - t0
 
@@ -199,16 +202,18 @@ def run_all(args) -> None:
     for q in questions:
         for label, cfg in configs.items():
             r = run_one(
-                question    = q["question"],
-                gold_answer = q["gold_answer"],
-                source      = q.get("source", ""),
-                backend     = backend,
-                model_name  = args.model,
-                tree_config = cfg,
-                tree_label  = label,
-                max_tokens  = args.max_tokens,
-                temperature = args.temperature,
-                save_dir    = save_dir,
+                question       = q["question"],
+                gold_answer    = q["gold_answer"],
+                source         = q.get("source", ""),
+                backend        = backend,
+                model_name     = args.model,
+                tree_config    = cfg,
+                tree_label     = label,
+                max_tokens     = args.max_tokens,
+                temperature    = args.temperature,
+                compute_p      = not args.no_compute_p,
+                top_k_logprobs = args.top_k_logprobs,
+                save_dir       = save_dir,
             )
             results.append(r)
 
@@ -234,10 +239,16 @@ if __name__ == "__main__":
                     help="Load model in 8-bit — intermediate between fp16 and int4.")
     ap.add_argument("--tree",         choices=list(TREE_CONFIGS), default=None)
     ap.add_argument("--question-idx", default=None)
-    ap.add_argument("--max-tokens",   type=int,   default=256,
+    ap.add_argument("--max-tokens",      type=int,   default=256,
                     help="Tokens per step (default 256; lower = faster on small GPU).")
-    ap.add_argument("--temperature",  type=float, default=0.8)
-    ap.add_argument("--save-dir",     default="./results")
+    ap.add_argument("--temperature",     type=float, default=0.8)
+    ap.add_argument("--no-compute-p",    action="store_true",
+                    help="Skip log P(gold_answer|trajectory) scoring. "
+                         "Saves 85 forward passes on 4-4-4; ~2-10x faster. "
+                         "V and JSD still computed.")
+    ap.add_argument("--top-k-logprobs",  type=int,   default=20,
+                    help="Top-K tokens for JSD computation (default 20; use 5 for speed).")
+    ap.add_argument("--save-dir",        default="./results")
     ap.add_argument("--parquet",      default=None,
                     help="Path to a verl-format parquet file. "
                          "Randomly sample --num-examples rows from it.")

@@ -48,7 +48,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import requests as _requests
 
@@ -147,6 +147,76 @@ def stop_vllm(proc: subprocess.Popen) -> None:
         print("[server] Stopped.")
 
 
+def find_gpu_pids() -> List[int]:
+    """Return PIDs of all processes currently using the GPU, via nvidia-smi."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+        return [int(p.strip()) for p in out.splitlines() if p.strip().isdigit()]
+    except Exception:
+        return []
+
+
+def _vllm_zombie_pids(pgid: int) -> List[int]:
+    """Return GPU PIDs that belong to a specific process group (our vLLM's pgid).
+
+    Cross-references nvidia-smi output with os.getpgid() so we never touch
+    GPU processes that belong to other jobs on the same machine.
+    """
+    result = []
+    for pid in find_gpu_pids():
+        try:
+            if os.getpgid(pid) == pgid:
+                result.append(pid)
+        except ProcessLookupError:
+            pass
+    return result
+
+
+def restart_vllm_server(
+    old_proc: Optional[subprocess.Popen],
+    model: str,
+    port: int,
+    max_model_len: int,
+    gpu_memory_utilization: float,
+) -> subprocess.Popen:
+    """Kill old vLLM, clear zombie GPU processes via nvidia-smi, start fresh."""
+    print("\n[restart] Stopping old vLLM server...")
+    pgid = None
+    if old_proc is not None:
+        try:
+            pgid = os.getpgid(old_proc.pid)
+        except ProcessLookupError:
+            pass
+        stop_vllm(old_proc)
+
+    # Only kill GPU PIDs that are still in vLLM's own process group.
+    # os.getpgid() filters out any unrelated GPU jobs on the same machine.
+    time.sleep(1)
+    if pgid is not None:
+        zombie_pids = _vllm_zombie_pids(pgid)
+        if zombie_pids:
+            print(f"[restart] nvidia-smi: killing {len(zombie_pids)} vLLM zombie PID(s) "
+                  f"(pgid={pgid}): {zombie_pids}")
+            for pid in zombie_pids:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            time.sleep(2)  # wait for GPU memory to be released
+
+    print("[restart] Starting fresh vLLM server...")
+    new_proc = start_vllm(model, port, max_model_len, gpu_memory_utilization)
+    server_url = f"http://localhost:{port}/v1"
+    print(f"[restart] Waiting for {server_url}...")
+    if not _server_ready(server_url, timeout=300):
+        raise RuntimeError("[restart] vLLM failed to come up after restart")
+    print("[restart] vLLM ready.\n")
+    return new_proc
+
+
 # ── analysis ──────────────────────────────────────────────────────────────────
 
 def node_count(b: int, d: int) -> int:
@@ -165,6 +235,10 @@ async def run_one(
     temperature: float,
     stop: List[str],
     max_concurrent: int,
+    score_concurrent: int,
+    compute_p: bool,
+    compute_p_inline: bool,
+    p_max_tokens: int,
     save_dir: Path,
 ) -> dict:
     bf    = tree_config["branch_factor"]
@@ -184,16 +258,16 @@ async def run_one(
         tree_kwargs = {
             "max_depth":     depth,
             "branch_factor": bf,
-            "max_tokens":    max_tokens,   # tokens per step (SPO default: 256–512)
+            "max_tokens":    max_tokens,
             "temperature":   temperature,
-            # stop=None → M-token splitting mode (same as SPO):
-            #   generate max_tokens per step, branch at step boundary,
-            #   stop only when model hits natural EOS.
-            # Pass --stop "\n\n" to use delimiter-based splitting instead.
-            "stop":          args.stop or None,
+            "stop":          stop or None,
+            "p_max_tokens":  p_max_tokens,
         },
-        top_k_logprobs = 20,
-        max_concurrent = max_concurrent,
+        top_k_logprobs   = 20,
+        max_concurrent   = max_concurrent,
+        score_concurrent = score_concurrent,
+        compute_p        = compute_p,
+        compute_p_inline = compute_p_inline,
     )
     elapsed = time.perf_counter() - t0
 
@@ -231,7 +305,21 @@ async def run_one(
     return result
 
 
-async def run_all(args, server_url: str) -> None:
+def run_all(
+    args,
+    server_url: str,
+    server_proc: Optional[subprocess.Popen],
+) -> Optional[subprocess.Popen]:
+    """Run all (question, tree) combinations.
+
+    After each sample (except the last), vLLM is restarted:
+      1. stop_vllm kills the managed process group
+      2. nvidia-smi finds any remaining GPU zombie PIDs and kills them
+      3. a fresh vLLM instance is started
+
+    Returns the current server_proc handle (updated after each restart)
+    so the caller's finally-block can stop it cleanly.
+    """
     configs = {args.tree: TREE_CONFIGS[args.tree]} if args.tree else TREE_CONFIGS
 
     if args.parquet:
@@ -242,6 +330,7 @@ async def run_all(args, server_url: str) -> None:
         questions = SAMPLE_QUESTIONS
 
     save_dir = Path(args.save_dir)
+    items    = [(q, label, cfg) for q in questions for label, cfg in configs.items()]
 
     print(f"\n  server       : {server_url}")
     print(f"  model        : {args.model}")
@@ -250,23 +339,38 @@ async def run_all(args, server_url: str) -> None:
     print(f"  save dir     : {save_dir}")
 
     results = []
-    for q in questions:
-        for label, cfg in configs.items():
-            r = await run_one(
-                question      = q["question"],
-                gold_answer   = q["gold_answer"],
-                source        = q.get("source", ""),
-                server_url    = server_url,
-                model_name    = args.model,
-                tree_config   = cfg,
-                tree_label    = label,
-                max_tokens    = args.max_tokens,
-                temperature   = args.temperature,
-                stop          = args.stop,
-                max_concurrent= args.max_concurrent,
-                save_dir      = save_dir,
+    for idx, (q, label, cfg) in enumerate(items):
+        r = asyncio.run(run_one(
+            question         = q["question"],
+            gold_answer      = q["gold_answer"],
+            source           = q.get("source", ""),
+            server_url       = server_url,
+            model_name       = args.model,
+            tree_config      = cfg,
+            tree_label       = label,
+            max_tokens       = args.max_tokens,
+            temperature      = args.temperature,
+            stop             = args.stop,
+            max_concurrent   = args.max_concurrent,
+            score_concurrent = args.score_concurrent,
+            compute_p        = not args.no_compute_p,
+            compute_p_inline = args.compute_p_inline,
+            p_max_tokens     = args.p_max_tokens,
+            save_dir         = save_dir,
+        ))
+        results.append(r)
+
+        # After every sample (except the last), restart vLLM to clear zombie
+        # requests that are still running inside the server.
+        is_last = (idx == len(items) - 1)
+        if not is_last and not args.no_auto_server and server_proc is not None:
+            server_proc = restart_vllm_server(
+                server_proc,
+                args.model,
+                args.port,
+                args.max_model_len,
+                args.gpu_memory_utilization,
             )
-            results.append(r)
 
     print("\n" + "="*64)
     print(f"{'Tree':<8}  {'V':>6}  {'P':>8}  {'Time(s)':>9}")
@@ -275,6 +379,8 @@ async def run_all(args, server_url: str) -> None:
         p_str = f"{r['root_P']:.1f}" if r["root_P"] is not None else "N/A"
         print(f"{r['tree_config']:<8}  {r['root_V']:>6.3f}  {p_str:>8}  {r['elapsed_s']:>9.1f}")
     print("="*64)
+
+    return server_proc
 
 
 # ── entry point ───────────────────────────────────────────────────────────────
@@ -296,7 +402,11 @@ if __name__ == "__main__":
     ap.add_argument("--stop", nargs="*", default=[],
                     help="Stop sequences for delimiter-based step splitting "
                          "(e.g. --stop '\\n\\n'). Default: empty = M-token mode (like SPO).")
-    ap.add_argument("--max-concurrent", type=int, default=16)
+    ap.add_argument("--max-concurrent",   type=int, default=8,
+                    help="Concurrency for tree-building (generation) requests (default 8).")
+    ap.add_argument("--score-concurrent", type=int, default=4,
+                    help="Concurrency for echo/scoring requests — keep low (2–4) to avoid "
+                         "KV-cache exhaustion (default 4).")
     ap.add_argument("--save-dir", default="./results")
     ap.add_argument("--parquet", default=None,
                     help="Path to a verl-format parquet file. "
@@ -305,6 +415,19 @@ if __name__ == "__main__":
                     help="Number of random examples to sample from --parquet (default: 5).")
     ap.add_argument("--seed", type=int, default=42,
                     help="Random seed for parquet sampling (default: 42).")
+    ap.add_argument("--no-compute-p", action="store_true",
+                    help="Skip log P(gold|trajectory) scoring. "
+                         "Saves 2×N echo requests (N=nodes). "
+                         "Recommended for 6-6-6 and larger trees. "
+                         "V and JSD are still computed.")
+    ap.add_argument("--compute-p-inline", action="store_true",
+                    help="Compute P inline during tree building via one free-form "
+                         "'answer branch' per expanding node (no echo requests). "
+                         "Faster than post-hoc scoring; automatically disables "
+                         "--no-compute-p echo phase.")
+    ap.add_argument("--p-max-tokens", type=int, default=1024,
+                    help="Max tokens for the inline answer branch used to compute P. "
+                         "Lower = faster but answer may be cut off (default: 1024).")
     args = ap.parse_args()
 
     server_proc = None
@@ -326,7 +449,7 @@ if __name__ == "__main__":
                 sys.exit(1)
             print("[server] Ready.\n")
 
-        asyncio.run(run_all(args, server_url))
+        server_proc = run_all(args, server_url, server_proc)
 
     finally:
         if server_proc is not None:

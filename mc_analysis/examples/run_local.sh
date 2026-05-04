@@ -49,20 +49,24 @@ PARQUET=""
 NUM_EXAMPLES=5
 SEED=42
 QUANT="--load-in-4bit"
+NO_COMPUTE_P=""
+TOP_K=20
 SAVE_DIR=""
 
 # ── parse args ────────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --model)        MODEL_KEY="$2";    shift 2 ;;
-    --tree)         TREE="$2";         shift 2 ;;
-    --question)     QUESTION="$2";     shift 2 ;;
-    --parquet)      PARQUET="$2";      shift 2 ;;
-    --num-examples) NUM_EXAMPLES="$2"; shift 2 ;;
-    --seed)         SEED="$2";         shift 2 ;;
-    --int8)         QUANT="--load-in-8bit"; shift ;;
-    --fp16)         QUANT="";          shift ;;
-    --save-dir)     SAVE_DIR="$2";     shift 2 ;;
+    --model)         MODEL_KEY="$2";    shift 2 ;;
+    --tree)          TREE="$2";         shift 2 ;;
+    --question)      QUESTION="$2";     shift 2 ;;
+    --parquet)       PARQUET="$2";      shift 2 ;;
+    --num-examples)  NUM_EXAMPLES="$2"; shift 2 ;;
+    --seed)          SEED="$2";         shift 2 ;;
+    --int8)          QUANT="--load-in-8bit"; shift ;;
+    --fp16)          QUANT="";          shift ;;
+    --no-compute-p)  NO_COMPUTE_P="--no-compute-p"; shift ;;
+    --top-k)         TOP_K="$2";        shift 2 ;;
+    --save-dir)      SAVE_DIR="$2";     shift 2 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done
@@ -87,16 +91,18 @@ python3 -c "import bitsandbytes" 2>/dev/null || {
 # ── build args ────────────────────────────────────────────────────────────────
 PY_ARGS=(
   "$SCRIPT_DIR/run_local_hf.py"
-  --model       "$MODEL"
-  --tree        "$TREE"
-  --save-dir    "$SAVE_DIR"
-  --num-examples "$NUM_EXAMPLES"
-  --seed        "$SEED"
+  --model          "$MODEL"
+  --tree           "$TREE"
+  --save-dir       "$SAVE_DIR"
+  --num-examples   "$NUM_EXAMPLES"
+  --seed           "$SEED"
+  --top-k-logprobs "$TOP_K"
 )
 
-[[ -n "$QUANT" ]]    && PY_ARGS+=($QUANT)
-[[ -n "$QUESTION" ]] && PY_ARGS+=(--question-idx "$QUESTION")
-[[ -n "$PARQUET" ]]  && PY_ARGS+=(--parquet "$PARQUET")
+[[ -n "$QUANT" ]]        && PY_ARGS+=($QUANT)
+[[ -n "$QUESTION" ]]     && PY_ARGS+=(--question-idx "$QUESTION")
+[[ -n "$PARQUET" ]]      && PY_ARGS+=(--parquet "$PARQUET")
+[[ -n "$NO_COMPUTE_P" ]] && PY_ARGS+=($NO_COMPUTE_P)
 
 echo "============================================================"
 echo "  Backend      : HuggingFace (${QUANT:-fp16})"

@@ -21,6 +21,10 @@
 #   --max-len      INT         max_model_len for vLLM (default: 8192)
 #   --gpu-mem      FLOAT       gpu_memory_utilization (default: 0.90)
 #   --no-server                assume vLLM already running at --port
+#   --score-concurrent INT     concurrency for echo/scoring requests (default: 4)
+#   --no-compute-p             skip P scoring (recommended for 6-6-6 and larger)
+#   --compute-p-inline         compute P inline via answer branch (no echo requests)
+#   --p-max-tokens INT         max tokens for the inline P branch (default: 1024)
 #   --save-dir     DIR         (default: ./results/server/<model>)
 #
 # Examples:
@@ -55,6 +59,10 @@ PORT=8000
 MAX_LEN=8192
 GPU_MEM=0.90
 NO_SERVER=0
+SCORE_CONCURRENT=4
+NO_COMPUTE_P=""
+COMPUTE_P_INLINE=""
+P_MAX_TOKENS=""
 SAVE_DIR=""
 
 # ── parse args ────────────────────────────────────────────────────────────────
@@ -69,8 +77,12 @@ while [[ $# -gt 0 ]]; do
     --port)         PORT="$2";         shift 2 ;;
     --max-len)      MAX_LEN="$2";      shift 2 ;;
     --gpu-mem)      GPU_MEM="$2";      shift 2 ;;
-    --no-server)    NO_SERVER=1;       shift   ;;
-    --save-dir)     SAVE_DIR="$2";     shift 2 ;;
+    --no-server)         NO_SERVER=1;            shift   ;;
+    --score-concurrent)  SCORE_CONCURRENT="$2";  shift 2 ;;
+    --no-compute-p)      NO_COMPUTE_P="--no-compute-p"; shift ;;
+    --compute-p-inline)  COMPUTE_P_INLINE="--compute-p-inline"; shift ;;
+    --p-max-tokens)      P_MAX_TOKENS="--p-max-tokens $2"; shift 2 ;;
+    --save-dir)          SAVE_DIR="$2";           shift 2 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done
@@ -99,18 +111,22 @@ PY_ARGS=(
   --max-model-len "$MAX_LEN"
   --gpu-memory-utilization "$GPU_MEM"
   --save-dir     "$SAVE_DIR"
-  --max-tokens   512
-  --temperature  0.8
-  --max-concurrent 16
-  --num-examples "$NUM_EXAMPLES"
+  --max-tokens        512
+  --temperature       0.8
+  --max-concurrent    8
+  --score-concurrent  "$SCORE_CONCURRENT"
+  --num-examples      "$NUM_EXAMPLES"
   --seed         "$SEED"
   # M-token mode by default (no --stop = SPO default)
 )
 
-[[ -n "$TREE" ]]     && PY_ARGS+=(--tree "$TREE")
-[[ -n "$QUESTION" ]] && PY_ARGS+=(--question-idx "$QUESTION")
-[[ -n "$PARQUET" ]]  && PY_ARGS+=(--parquet "$PARQUET")
-[[ "$NO_SERVER" -eq 1 ]] && PY_ARGS+=(--no-auto-server --server "$SERVER_URL")
+[[ -n "$TREE" ]]         && PY_ARGS+=(--tree "$TREE")
+[[ -n "$QUESTION" ]]    && PY_ARGS+=(--question-idx "$QUESTION")
+[[ -n "$PARQUET" ]]     && PY_ARGS+=(--parquet "$PARQUET")
+[[ -n "$NO_COMPUTE_P" ]]     && PY_ARGS+=($NO_COMPUTE_P)
+[[ -n "$COMPUTE_P_INLINE" ]] && PY_ARGS+=($COMPUTE_P_INLINE)
+[[ -n "$P_MAX_TOKENS" ]]     && PY_ARGS+=($P_MAX_TOKENS)
+[[ "$NO_SERVER" -eq 1 ]]     && PY_ARGS+=(--no-auto-server --server "$SERVER_URL")
 
 echo "============================================================"
 echo "  Backend      : vLLM  (port $PORT)"

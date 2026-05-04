@@ -38,6 +38,18 @@ import requests
 Node = Dict[str, Any]
 
 
+def _make_session(api_key: Optional[str] = None) -> requests.Session:
+    """Return a requests.Session, optionally pre-configured with Bearer auth.
+
+    Used when querying an external OpenAI-compatible API endpoint instead of
+    a locally hosted vLLM server.
+    """
+    s = requests.Session()
+    if api_key:
+        s.headers["Authorization"] = f"Bearer {api_key}"
+    return s
+
+
 # ---------------------------------------------------------------------------
 # 1. rollout_with_alpha
 # ---------------------------------------------------------------------------
@@ -115,7 +127,7 @@ def rollout_with_alpha(
     if seed is not None:
         payload["seed"] = seed
 
-    response = requests.post(f"{server_url}/completions", json=payload)
+    response = requests.post(f"{server_url}/completions", json=payload, timeout=300)
     response.raise_for_status()
     choice = response.json()["choices"][0]
 
@@ -219,6 +231,7 @@ def compute_sequence_logprob(
                 "logprobs": 1,
                 "echo": True,         # include prompt tokens in the response
             },
+            timeout=300,
         )
         r.raise_for_status()
         return r.json()["choices"][0]["logprobs"]
@@ -274,6 +287,7 @@ def _sample_completions(
     stop: Optional[List[str]],
     get_logprobs: bool,
     seed: Optional[int],
+    session: Optional[requests.Session] = None,
 ) -> List[Node]:
     """Sample *n* completions from vLLM and return them as raw Node dicts."""
     payload: Dict[str, Any] = {
@@ -290,7 +304,8 @@ def _sample_completions(
     if seed is not None:
         payload["seed"] = seed
 
-    r = requests.post(f"{server_url}/completions", json=payload)
+    poster = session or requests
+    r = poster.post(f"{server_url}/completions", json=payload, timeout=300)
     r.raise_for_status()
 
     nodes: List[Node] = []
@@ -362,6 +377,28 @@ def _assign_answer(
         node["answer"] = node["text"]
 
 
+def _is_short_answer(text: str) -> bool:
+    """Return True for bare short answers that look like a single value (no whitespace)."""
+    stripped = text.strip()
+    return bool(stripped) and len(stripped.split()) == 1
+
+
+def _normalize_p_answer(raw_answer: str, is_internal: bool) -> str:
+    """Normalize an extracted answer string for the inline-P answer branch.
+
+    - Internal nodes: prefix with '...' so the model treats it as a continuation
+    - Short answers (single token): wrap in LaTeX boxed format for cleaner display
+    """
+    raw_answer = raw_answer.strip()
+    if is_internal:
+        if _is_short_answer(raw_answer):
+            return f"...The final answer is \\boxed{{{raw_answer}}}"
+        return "..." + raw_answer
+    if _is_short_answer(raw_answer):
+        return f"The final answer is \\boxed{{{raw_answer}}}"
+    return raw_answer
+
+
 # ---------------------------------------------------------------------------
 # 3a. build_tree  (synchronous)
 # ---------------------------------------------------------------------------
@@ -379,6 +416,9 @@ def build_tree(
     extract_answer_fn: Optional[Callable[[str], Optional[str]]] = None,
     get_logprobs: bool = True,
     seed: Optional[int] = None,
+    api_key: Optional[str] = None,
+    compute_p_inline: bool = False,
+    p_max_tokens: int = 1024,
 ) -> Node:
     """Build a search tree by recursively sampling continuations from vLLM.
 
@@ -439,15 +479,27 @@ def build_tree(
         Whether to request and store per-token log-probs.
     seed : int, optional
         RNG seed passed to vLLM.
+    compute_p_inline : bool
+        If True, for every expanding node fire one extra "answer branch"
+        request (no stop constraints, up to ``p_max_tokens``).  The
+        sum-logprob of that branch is stored as ``node["P"]``, replacing
+        the post-hoc echo scoring.  Terminal leaf nodes get
+        ``P = sum_logprobs`` from their own generation.
+    p_max_tokens : int
+        Max tokens for the inline answer branch (default 4096).
 
     Returns
     -------
     Node
         The root node of the constructed tree.
     """
+    session = _make_session(api_key)
+
     def _dfs(node: Node, depth: int) -> None:
         if depth >= max_depth:
             _assign_answer(node, extract_answer_fn)
+            if compute_p_inline:
+                node["P"] = node.get("sum_logprobs", 0.0)
             return
 
         bf = _resolve_branch_factor(branch_factor, depth)
@@ -462,12 +514,35 @@ def build_tree(
             stop=stop,
             get_logprobs=get_logprobs,
             seed=seed,
+            session=session,
         )
+
+        if compute_p_inline:
+            ans_nodes = _sample_completions(
+                server_url=server_url,
+                model_name=model_name,
+                prefix=node["full_text"],
+                n=1,
+                max_tokens=p_max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stop=None,
+                get_logprobs=True,
+                seed=seed,
+                session=session,
+            )
+            ans_branch = ans_nodes[0]
+            node["P"] = ans_branch.get("sum_logprobs", 0.0)
+            raw_ans = extract_answer_fn(ans_branch["text"]) if extract_answer_fn else ans_branch["text"]
+            if raw_ans is not None:
+                node["p_answer"] = _normalize_p_answer(raw_ans, is_internal=True)
 
         for child in children:
             child["depth"] = depth + 1
             if _is_terminal_node(child, stop):
                 _assign_answer(child, extract_answer_fn)
+                if compute_p_inline:
+                    child["P"] = child.get("sum_logprobs", 0.0)
             else:
                 _dfs(child, depth + 1)
 
@@ -500,6 +575,11 @@ async def build_tree_async(
     get_logprobs: bool = True,
     seed: Optional[int] = None,
     max_concurrent: int = 64,
+    p_concurrent: int = 4,
+    api_key: Optional[str] = None,
+    compute_p_inline: bool = False,
+    p_max_tokens: int = 1024,
+    verbose: bool = True,
 ) -> Node:
     """Async version of :func:`build_tree` with concurrent node expansion.
 
@@ -511,42 +591,77 @@ async def build_tree_async(
     Parameters
     ----------
     max_concurrent : int
-        Maximum number of simultaneous HTTP requests to the vLLM server.
+        Maximum number of simultaneous HTTP requests for tree-building
+        (children sampling).  Default 64.
+    p_concurrent : int
+        Separate concurrency limit for inline-P answer branches so they
+        do not compete with tree-building requests.  Default 4.
+    verbose : bool
+        Print per-node progress to stdout.  Default True.
 
     Returns
     -------
     Node
         The root node of the constructed tree.
     """
-    sem = asyncio.Semaphore(max_concurrent)
+    sem   = asyncio.Semaphore(max_concurrent)
+    p_sem = asyncio.Semaphore(p_concurrent)   # separate — never blocks tree expansion
+    session = _make_session(api_key)
+    _ans_tasks: List = []   # (node, asyncio.Task) collected during DFS, resolved after
+    _expanded  = [0]        # mutable counter (list avoids nonlocal)
 
     async def _async_sample(prefix: str, n: int) -> List[Node]:
         async with sem:
             loop = asyncio.get_event_loop()
-            # Run the blocking HTTP call in a thread-pool executor so we don't
-            # block the event loop.
             return await loop.run_in_executor(
                 None,
                 lambda: _sample_completions(
                     server_url, model_name, prefix, n,
                     max_tokens, temperature, top_p, stop,
-                    get_logprobs, seed,
+                    get_logprobs, seed, session,
+                ),
+            )
+
+    async def _async_ans_branch(prefix: str) -> List[Node]:
+        """Sample one free-form answer branch for inline P (uses p_sem)."""
+        async with p_sem:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                None,
+                lambda: _sample_completions(
+                    server_url, model_name, prefix, 1,
+                    p_max_tokens, temperature, top_p, None,
+                    True, seed, session,
                 ),
             )
 
     async def _dfs(node: Node, depth: int) -> None:
         if depth >= max_depth:
             _assign_answer(node, extract_answer_fn)
+            if compute_p_inline:
+                node["P"] = node.get("sum_logprobs", 0.0)
             return
 
         bf = _resolve_branch_factor(branch_factor, depth)
+
+        if compute_p_inline:
+            # Fire answer branch as a background task — do NOT await here.
+            # Awaiting would block child expansion for the full p_max_tokens
+            # generation time (can be 30–60 s per node for large trees).
+            _ans_tasks.append((node, asyncio.create_task(_async_ans_branch(node["full_text"]))))
+
         children = await _async_sample(node["full_text"], bf)
+        _expanded[0] += 1
+        if verbose:
+            print(f"\r  [tree] {_expanded[0]} nodes expanded  ", end="", flush=True)
 
         expand_tasks = []
         for child in children:
             child["depth"] = depth + 1
             if _is_terminal_node(child, stop):
                 _assign_answer(child, extract_answer_fn)
+                if compute_p_inline:
+                    child["P"] = child.get("sum_logprobs", 0.0)
             else:
                 expand_tasks.append(asyncio.create_task(_dfs(child, depth + 1)))
 
@@ -555,12 +670,41 @@ async def build_tree_async(
 
         node["children"] = children
 
+    if verbose:
+        if isinstance(branch_factor, list):
+            bf_str = "×".join(str(_resolve_branch_factor(branch_factor, d))
+                              for d in range(max_depth))
+        else:
+            bf_str = "×".join([str(branch_factor)] * max_depth)
+        print(f"  [tree] building {bf_str} tree...", flush=True)
+
     root: Node = {
         "text": prompt,
         "full_text": prompt,
         "depth": 0,
     }
     await _dfs(root, 0)
+
+    # Resolve all answer branches fired during DFS.  Many will already be
+    # done by the time tree-building finishes; we just collect the results.
+    if compute_p_inline and _ans_tasks:
+        pending = sum(not t.done() for _, t in _ans_tasks)
+        if verbose and pending:
+            print(f"\r  [tree] tree done, waiting for {pending}/{len(_ans_tasks)} "
+                  f"P-branch(es)...          ", flush=True)
+        results = await asyncio.gather(*[t for _, t in _ans_tasks])
+        for (node, _), ans_nodes in zip(_ans_tasks, results):
+            ans_branch = ans_nodes[0]
+            node["P"] = ans_branch.get("sum_logprobs", 0.0)
+            raw_ans = (extract_answer_fn(ans_branch["text"]) if extract_answer_fn
+                       else ans_branch["text"])
+            if raw_ans is not None:
+                node["p_answer"] = _normalize_p_answer(raw_ans, is_internal=True)
+
+    if verbose:
+        p_info = (f", {len(_ans_tasks)} P-branches" if compute_p_inline else "")
+        print(f"\r  [tree] {_expanded[0]} nodes expanded{p_info}.           ", flush=True)
+
     return root
 
 
@@ -649,6 +793,7 @@ def get_next_token_logprobs(
     model_name: str,
     text: str,
     top_k: int = 20,
+    session: Optional[requests.Session] = None,
 ) -> List[Tuple[str, float]]:
     """
     Query the top-K next-token log-probs from vLLM at the end of *text*.
@@ -661,7 +806,8 @@ def get_next_token_logprobs(
     List[Tuple[str, float]]
         ``[(token_string, log_prob), ...]`` sorted by descending log-prob.
     """
-    r = requests.post(
+    poster = session or requests
+    r = poster.post(
         f"{server_url}/completions",
         json={
             "model": model_name,
@@ -670,6 +816,7 @@ def get_next_token_logprobs(
             "logprobs": top_k,
             "temperature": 0.0,
         },
+        timeout=300,
     )
     r.raise_for_status()
     choice = r.json()["choices"][0]
@@ -684,11 +831,14 @@ def annotate_top_logprobs(
     server_url: str,
     model_name: str,
     top_k: int = 20,
+    api_key: Optional[str] = None,
 ) -> None:
     """Store top-K next-token log-probs in ``node["top_logprobs"]`` for every node (sequential DFS)."""
+    session = _make_session(api_key)
+
     def _recurse(node: Node) -> None:
         node["top_logprobs"] = get_next_token_logprobs(
-            server_url, model_name, node["full_text"], top_k
+            server_url, model_name, node["full_text"], top_k, session
         )
         for child in node.get("children", []):
             _recurse(child)
@@ -702,6 +852,8 @@ async def annotate_top_logprobs_async(
     model_name: str,
     top_k: int = 20,
     max_concurrent: int = 8,
+    api_key: Optional[str] = None,
+    verbose: bool = True,
 ) -> None:
     """Store top-K next-token log-probs for every node concurrently.
 
@@ -711,6 +863,8 @@ async def annotate_top_logprobs_async(
     cached before deeper nodes that share that prefix are processed.
     """
     sem = asyncio.Semaphore(max_concurrent)
+    session = _make_session(api_key)
+    _done = [0]
 
     async def _score(node: Node) -> None:
         async with sem:
@@ -718,9 +872,12 @@ async def annotate_top_logprobs_async(
             node["top_logprobs"] = await loop.run_in_executor(
                 None,
                 lambda: get_next_token_logprobs(
-                    server_url, model_name, node["full_text"], top_k
+                    server_url, model_name, node["full_text"], top_k, session
                 ),
             )
+        _done[0] += 1
+        if verbose:
+            print(f"\r  [JSD]  {_done[0]}/{len(all_nodes)} nodes  ", end="", flush=True)
 
     all_nodes: List[Node] = []
 
@@ -732,4 +889,8 @@ async def annotate_top_logprobs_async(
     _collect(root)
     # Shallowest nodes first → warms prefix cache for deeper siblings/children
     all_nodes.sort(key=lambda n: len(n.get("full_text", "")))
+    if verbose:
+        print(f"  [JSD]  annotating {len(all_nodes)} nodes...", flush=True)
     await asyncio.gather(*[_score(n) for n in all_nodes])
+    if verbose:
+        print(f"\r  [JSD]  {len(all_nodes)}/{len(all_nodes)} nodes done.          ", flush=True)
