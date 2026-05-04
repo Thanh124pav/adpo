@@ -15,7 +15,7 @@ def assign_names(node: Node, name: str = "root") -> None:
     """Assign hierarchical name to every node in-place (DFS)."""
     node["name"] = name
     for i, child in enumerate(node.get("children", []), start=1):
-        child_name = f"n{i}" if name == "root" else f"{name}.{i}"
+        child_name = f"n{i}" if name == "root" else f"{name}.{i}" # ? 
         assign_names(child, child_name)
 
 
