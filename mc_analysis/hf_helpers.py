@@ -24,6 +24,26 @@ Node = Dict[str, Any]
 
 
 # =============================================================================
+# Shared answer-normalization helpers  (mirrors vllm_helpers)
+# =============================================================================
+
+def _is_short_answer(text: str) -> bool:
+    stripped = text.strip()
+    return bool(stripped) and len(stripped.split()) == 1
+
+
+def _normalize_p_answer(raw_answer: str, is_internal: bool) -> str:
+    raw_answer = raw_answer.strip()
+    if is_internal:
+        if _is_short_answer(raw_answer):
+            return f"...The final answer is \\boxed{{{raw_answer}}}"
+        return "..." + raw_answer
+    if _is_short_answer(raw_answer):
+        return f"The final answer is \\boxed{{{raw_answer}}}"
+    return raw_answer
+
+
+# =============================================================================
 # Internal helpers
 # =============================================================================
 
@@ -322,6 +342,9 @@ def build_tree_hf(
     extract_answer_fn: Optional[Callable[[str], Optional[str]]] = None,
     get_logprobs: bool = True,
     seed: Optional[int] = None,
+    compute_p_inline: bool = False,
+    p_max_tokens: int = 1024,
+    verbose: bool = True,
 ) -> Node:
     """
     Build a search tree using HuggingFace model.generate().
@@ -329,10 +352,22 @@ def build_tree_hf(
     Same Node structure and semantics as vllm_helpers.build_tree.
     Branching uses num_return_sequences; stop sequences are enforced via
     StoppingCriteria (all sequences stop when any hits a stop string).
+
+    compute_p_inline : bool
+        If True, for each expanding node sample one extra free-form
+        "answer branch" (no stop, up to p_max_tokens). Its sum_logprob
+        is stored as node["P"].  Terminal leaf nodes reuse their own
+        sum_logprobs as P.
+    p_max_tokens : int
+        Max tokens for the inline answer branch (default 1024).
     """
+    _expanded = [0]
+
     def _dfs(node: Node, depth: int) -> None:
         if depth >= max_depth:
             _assign_answer(node, extract_answer_fn)
+            if compute_p_inline:
+                node["P"] = node.get("sum_logprobs", 0.0)
             return
 
         bf = _resolve_branch_factor(branch_factor, depth)
@@ -347,16 +382,49 @@ def build_tree_hf(
             get_logprobs=get_logprobs,
             seed=seed,
         )
+
+        if compute_p_inline:
+            ans_nodes = _sample_completions_hf(
+                model, tokenizer,
+                prefix=node["full_text"],
+                n=1,
+                max_new_tokens=p_max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stop=None,
+                get_logprobs=True,
+                seed=seed,
+            )
+            ans = ans_nodes[0]
+            node["P"] = ans.get("sum_logprobs", 0.0)
+            raw = extract_answer_fn(ans["text"]) if extract_answer_fn else ans["text"]
+            if raw is not None:
+                node["p_answer"] = _normalize_p_answer(raw, is_internal=True)
+
+        _expanded[0] += 1
+        if verbose:
+            print(f"\r  [tree] {_expanded[0]} nodes expanded  ", end="", flush=True)
+
         for child in children:
             child["depth"] = depth + 1
             if _is_terminal(child, stop):
                 _assign_answer(child, extract_answer_fn)
+                if compute_p_inline:
+                    child["P"] = child.get("sum_logprobs", 0.0)
             else:
                 _dfs(child, depth + 1)
         node["children"] = children
 
+    if verbose:
+        bf_str = ("×".join(str(_resolve_branch_factor(branch_factor, d)) for d in range(max_depth))
+                  if isinstance(branch_factor, list) else
+                  "×".join([str(branch_factor)] * max_depth))
+        print(f"  [tree] building {bf_str} tree (HF)...", flush=True)
+
     root: Node = {"text": prompt, "full_text": prompt, "depth": 0}
     _dfs(root, 0)
+    if verbose:
+        print(f"\r  [tree] {_expanded[0]} nodes expanded.           ", flush=True)
     return root
 
 
@@ -374,6 +442,9 @@ async def build_tree_hf_async(
     get_logprobs: bool = True,
     seed: Optional[int] = None,
     max_concurrent: int = 4,
+    compute_p_inline: bool = False,
+    p_max_tokens: int = 1024,
+    verbose: bool = True,
 ) -> Node:
     """
     Async variant of build_tree_hf — runs HF inference in thread-pool
@@ -382,40 +453,91 @@ async def build_tree_hf_async(
     Note: GPU inference is not truly parallel (GIL + CUDA serialisation),
     but this allows interleaving with other async work.
     max_concurrent limits simultaneous generate() calls.
-    """
-    sem = asyncio.Semaphore(max_concurrent)
 
-    async def _async_sample(prefix: str, n: int) -> List[Node]:
+    compute_p_inline / p_max_tokens: same semantics as build_tree_hf.
+    Answer branches are fired as background tasks (non-blocking).
+    """
+    sem       = asyncio.Semaphore(max_concurrent)
+    _ans_tasks: List = []
+    _expanded  = [0]
+
+    async def _async_sample(prefix: str, n: int, mt: int = max_new_tokens,
+                             st: Optional[List[str]] = stop) -> List[Node]:
         async with sem:
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(
                 None,
                 lambda: _sample_completions_hf(
                     model, tokenizer, prefix, n,
-                    max_new_tokens, temperature, top_p,
-                    stop, get_logprobs, seed,
+                    mt, temperature, top_p, st, get_logprobs, seed,
+                ),
+            )
+
+    async def _async_ans_branch(prefix: str) -> List[Node]:
+        async with sem:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                None,
+                lambda: _sample_completions_hf(
+                    model, tokenizer, prefix, 1,
+                    p_max_tokens, temperature, top_p, None, True, seed,
                 ),
             )
 
     async def _dfs(node: Node, depth: int) -> None:
         if depth >= max_depth:
             _assign_answer(node, extract_answer_fn)
+            if compute_p_inline:
+                node["P"] = node.get("sum_logprobs", 0.0)
             return
+
         bf = _resolve_branch_factor(branch_factor, depth)
+        if compute_p_inline:
+            _ans_tasks.append((node, asyncio.create_task(_async_ans_branch(node["full_text"]))))
+
         children = await _async_sample(node["full_text"], bf)
+        _expanded[0] += 1
+        if verbose:
+            print(f"\r  [tree] {_expanded[0]} nodes expanded  ", end="", flush=True)
+
         tasks = []
         for child in children:
             child["depth"] = depth + 1
             if _is_terminal(child, stop):
                 _assign_answer(child, extract_answer_fn)
+                if compute_p_inline:
+                    child["P"] = child.get("sum_logprobs", 0.0)
             else:
                 tasks.append(asyncio.create_task(_dfs(child, depth + 1)))
         if tasks:
             await asyncio.gather(*tasks)
         node["children"] = children
 
+    if verbose:
+        bf_str = ("×".join(str(_resolve_branch_factor(branch_factor, d)) for d in range(max_depth))
+                  if isinstance(branch_factor, list) else
+                  "×".join([str(branch_factor)] * max_depth))
+        print(f"  [tree] building {bf_str} tree (HF async)...", flush=True)
+
     root: Node = {"text": prompt, "full_text": prompt, "depth": 0}
     await _dfs(root, 0)
+
+    if compute_p_inline and _ans_tasks:
+        pending = sum(not t.done() for _, t in _ans_tasks)
+        if verbose and pending:
+            print(f"\r  [tree] tree done, waiting for {pending}/{len(_ans_tasks)} P-branch(es)...",
+                  flush=True)
+        results = await asyncio.gather(*[t for _, t in _ans_tasks])
+        for (node, _), ans_nodes in zip(_ans_tasks, results):
+            ans = ans_nodes[0]
+            node["P"] = ans.get("sum_logprobs", 0.0)
+            raw = extract_answer_fn(ans["text"]) if extract_answer_fn else ans["text"]
+            if raw is not None:
+                node["p_answer"] = _normalize_p_answer(raw, is_internal=True)
+
+    if verbose:
+        p_info = f", {len(_ans_tasks)} P-branches" if compute_p_inline else ""
+        print(f"\r  [tree] {_expanded[0]} nodes expanded{p_info}.           ", flush=True)
     return root
 
 
@@ -555,13 +677,13 @@ class HFBackend:
         return compute_sequence_logprob_hf(self.model, self.tokenizer, prompt, completion)
 
     def build_tree(self, prompt: str, **kwargs) -> Node:
-        """See :func:`build_tree_hf`."""
+        """See :func:`build_tree_hf`.  Accepts max_tokens alias for max_new_tokens."""
         if "max_tokens" in kwargs:
             kwargs["max_new_tokens"] = kwargs.pop("max_tokens")
         return build_tree_hf(self.model, self.tokenizer, prompt, **kwargs)
 
     async def build_tree_async(self, prompt: str, **kwargs) -> Node:
-        """See :func:`build_tree_hf_async`."""
+        """See :func:`build_tree_hf_async`.  Accepts max_tokens alias for max_new_tokens."""
         if "max_tokens" in kwargs:
             kwargs["max_new_tokens"] = kwargs.pop("max_tokens")
         return await build_tree_hf_async(self.model, self.tokenizer, prompt, **kwargs)
@@ -624,9 +746,11 @@ class HFBackend:
         root: Node,
         top_k: int = 20,
         max_concurrent: int = 4,
+        verbose: bool = True,
     ) -> None:
         """Annotate top-K next-token log-probs concurrently (thread-pool)."""
-        sem = asyncio.Semaphore(max_concurrent)
+        sem   = asyncio.Semaphore(max_concurrent)
+        _done = [0]
 
         async def _score(node: Node) -> None:
             async with sem:
@@ -637,6 +761,9 @@ class HFBackend:
                         self.model, self.tokenizer, node["full_text"], top_k
                     ),
                 )
+            _done[0] += 1
+            if verbose:
+                print(f"\r  [JSD]  {_done[0]}/{len(all_nodes)} nodes  ", end="", flush=True)
 
         all_nodes: List[Node] = []
 
@@ -646,4 +773,8 @@ class HFBackend:
                 _collect(c)
 
         _collect(root)
+        if verbose:
+            print(f"  [JSD]  annotating {len(all_nodes)} nodes...", flush=True)
         await asyncio.gather(*[_score(n) for n in all_nodes])
+        if verbose:
+            print(f"\r  [JSD]  {len(all_nodes)}/{len(all_nodes)} nodes done.          ", flush=True)

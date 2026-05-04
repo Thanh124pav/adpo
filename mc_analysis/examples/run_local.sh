@@ -50,6 +50,8 @@ NUM_EXAMPLES=5
 SEED=42
 QUANT="--load-in-4bit"
 NO_COMPUTE_P=""
+COMPUTE_P_INLINE=""
+P_MAX_TOKENS=""
 TOP_K=20
 SAVE_DIR=""
 
@@ -64,8 +66,10 @@ while [[ $# -gt 0 ]]; do
     --seed)          SEED="$2";         shift 2 ;;
     --int8)          QUANT="--load-in-8bit"; shift ;;
     --fp16)          QUANT="";          shift ;;
-    --no-compute-p)  NO_COMPUTE_P="--no-compute-p"; shift ;;
-    --top-k)         TOP_K="$2";        shift 2 ;;
+    --no-compute-p)      NO_COMPUTE_P="--no-compute-p"; shift ;;
+    --compute-p-inline)  COMPUTE_P_INLINE="--compute-p-inline"; shift ;;
+    --p-max-tokens)      P_MAX_TOKENS="--p-max-tokens $2"; shift 2 ;;
+    --top-k)             TOP_K="$2";        shift 2 ;;
     --save-dir)      SAVE_DIR="$2";     shift 2 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
@@ -99,10 +103,12 @@ PY_ARGS=(
   --top-k-logprobs "$TOP_K"
 )
 
-[[ -n "$QUANT" ]]        && PY_ARGS+=($QUANT)
-[[ -n "$QUESTION" ]]     && PY_ARGS+=(--question-idx "$QUESTION")
-[[ -n "$PARQUET" ]]      && PY_ARGS+=(--parquet "$PARQUET")
-[[ -n "$NO_COMPUTE_P" ]] && PY_ARGS+=($NO_COMPUTE_P)
+[[ -n "$QUANT" ]]             && PY_ARGS+=($QUANT)
+[[ -n "$QUESTION" ]]          && PY_ARGS+=(--question-idx "$QUESTION")
+[[ -n "$PARQUET" ]]           && PY_ARGS+=(--parquet "$PARQUET")
+[[ -n "$NO_COMPUTE_P" ]]      && PY_ARGS+=($NO_COMPUTE_P)
+[[ -n "$COMPUTE_P_INLINE" ]]  && PY_ARGS+=($COMPUTE_P_INLINE)
+[[ -n "$P_MAX_TOKENS" ]]      && PY_ARGS+=($P_MAX_TOKENS)
 
 echo "============================================================"
 echo "  Backend      : HuggingFace (${QUANT:-fp16})"

@@ -97,18 +97,20 @@ def node_count(b: int, d: int) -> int:
 
 
 def run_one(
-    question:    str,
-    gold_answer: str,
-    source:      str,
-    backend:     HFBackend,
-    model_name:  str,
-    tree_config: dict,
-    tree_label:  str,
-    max_tokens:  int,
-    temperature: float,
-    compute_p:   bool,
-    top_k_logprobs: int,
-    save_dir:    Path,
+    question:        str,
+    gold_answer:     str,
+    source:          str,
+    backend:         HFBackend,
+    model_name:      str,
+    tree_config:     dict,
+    tree_label:      str,
+    max_tokens:      int,
+    temperature:     float,
+    compute_p:       bool,
+    compute_p_inline: bool,
+    p_max_tokens:    int,
+    top_k_logprobs:  int,
+    save_dir:        Path,
 ) -> dict:
     bf    = tree_config["branch_factor"]
     depth = tree_config["max_depth"]
@@ -128,10 +130,11 @@ def run_one(
             "branch_factor": bf,
             "max_tokens":    max_tokens,
             "temperature":   temperature,
-            # M-token splitting mode (stop=None, same default as SPO / vLLM script)
+            "p_max_tokens":  p_max_tokens,
         },
-        compute_p      = compute_p,
-        top_k_logprobs = top_k_logprobs,
+        compute_p        = compute_p,
+        compute_p_inline = compute_p_inline,
+        top_k_logprobs   = top_k_logprobs,
     )
     elapsed = time.perf_counter() - t0
 
@@ -202,18 +205,20 @@ def run_all(args) -> None:
     for q in questions:
         for label, cfg in configs.items():
             r = run_one(
-                question       = q["question"],
-                gold_answer    = q["gold_answer"],
-                source         = q.get("source", ""),
-                backend        = backend,
-                model_name     = args.model,
-                tree_config    = cfg,
-                tree_label     = label,
-                max_tokens     = args.max_tokens,
-                temperature    = args.temperature,
-                compute_p      = not args.no_compute_p,
-                top_k_logprobs = args.top_k_logprobs,
-                save_dir       = save_dir,
+                question         = q["question"],
+                gold_answer      = q["gold_answer"],
+                source           = q.get("source", ""),
+                backend          = backend,
+                model_name       = args.model,
+                tree_config      = cfg,
+                tree_label       = label,
+                max_tokens       = args.max_tokens,
+                temperature      = args.temperature,
+                compute_p        = not args.no_compute_p,
+                compute_p_inline = args.compute_p_inline,
+                p_max_tokens     = args.p_max_tokens,
+                top_k_logprobs   = args.top_k_logprobs,
+                save_dir         = save_dir,
             )
             results.append(r)
 
@@ -242,10 +247,15 @@ if __name__ == "__main__":
     ap.add_argument("--max-tokens",      type=int,   default=256,
                     help="Tokens per step (default 256; lower = faster on small GPU).")
     ap.add_argument("--temperature",     type=float, default=0.8)
-    ap.add_argument("--no-compute-p",    action="store_true",
+    ap.add_argument("--no-compute-p",      action="store_true",
                     help="Skip log P(gold_answer|trajectory) scoring. "
                          "Saves 85 forward passes on 4-4-4; ~2-10x faster. "
                          "V and JSD still computed.")
+    ap.add_argument("--compute-p-inline", action="store_true",
+                    help="Compute P inline via answer branch during tree building "
+                         "(no separate forward pass needed). Supersedes --no-compute-p.")
+    ap.add_argument("--p-max-tokens",    type=int,   default=1024,
+                    help="Max tokens for inline P answer branch (default 1024).")
     ap.add_argument("--top-k-logprobs",  type=int,   default=20,
                     help="Top-K tokens for JSD computation (default 20; use 5 for speed).")
     ap.add_argument("--save-dir",        default="./results")
