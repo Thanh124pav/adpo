@@ -97,6 +97,7 @@ def analyse(
     compute_p_inline: bool = False,
     top_k_logprobs: int = 20,
     max_concurrent: int = 8,
+    api_key: Optional[str] = None,
 ) -> Node:
     """
     Full MC-analysis pipeline using a vLLM server.
@@ -154,6 +155,7 @@ def analyse(
     root = build_tree(
         server_url, model_name, question,
         extract_answer_fn=ext_fn,
+        api_key=api_key,
         compute_p_inline=compute_p_inline,
         **tkw,
     )
@@ -164,7 +166,7 @@ def analyse(
     if compute_p and not compute_p_inline:
         _compute_p_tree_vllm(root, gold_answer, server_url, model_name)
 
-    annotate_top_logprobs(root, server_url, model_name, top_k=top_k_logprobs)
+    annotate_top_logprobs(root, server_url, model_name, top_k=top_k_logprobs, api_key=api_key)
     compute_jsd(root)
     return root
 
@@ -183,6 +185,7 @@ async def analyse_async(
     top_k_logprobs: int = 20,
     max_concurrent: int = 8,
     score_concurrent: int = 4,
+    api_key: Optional[str] = None,
 ) -> Node:
     """Async version of :func:`analyse` — tree-building, P-scoring, and logprob annotation run concurrently.
 
@@ -211,6 +214,7 @@ async def analyse_async(
         server_url, model_name, question,
         extract_answer_fn=ext_fn,
         max_concurrent=max_concurrent,
+        api_key=api_key,
         compute_p_inline=compute_p_inline,
         **tkw,
     )
@@ -224,7 +228,8 @@ async def analyse_async(
         )
 
     await annotate_top_logprobs_async(
-        root, server_url, model_name, top_k=top_k_logprobs, max_concurrent=score_concurrent
+        root, server_url, model_name,
+        top_k=top_k_logprobs, max_concurrent=score_concurrent, api_key=api_key,
     )
     compute_jsd(root)
     return root

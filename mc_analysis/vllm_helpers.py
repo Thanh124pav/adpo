@@ -38,6 +38,18 @@ import requests
 Node = Dict[str, Any]
 
 
+def _make_session(api_key: Optional[str] = None) -> requests.Session:
+    """Return a requests.Session, optionally pre-configured with Bearer auth.
+
+    Used when querying an external OpenAI-compatible API endpoint instead of
+    a locally hosted vLLM server.
+    """
+    s = requests.Session()
+    if api_key:
+        s.headers["Authorization"] = f"Bearer {api_key}"
+    return s
+
+
 # ---------------------------------------------------------------------------
 # 1. rollout_with_alpha
 # ---------------------------------------------------------------------------
@@ -275,6 +287,7 @@ def _sample_completions(
     stop: Optional[List[str]],
     get_logprobs: bool,
     seed: Optional[int],
+    session: Optional[requests.Session] = None,
 ) -> List[Node]:
     """Sample *n* completions from vLLM and return them as raw Node dicts."""
     payload: Dict[str, Any] = {
@@ -291,7 +304,8 @@ def _sample_completions(
     if seed is not None:
         payload["seed"] = seed
 
-    r = requests.post(f"{server_url}/completions", json=payload, timeout=300)
+    poster = session or requests
+    r = poster.post(f"{server_url}/completions", json=payload, timeout=300)
     r.raise_for_status()
 
     nodes: List[Node] = []
@@ -402,6 +416,7 @@ def build_tree(
     extract_answer_fn: Optional[Callable[[str], Optional[str]]] = None,
     get_logprobs: bool = True,
     seed: Optional[int] = None,
+    api_key: Optional[str] = None,
     compute_p_inline: bool = False,
     p_max_tokens: int = 4096,
 ) -> Node:
@@ -478,6 +493,8 @@ def build_tree(
     Node
         The root node of the constructed tree.
     """
+    session = _make_session(api_key)
+
     def _dfs(node: Node, depth: int) -> None:
         if depth >= max_depth:
             _assign_answer(node, extract_answer_fn)
@@ -497,6 +514,7 @@ def build_tree(
             stop=stop,
             get_logprobs=get_logprobs,
             seed=seed,
+            session=session,
         )
 
         if compute_p_inline:
@@ -511,6 +529,7 @@ def build_tree(
                 stop=None,
                 get_logprobs=True,
                 seed=seed,
+                session=session,
             )
             ans_branch = ans_nodes[0]
             node["P"] = ans_branch.get("sum_logprobs", 0.0)
@@ -556,6 +575,7 @@ async def build_tree_async(
     get_logprobs: bool = True,
     seed: Optional[int] = None,
     max_concurrent: int = 64,
+    api_key: Optional[str] = None,
     compute_p_inline: bool = False,
     p_max_tokens: int = 4096,
 ) -> Node:
@@ -577,6 +597,7 @@ async def build_tree_async(
         The root node of the constructed tree.
     """
     sem = asyncio.Semaphore(max_concurrent)
+    session = _make_session(api_key)
 
     async def _async_sample(prefix: str, n: int) -> List[Node]:
         async with sem:
@@ -586,7 +607,7 @@ async def build_tree_async(
                 lambda: _sample_completions(
                     server_url, model_name, prefix, n,
                     max_tokens, temperature, top_p, stop,
-                    get_logprobs, seed,
+                    get_logprobs, seed, session,
                 ),
             )
 
@@ -599,7 +620,7 @@ async def build_tree_async(
                 lambda: _sample_completions(
                     server_url, model_name, prefix, 1,
                     p_max_tokens, temperature, top_p, None,
-                    True, seed,
+                    True, seed, session,
                 ),
             )
 
@@ -734,6 +755,7 @@ def get_next_token_logprobs(
     model_name: str,
     text: str,
     top_k: int = 20,
+    session: Optional[requests.Session] = None,
 ) -> List[Tuple[str, float]]:
     """
     Query the top-K next-token log-probs from vLLM at the end of *text*.
@@ -746,7 +768,8 @@ def get_next_token_logprobs(
     List[Tuple[str, float]]
         ``[(token_string, log_prob), ...]`` sorted by descending log-prob.
     """
-    r = requests.post(
+    poster = session or requests
+    r = poster.post(
         f"{server_url}/completions",
         json={
             "model": model_name,
@@ -770,11 +793,14 @@ def annotate_top_logprobs(
     server_url: str,
     model_name: str,
     top_k: int = 20,
+    api_key: Optional[str] = None,
 ) -> None:
     """Store top-K next-token log-probs in ``node["top_logprobs"]`` for every node (sequential DFS)."""
+    session = _make_session(api_key)
+
     def _recurse(node: Node) -> None:
         node["top_logprobs"] = get_next_token_logprobs(
-            server_url, model_name, node["full_text"], top_k
+            server_url, model_name, node["full_text"], top_k, session
         )
         for child in node.get("children", []):
             _recurse(child)
@@ -788,6 +814,7 @@ async def annotate_top_logprobs_async(
     model_name: str,
     top_k: int = 20,
     max_concurrent: int = 8,
+    api_key: Optional[str] = None,
 ) -> None:
     """Store top-K next-token log-probs for every node concurrently.
 
@@ -797,6 +824,7 @@ async def annotate_top_logprobs_async(
     cached before deeper nodes that share that prefix are processed.
     """
     sem = asyncio.Semaphore(max_concurrent)
+    session = _make_session(api_key)
 
     async def _score(node: Node) -> None:
         async with sem:
@@ -804,7 +832,7 @@ async def annotate_top_logprobs_async(
             node["top_logprobs"] = await loop.run_in_executor(
                 None,
                 lambda: get_next_token_logprobs(
-                    server_url, model_name, node["full_text"], top_k
+                    server_url, model_name, node["full_text"], top_k, session
                 ),
             )
 
