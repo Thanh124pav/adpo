@@ -418,7 +418,7 @@ def build_tree(
     seed: Optional[int] = None,
     api_key: Optional[str] = None,
     compute_p_inline: bool = False,
-    p_max_tokens: int = 4096,
+    p_max_tokens: int = 1024,
 ) -> Node:
     """Build a search tree by recursively sampling continuations from vLLM.
 
@@ -575,9 +575,11 @@ async def build_tree_async(
     get_logprobs: bool = True,
     seed: Optional[int] = None,
     max_concurrent: int = 64,
+    p_concurrent: int = 4,
     api_key: Optional[str] = None,
     compute_p_inline: bool = False,
-    p_max_tokens: int = 4096,
+    p_max_tokens: int = 1024,
+    verbose: bool = True,
 ) -> Node:
     """Async version of :func:`build_tree` with concurrent node expansion.
 
@@ -589,15 +591,24 @@ async def build_tree_async(
     Parameters
     ----------
     max_concurrent : int
-        Maximum number of simultaneous HTTP requests to the vLLM server.
+        Maximum number of simultaneous HTTP requests for tree-building
+        (children sampling).  Default 64.
+    p_concurrent : int
+        Separate concurrency limit for inline-P answer branches so they
+        do not compete with tree-building requests.  Default 4.
+    verbose : bool
+        Print per-node progress to stdout.  Default True.
 
     Returns
     -------
     Node
         The root node of the constructed tree.
     """
-    sem = asyncio.Semaphore(max_concurrent)
+    sem   = asyncio.Semaphore(max_concurrent)
+    p_sem = asyncio.Semaphore(p_concurrent)   # separate — never blocks tree expansion
     session = _make_session(api_key)
+    _ans_tasks: List = []   # (node, asyncio.Task) collected during DFS, resolved after
+    _expanded  = [0]        # mutable counter (list avoids nonlocal)
 
     async def _async_sample(prefix: str, n: int) -> List[Node]:
         async with sem:
@@ -612,8 +623,8 @@ async def build_tree_async(
             )
 
     async def _async_ans_branch(prefix: str) -> List[Node]:
-        """Sample one free-form answer branch (no stop, p_max_tokens) for inline P."""
-        async with sem:
+        """Sample one free-form answer branch for inline P (uses p_sem)."""
+        async with p_sem:
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(
                 None,
@@ -634,17 +645,15 @@ async def build_tree_async(
         bf = _resolve_branch_factor(branch_factor, depth)
 
         if compute_p_inline:
-            children, ans_nodes = await asyncio.gather(
-                _async_sample(node["full_text"], bf),
-                _async_ans_branch(node["full_text"]),
-            )
-            ans_branch = ans_nodes[0]
-            node["P"] = ans_branch.get("sum_logprobs", 0.0)
-            raw_ans = extract_answer_fn(ans_branch["text"]) if extract_answer_fn else ans_branch["text"]
-            if raw_ans is not None:
-                node["p_answer"] = _normalize_p_answer(raw_ans, is_internal=True)
-        else:
-            children = await _async_sample(node["full_text"], bf)
+            # Fire answer branch as a background task — do NOT await here.
+            # Awaiting would block child expansion for the full p_max_tokens
+            # generation time (can be 30–60 s per node for large trees).
+            _ans_tasks.append((node, asyncio.create_task(_async_ans_branch(node["full_text"]))))
+
+        children = await _async_sample(node["full_text"], bf)
+        _expanded[0] += 1
+        if verbose:
+            print(f"\r  [tree] {_expanded[0]} nodes expanded  ", end="", flush=True)
 
         expand_tasks = []
         for child in children:
@@ -661,12 +670,41 @@ async def build_tree_async(
 
         node["children"] = children
 
+    if verbose:
+        if isinstance(branch_factor, list):
+            bf_str = "×".join(str(_resolve_branch_factor(branch_factor, d))
+                              for d in range(max_depth))
+        else:
+            bf_str = "×".join([str(branch_factor)] * max_depth)
+        print(f"  [tree] building {bf_str} tree...", flush=True)
+
     root: Node = {
         "text": prompt,
         "full_text": prompt,
         "depth": 0,
     }
     await _dfs(root, 0)
+
+    # Resolve all answer branches fired during DFS.  Many will already be
+    # done by the time tree-building finishes; we just collect the results.
+    if compute_p_inline and _ans_tasks:
+        pending = sum(not t.done() for _, t in _ans_tasks)
+        if verbose and pending:
+            print(f"\r  [tree] tree done, waiting for {pending}/{len(_ans_tasks)} "
+                  f"P-branch(es)...          ", flush=True)
+        results = await asyncio.gather(*[t for _, t in _ans_tasks])
+        for (node, _), ans_nodes in zip(_ans_tasks, results):
+            ans_branch = ans_nodes[0]
+            node["P"] = ans_branch.get("sum_logprobs", 0.0)
+            raw_ans = (extract_answer_fn(ans_branch["text"]) if extract_answer_fn
+                       else ans_branch["text"])
+            if raw_ans is not None:
+                node["p_answer"] = _normalize_p_answer(raw_ans, is_internal=True)
+
+    if verbose:
+        p_info = (f", {len(_ans_tasks)} P-branches" if compute_p_inline else "")
+        print(f"\r  [tree] {_expanded[0]} nodes expanded{p_info}.           ", flush=True)
+
     return root
 
 
@@ -815,6 +853,7 @@ async def annotate_top_logprobs_async(
     top_k: int = 20,
     max_concurrent: int = 8,
     api_key: Optional[str] = None,
+    verbose: bool = True,
 ) -> None:
     """Store top-K next-token log-probs for every node concurrently.
 
@@ -825,6 +864,7 @@ async def annotate_top_logprobs_async(
     """
     sem = asyncio.Semaphore(max_concurrent)
     session = _make_session(api_key)
+    _done = [0]
 
     async def _score(node: Node) -> None:
         async with sem:
@@ -835,6 +875,9 @@ async def annotate_top_logprobs_async(
                     server_url, model_name, node["full_text"], top_k, session
                 ),
             )
+        _done[0] += 1
+        if verbose:
+            print(f"\r  [JSD]  {_done[0]}/{len(all_nodes)} nodes  ", end="", flush=True)
 
     all_nodes: List[Node] = []
 
@@ -846,4 +889,8 @@ async def annotate_top_logprobs_async(
     _collect(root)
     # Shallowest nodes first → warms prefix cache for deeper siblings/children
     all_nodes.sort(key=lambda n: len(n.get("full_text", "")))
+    if verbose:
+        print(f"  [JSD]  annotating {len(all_nodes)} nodes...", flush=True)
     await asyncio.gather(*[_score(n) for n in all_nodes])
+    if verbose:
+        print(f"\r  [JSD]  {len(all_nodes)}/{len(all_nodes)} nodes done.          ", flush=True)

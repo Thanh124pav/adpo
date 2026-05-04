@@ -20,6 +20,7 @@ fields set on every node:
     correct      – bool (leaves only)
 """
 import asyncio
+import time
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from ._annotation import assign_names, compute_v, compute_jsd
@@ -186,23 +187,21 @@ async def analyse_async(
     max_concurrent: int = 8,
     score_concurrent: int = 4,
     api_key: Optional[str] = None,
+    verbose: bool = True,
 ) -> Node:
     """Async version of :func:`analyse` — tree-building, P-scoring, and logprob annotation run concurrently.
 
     Parameters
     ----------
     max_concurrent : int
-        Concurrency for tree-building (generation requests). vLLM handles
-        these well via continuous batching. Default 8.
+        Concurrency for tree-building (generation requests). Default 8.
     score_concurrent : int
-        Concurrency for echo/scoring requests (compute_p, annotate_top_logprobs).
-        Each scoring call sends long-prompt echo requests that are heavy on the
-        KV cache. Keep this low (2–4) to avoid exhausting the cache and stalling.
-        Default 4.
+        Concurrency for echo/scoring and JSD requests. Default 4.
     compute_p_inline : bool
-        If True, compute P during tree building via one free-form "answer
-        branch" per expanding node.  No echo requests are fired; the
-        ``compute_p`` post-hoc scoring phase is skipped automatically.
+        Compute P via free-form answer branch per node instead of post-hoc
+        echo scoring.  The ``compute_p`` echo phase is skipped automatically.
+    verbose : bool
+        Print phase-level progress to stdout.  Default True.
     """
     from .vllm_helpers import build_tree_async, annotate_top_logprobs_async
 
@@ -210,27 +209,42 @@ async def analyse_async(
     ext_fn  = extract_answer_fn or extract_answer
     tkw     = tree_kwargs or {}
 
+    t0 = time.perf_counter()
     root = await build_tree_async(
         server_url, model_name, question,
         extract_answer_fn=ext_fn,
         max_concurrent=max_concurrent,
+        p_concurrent=score_concurrent,
         api_key=api_key,
         compute_p_inline=compute_p_inline,
+        verbose=verbose,
         **tkw,
     )
+    if verbose:
+        print(f"  [pipeline] tree built in {time.perf_counter()-t0:.1f}s", flush=True)
 
     assign_names(root)
     compute_v(root, gold_answer, checker)
 
     if compute_p and not compute_p_inline:
+        if verbose:
+            print("  [P]    scoring nodes (echo)...", flush=True)
+        t0 = time.perf_counter()
         await _compute_p_tree_vllm_async(
             root, gold_answer, server_url, model_name, max_concurrent=score_concurrent
         )
+        if verbose:
+            print(f"  [P]    done in {time.perf_counter()-t0:.1f}s", flush=True)
 
+    t0 = time.perf_counter()
     await annotate_top_logprobs_async(
         root, server_url, model_name,
-        top_k=top_k_logprobs, max_concurrent=score_concurrent, api_key=api_key,
+        top_k=top_k_logprobs, max_concurrent=score_concurrent,
+        api_key=api_key, verbose=verbose,
     )
+    if verbose:
+        print(f"  [pipeline] JSD done in {time.perf_counter()-t0:.1f}s", flush=True)
+
     compute_jsd(root)
     return root
 

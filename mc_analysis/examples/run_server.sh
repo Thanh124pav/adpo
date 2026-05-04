@@ -24,6 +24,7 @@
 #   --score-concurrent INT     concurrency for echo/scoring requests (default: 4)
 #   --no-compute-p             skip P scoring (recommended for 6-6-6 and larger)
 #   --compute-p-inline         compute P inline via answer branch (no echo requests)
+#   --p-max-tokens INT         max tokens for the inline P branch (default: 1024)
 #   --save-dir     DIR         (default: ./results/server/<model>)
 #
 # Examples:
@@ -61,6 +62,7 @@ NO_SERVER=0
 SCORE_CONCURRENT=4
 NO_COMPUTE_P=""
 COMPUTE_P_INLINE=""
+P_MAX_TOKENS=""
 SAVE_DIR=""
 
 # ── parse args ────────────────────────────────────────────────────────────────
@@ -79,6 +81,7 @@ while [[ $# -gt 0 ]]; do
     --score-concurrent)  SCORE_CONCURRENT="$2";  shift 2 ;;
     --no-compute-p)      NO_COMPUTE_P="--no-compute-p"; shift ;;
     --compute-p-inline)  COMPUTE_P_INLINE="--compute-p-inline"; shift ;;
+    --p-max-tokens)      P_MAX_TOKENS="--p-max-tokens $2"; shift 2 ;;
     --save-dir)          SAVE_DIR="$2";           shift 2 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
@@ -122,6 +125,7 @@ PY_ARGS=(
 [[ -n "$PARQUET" ]]     && PY_ARGS+=(--parquet "$PARQUET")
 [[ -n "$NO_COMPUTE_P" ]]     && PY_ARGS+=($NO_COMPUTE_P)
 [[ -n "$COMPUTE_P_INLINE" ]] && PY_ARGS+=($COMPUTE_P_INLINE)
+[[ -n "$P_MAX_TOKENS" ]]     && PY_ARGS+=($P_MAX_TOKENS)
 [[ "$NO_SERVER" -eq 1 ]]     && PY_ARGS+=(--no-auto-server --server "$SERVER_URL")
 
 echo "============================================================"

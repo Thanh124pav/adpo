@@ -111,6 +111,7 @@ async def run_one(
     max_concurrent: int,
     score_concurrent: int,
     compute_p_inline: bool,
+    p_max_tokens: int,
     save_dir: Path,
 ) -> dict:
     bf    = tree_config["branch_factor"]
@@ -135,6 +136,7 @@ async def run_one(
             "max_tokens":    max_tokens,
             "temperature":   temperature,
             "stop":          stop or None,
+            "p_max_tokens":  p_max_tokens,
         },
         top_k_logprobs   = 20,
         max_concurrent   = max_concurrent,
@@ -218,6 +220,7 @@ def run_all(args, server_url: str, api_key: str) -> None:
             max_concurrent   = args.max_concurrent,
             score_concurrent = args.score_concurrent,
             compute_p_inline = args.compute_p_inline,
+            p_max_tokens     = args.p_max_tokens,
             save_dir         = save_dir,
         ))
         results.append(r)
@@ -258,6 +261,8 @@ if __name__ == "__main__":
                          "External APIs do not support echo mode.")
     ap.add_argument("--no-compute-p-inline", dest="compute_p_inline", action="store_false",
                     help="Disable inline P (skips P entirely for this run).")
+    ap.add_argument("--p-max-tokens", type=int, default=1024,
+                    help="Max tokens for the inline P answer branch (default: 1024).")
     ap.add_argument("--save-dir", default="./results/api")
     ap.add_argument("--parquet", default=None,
                     help="Path to a parquet file; randomly sample --num-examples rows.")

@@ -238,6 +238,7 @@ async def run_one(
     score_concurrent: int,
     compute_p: bool,
     compute_p_inline: bool,
+    p_max_tokens: int,
     save_dir: Path,
 ) -> dict:
     bf    = tree_config["branch_factor"]
@@ -257,13 +258,10 @@ async def run_one(
         tree_kwargs = {
             "max_depth":     depth,
             "branch_factor": bf,
-            "max_tokens":    max_tokens,   # tokens per step (SPO default: 256–512)
+            "max_tokens":    max_tokens,
             "temperature":   temperature,
-            # stop=None → M-token splitting mode (same as SPO):
-            #   generate max_tokens per step, branch at step boundary,
-            #   stop only when model hits natural EOS.
-            # Pass --stop "\n\n" to use delimiter-based splitting instead.
             "stop":          stop or None,
+            "p_max_tokens":  p_max_tokens,
         },
         top_k_logprobs   = 20,
         max_concurrent   = max_concurrent,
@@ -357,6 +355,7 @@ def run_all(
             score_concurrent = args.score_concurrent,
             compute_p        = not args.no_compute_p,
             compute_p_inline = args.compute_p_inline,
+            p_max_tokens     = args.p_max_tokens,
             save_dir         = save_dir,
         ))
         results.append(r)
@@ -426,6 +425,9 @@ if __name__ == "__main__":
                          "'answer branch' per expanding node (no echo requests). "
                          "Faster than post-hoc scoring; automatically disables "
                          "--no-compute-p echo phase.")
+    ap.add_argument("--p-max-tokens", type=int, default=1024,
+                    help="Max tokens for the inline answer branch used to compute P. "
+                         "Lower = faster but answer may be cut off (default: 1024).")
     args = ap.parse_args()
 
     server_proc = None
