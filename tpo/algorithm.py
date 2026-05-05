@@ -188,9 +188,11 @@ def build_tree_tpo(
             if _is_terminal_node(child, stop):
                 # Natural leaf: EOS or stop string matched but without further expansion
                 _assign_answer(child, extract_answer_fn)
+                child["early_stopped"] = False
             elif ts.should_terminate(child, child_path):
-                # Strategic leaf: termination strategy says stop
+                # Strategic leaf: P-degradation or depth cap — V = 0 during training
                 _assign_answer(child, extract_answer_fn)
+                child["early_stopped"] = True
             else:
                 _dfs(child, current_path)
 
@@ -305,8 +307,10 @@ async def build_tree_tpo_async(
 
             if _is_terminal_node(child, stop):
                 _assign_answer(child, extract_answer_fn)
+                child["early_stopped"] = False
             elif ts.should_terminate(child, child_path):
                 _assign_answer(child, extract_answer_fn)
+                child["early_stopped"] = True
             else:
                 expand_tasks.append(asyncio.create_task(_dfs(child, current_path)))
 
