@@ -5,35 +5,37 @@ TPO Training Entry Point
 Registers TPO's inference strategy and episode generator with treetune's
 registry, then delegates to SPO's standard ``treetune.main`` entry point.
 
+vLLM lifecycle
+--------------
+The vLLM server is managed INTERNALLY by TPOEpisodeGenerator — it is started
+at the beginning of each iteration with the CURRENT actor model checkpoint and
+stopped afterwards.  This is identical to how SPO's on-policy generators work.
+No external vLLM server needs to be started before running this script.
+
 Usage (from the repo root)
 --------------------------
 
 Single GPU (debug / quick test):
 
-    TPO_SERVER_URL=http://localhost:8000/v1 \\
-    TPO_MODEL_NAME=Qwen/Qwen2.5-1.5B \\
-    APP_SEED=42 \\
-    python tpo/scripts/train_tpo.py \\
-        tpo/configs/polIter_qwen1_5b_tpo_MATH.jsonnet
+    APP_SEED=42 python tpo/scripts/train_tpo.py \\
+        tpo/configs/polIter_qwen1_5b_tpo_MATH.jsonnet run_iteration
 
 Multi-GPU with Accelerate (mirrors SPO's launch pattern):
 
-    TPO_SERVER_URL=http://localhost:8000/v1 \\
-    TPO_MODEL_NAME=Qwen/Qwen2.5-1.5B \\
-    APP_SEED=42 \\
-    accelerate launch --num_processes 4 tpo/scripts/train_tpo.py \\
-        tpo/configs/polIter_qwen1_5b_tpo_MATH.jsonnet
+    APP_SEED=42 accelerate launch \\
+        --num_processes 4 \\
+        --config_file tpo/configs/accelerate/default_config.yaml \\
+        tpo/scripts/train_tpo.py \\
+        tpo/configs/polIter_qwen1_5b_tpo_MATH.jsonnet run_iteration
 
 Config variants:
-    polIter_qwen1_5b_tpo_MATH.jsonnet             # default (entropy branch + P-degradation)
-    polIter_qwen1_5b_tpo_MATH_deep_tree.jsonnet   # larger K, deeper trees
-    polIter_qwen1_5b_tpo_MATH_fixed_branch.jsonnet # ablation: fixed branching
+    polIter_qwen1_5b_tpo_MATH.jsonnet              # default (entropy + P-degradation)
+    polIter_qwen1_5b_tpo_MATH_deep_tree.jsonnet    # K=5, depth=12, adaptive tokens
+    polIter_qwen1_5b_tpo_MATH_fixed_branch.jsonnet # ablation: fixed branch_factor=3
 
 Environment variables
 ---------------------
-TPO_SERVER_URL   Required. vLLM server URL, e.g. ``http://localhost:8000/v1``.
-TPO_MODEL_NAME   Required. Model identifier registered on the vLLM server.
-APP_SEED         Optional. Integer random seed (default: 42).
+APP_SEED   Optional. Integer random seed (default: 42).  Same as SPO.
 """
 
 import sys
@@ -41,7 +43,7 @@ import os
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# 1. Ensure the project roots are on sys.path so treetune and tpo are both
+# 1. Ensure project roots are on sys.path so both treetune and tpo are
 #    importable regardless of from which directory this script is launched.
 # ---------------------------------------------------------------------------
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent  # /home/user/adpo
@@ -65,13 +67,11 @@ except Exception as exc:
     print("[train_tpo] Continuing — classes may already be registered.", flush=True)
 
 # ---------------------------------------------------------------------------
-# 3. Validate required environment variables
+# 3. Default APP_SEED if not set (SPO does the same)
 # ---------------------------------------------------------------------------
-for _env_var in ("TPO_SERVER_URL", "TPO_MODEL_NAME"):
-    if not os.environ.get(_env_var):
-        print(f"[train_tpo] ERROR: Environment variable {_env_var} is not set.", flush=True)
-        print(f"  Example: {_env_var}=http://localhost:8000/v1", flush=True)
-        sys.exit(1)
+if not os.environ.get("APP_SEED"):
+    os.environ["APP_SEED"] = "42"
+    print("[train_tpo] APP_SEED not set, defaulting to 42.", flush=True)
 
 # ---------------------------------------------------------------------------
 # 4. Hand off to SPO's standard main entry point (fire.Fire → EntryPoint).

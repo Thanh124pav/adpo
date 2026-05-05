@@ -125,8 +125,8 @@ class TPOInferenceStrategy(_BASE):
 
     def __init__(
         self,
-        server_url: str,
-        model_name: str,
+        server_url: Optional[str] = None,
+        model_name: Optional[str] = None,
         question_template: str = "[MATH_TASK] Problem:\n{query}\n\nSolution:",
         question_field: str = "query",
         answer_field: str = "answer",
@@ -223,6 +223,13 @@ class TPOInferenceStrategy(_BASE):
             Input dataset with an additional ``_treetune__reasoning_tree``
             column (JSON string).
         """
+        if self.server_url is None or self.model_name is None:
+            raise RuntimeError(
+                "[TPOInferenceStrategy] server_url and model_name must be set before "
+                "calling generate(). In on-policy training these are injected "
+                "automatically by TPOEpisodeGenerator._run_inference each iteration."
+            )
+
         examples: List[Dict[str, Any]] = dataset.to_list()
         n = len(examples)
         ordered: List[Optional[Dict[str, Any]]] = [None] * n

@@ -1,0 +1,21 @@
+# Accelerate config for TPO multi-GPU training.
+# Mirrors SPO's typical setup: one process per GPU, no tensor parallelism
+# (DeepSpeed ZeRO handles gradient sync; vLLM runs on the same GPU per process).
+#
+# Edit num_processes to match your available GPU count.
+
+compute_environment: LOCAL_MACHINE
+distributed_type: MULTI_GPU
+downcast_bf16: 'no'
+gpu_ids: all
+machine_rank: 0
+main_training_function: main
+mixed_precision: bf16
+num_machines: 1
+num_processes: 4          # ← change to 1, 4, or 8
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false
