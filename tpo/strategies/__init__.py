@@ -5,21 +5,23 @@ Branching
 ---------
 BranchingStrategy         – abstract base
 FixedBranchingStrategy    – constant branch factor (SPO-compatible)
-EntropyBranchingStrategy  – dynamic branching from next-token entropy [2, 8]
+EntropyBranchingStrategy  – dynamic branching from next-token entropy [1, 8]
 
 Termination
 -----------
-TerminationStrategy            – abstract base
-DepthTerminationStrategy       – max-depth cap (SPO-compatible)
-PDegradationTerminationStrategy – terminates when P(answer|traj) degrades K times
-CombinedTerminationStrategy    – OR of multiple strategies
+TerminationStrategy              – abstract base
+DepthTerminationStrategy         – max-depth cap (SPO-compatible)
+PDegradationTerminationStrategy  – terminates when P(answer|traj) degrades K times
+CombinedTerminationStrategy      – OR of multiple strategies
+MLClassifierTermination          – learned classifier over exp(log_P) values
 
 Segmentation
 ------------
-SegmentationStrategy       – abstract base
-FixedTokenSegmentation     – fixed M-token steps (SPO-compatible)
-StopSequenceSegmentation   – step boundaries at explicit stop strings
-AdaptiveTokenSegmentation  – decaying token budget per depth
+SegmentationStrategy        – abstract base
+FixedTokenSegmentation      – fixed M-token steps (SPO-compatible)
+StopSequenceSegmentation    – step boundaries at explicit stop strings
+AdaptiveTokenSegmentation   – decaying token budget per depth
+DelayBranchingSegmentation  – generate long chunk, truncate at high-uncertainty position
 """
 
 from .branching import (
@@ -34,12 +36,14 @@ from .termination import (
     DepthTerminationStrategy,
     PDegradationTerminationStrategy,
     CombinedTerminationStrategy,
+    MLClassifierTermination,
 )
 from .segmentation import (
     SegmentationStrategy,
     FixedTokenSegmentation,
     StopSequenceSegmentation,
     AdaptiveTokenSegmentation,
+    DelayBranchingSegmentation,
 )
 
 __all__ = [
@@ -54,9 +58,11 @@ __all__ = [
     "DepthTerminationStrategy",
     "PDegradationTerminationStrategy",
     "CombinedTerminationStrategy",
+    "MLClassifierTermination",
     # segmentation
     "SegmentationStrategy",
     "FixedTokenSegmentation",
     "StopSequenceSegmentation",
     "AdaptiveTokenSegmentation",
+    "DelayBranchingSegmentation",
 ]

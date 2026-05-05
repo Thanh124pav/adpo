@@ -12,8 +12,7 @@ import numpy as np
 
 Node = Dict[str, Any]
 
-# Hard limits mandated by the TPO specification.
-BRANCH_MIN = 2
+BRANCH_MIN = 1   # 1 = no branching at a node (pure chain), useful for ablations
 BRANCH_MAX = 8
 
 

@@ -179,3 +179,131 @@ class AdaptiveTokenSegmentation(SegmentationStrategy):
             "top_p": self.top_p,
             "stop": self.stop,
         }
+
+
+class DelayBranchingSegmentation(SegmentationStrategy):
+    """Delay branching: generate a long chunk, then truncate at a high-uncertainty position.
+
+    **Algorithm** (applied per child after generation):
+
+    1. Compute a forward-looking average uncertainty for each token position *i*::
+
+           avg_uncertainty[i] = mean(-logprob[j] for j in [i, i+1, …, i+window_size-1])
+
+       Using the selected token's negative log-prob as a per-token uncertainty proxy.
+       Positions near the end (where the window extends past the sequence) are
+       computed over the available tokens only.
+
+    2. The segmentation threshold is the *entropy_percentile*-th percentile of
+       all ``avg_uncertainty`` values in the current chunk (computed per-child,
+       so the threshold adapts to each sampled sequence).
+
+    3. The **first** position *i* ≥ *min_segment_tokens* where
+       ``avg_uncertainty[i] ≥ threshold`` is chosen as the cut point.
+
+    4. The child's text is truncated to ``tokens[:cut_idx]`` and its metadata
+       (``full_text``, ``tokens``, ``token_logprobs``, ``sum_logprobs``,
+       ``num_tokens``, ``finish_reason``) are updated accordingly by the
+       algorithm.  The truncated node is then treated as a step boundary and
+       expanded further (unless a termination strategy stops it).
+
+    If no position satisfies the criterion, the child is returned unchanged —
+    it becomes a leaf in the usual way.
+
+    .. note::
+        This strategy requires per-token log-probs, so ``get_logprobs=True``
+        must be passed to :func:`~tpo.algorithm.build_tree_tpo`.  Call
+        :meth:`needs_per_token_logprobs` to verify at runtime.
+
+    Parameters
+    ----------
+    max_tokens : int
+        Token budget for the initial (pre-truncation) generation.
+    temperature : float
+        Sampling temperature.
+    top_p : float
+        Nucleus sampling threshold.
+    stop : list of str, optional
+        Stop sequences forwarded to vLLM unchanged.
+    window_size : int
+        Look-ahead window K for the sliding average.
+    entropy_percentile : float
+        Percentile threshold ∈ (0, 100].  Positions above this percentile
+        of per-child average uncertainties are candidate cut points.
+    min_segment_tokens : int
+        Minimum number of tokens in a segment (suppresses cutting too early).
+    """
+
+    def __init__(
+        self,
+        max_tokens: int = 512,
+        temperature: float = 0.8,
+        top_p: float = 1.0,
+        stop: Optional[List[str]] = None,
+        window_size: int = 5,
+        entropy_percentile: float = 80.0,
+        min_segment_tokens: int = 10,
+    ):
+        if not (0.0 < entropy_percentile <= 100.0):
+            raise ValueError("entropy_percentile must be in (0, 100]")
+        if window_size < 1:
+            raise ValueError("window_size must be ≥ 1")
+        if min_segment_tokens < 0:
+            raise ValueError("min_segment_tokens must be ≥ 0")
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.top_p = top_p
+        self.stop = stop
+        self.window_size = window_size
+        self.entropy_percentile = entropy_percentile
+        self.min_segment_tokens = min_segment_tokens
+
+    def needs_per_token_logprobs(self) -> bool:
+        """Signal that the algorithm must request per-token log-probs (get_logprobs=True)."""
+        return True
+
+    def get_generation_params(self, node: Node, depth: int) -> Dict[str, Any]:
+        return {
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "stop": self.stop,
+        }
+
+    def find_segment_point(self, token_logprobs: List[float]) -> Optional[int]:
+        """Return the index at which to cut the token sequence, or ``None``.
+
+        Parameters
+        ----------
+        token_logprobs : list of float
+            Per-token log-probabilities (negative values).
+
+        Returns
+        -------
+        int or None
+            Cut index (exclusive upper bound for ``tokens[:cut_idx]``), or
+            ``None`` if no segmentation point is found.
+        """
+        import numpy as np
+
+        n = len(token_logprobs)
+        if n == 0 or n <= self.min_segment_tokens:
+            return None
+
+        lp = np.array(token_logprobs, dtype=np.float64)
+        uncertainty = -lp  # negative log-prob → higher = more uncertain
+
+        # Forward-looking sliding average
+        avg = np.empty(n, dtype=np.float64)
+        for i in range(n):
+            end = min(i + self.window_size, n)
+            avg[i] = uncertainty[i:end].mean()
+
+        threshold = float(np.percentile(avg, self.entropy_percentile))
+
+        # First position ≥ min_segment_tokens where avg exceeds threshold
+        for i in range(self.min_segment_tokens, n):
+            if avg[i] >= threshold:
+                return i
+
+        return None

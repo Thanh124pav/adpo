@@ -175,6 +175,11 @@ def build_tree_tpo(
             session=session,
         )
 
+        # Apply delay-branching truncation if the segmentation strategy supports it
+        if hasattr(ss, "find_segment_point"):
+            for child in children:
+                _apply_delay_branching(child, node["full_text"], ss)
+
         _expanded[0] += 1
         if verbose:
             print(f"\r  [tpo] {_expanded[0]} nodes expanded, depth={depth}  ", end="", flush=True)
@@ -292,6 +297,11 @@ async def build_tree_tpo_async(
 
         children = await _async_sample(node["full_text"], n_branches, gen_params)
 
+        # Apply delay-branching truncation if the segmentation strategy supports it
+        if hasattr(ss, "find_segment_point"):
+            for child in children:
+                _apply_delay_branching(child, node["full_text"], ss)
+
         _expanded[0] += 1
         if verbose:
             print(f"\r  [tpo] {_expanded[0]} nodes expanded, depth={depth}  ", end="", flush=True)
@@ -352,3 +362,40 @@ def _score_node(
     """
     result = compute_sequence_logprob(server_url, model_name, node["full_text"], gold_answer)
     node["P"] = float(result["sum_logprob"])
+
+
+def _apply_delay_branching(
+    child: Node,
+    parent_full_text: str,
+    ss: "SegmentationStrategy",
+) -> None:
+    """Truncate *child* at the segmentation point found by *ss*, if any.
+
+    Called after ``_sample_completions`` when the segmentation strategy
+    implements ``find_segment_point``.  Mutates *child* in-place.  If no
+    cut point is found the child is left unchanged.
+
+    Updated fields: ``text``, ``full_text``, ``tokens``, ``token_logprobs``,
+    ``sum_logprobs``, ``num_tokens``, ``finish_reason``.
+    """
+    token_logprobs: Optional[List[float]] = child.get("token_logprobs")
+    tokens: Optional[List[str]] = child.get("tokens")
+
+    if not token_logprobs or not tokens:
+        return  # no logprob data — skip
+
+    cut_idx = ss.find_segment_point(token_logprobs)  # type: ignore[attr-defined]
+    if cut_idx is None or cut_idx >= len(tokens):
+        return  # no truncation needed
+
+    new_tokens = tokens[:cut_idx]
+    new_logprobs = token_logprobs[:cut_idx]
+    new_text = "".join(new_tokens)
+
+    child["text"] = new_text
+    child["full_text"] = parent_full_text + new_text
+    child["tokens"] = new_tokens
+    child["token_logprobs"] = new_logprobs
+    child["sum_logprobs"] = float(sum(new_logprobs))
+    child["num_tokens"] = cut_idx
+    child["finish_reason"] = "delay_branching"
