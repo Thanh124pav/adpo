@@ -81,6 +81,10 @@ local tpo_top_k_entropy      = 20;  // top-K tokens for entropy estimation
 
     question_template: '[MATH_TASK] Problem:\n{query}\n\nSolution:',
 
+    question_sampler: {
+      type: 'random',  // required by OnPolicyEpisodeGenerator; not used by TPO
+    },
+
     // TPO inference strategy.
     // server_url and model_name are injected dynamically by TPOEpisodeGenerator
     // at the start of each iteration (like SPO injects guidance_llm.api_base).
