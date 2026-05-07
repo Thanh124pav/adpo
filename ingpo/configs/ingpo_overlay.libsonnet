@@ -37,5 +37,6 @@
 
     ingpo_zero_advantage_when_pruned: $.ingpo.zero_advantage_when_pruned,
     ingpo_emit_pruned_edges: $.ingpo.emit_pruned_edges,
+    ingpo_demo_examples_per_tree: $.ingpo.demo_examples_per_tree,
   },
 }

@@ -181,6 +181,46 @@ up:
 bash scripts/train_debug.sh
 ```
 
+## Logging (wandb)
+
+The episode generator emits the following metrics to `cloud_logger`
+(wandb) **once per tree**:
+
+Aggregate rates (already in v1):
+
+* `ingpo/share_rate`, `ingpo/prune_rate`, `ingpo/expanded_count`,
+  `ingpo/shared_count`, `ingpo/pruned_count`
+* `ingpo/avg_tv_when_share`, `ingpo/avg_gap_when_prune`
+* `ingpo/answer_set_size`
+
+Per-depth breakdown (one set per depth `d` in the tree):
+
+* `ingpo/depth_<d>/n`, `expand_count`, `share_count`, `prune_count`,
+  `share_rate`, `prune_rate`
+
+Demo examples — a `wandb.Table` named `ingpo/demos` with up to
+`ingpo.demo_examples_per_tree` SHARE rows and the same for PRUNE rows.
+Each row has:
+
+| column        | meaning                                              |
+|---------------|------------------------------------------------------|
+| question_id   | dataset row id                                        |
+| action        | `share` or `prune`                                    |
+| depth         | depth of the child segment                            |
+| seg_id        | tree-internal id of the child segment                 |
+| parent_text   | text of the parent segment (truncated to 240 chars)   |
+| child_text    | text of the candidate segment that fired the trigger |
+| target_text   | for SHARE: text of the segment we shared into        |
+| target_seg_id | id of that share target                              |
+| avg_lp_K      | the candidate's K-subset AvgLP                        |
+| tv_m          | TV_m to share target (only on SHARE rows)            |
+| gap_m         | AvgLP_m gap to parent (only on PRUNE rows)           |
+| eta, tau      | thresholds in effect for this decision                |
+
+Set `ingpo.demo_examples_per_tree = 0` in
+`configs/ingpo_defaults.libsonnet` (or override in any config) to disable
+the demo table while keeping the rate metrics.
+
 ## Notes
 
 * The vLLM `/v1/completions` endpoint is hit with `echo=True, logprobs=1,

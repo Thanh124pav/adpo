@@ -29,5 +29,9 @@
     // Edge handling
     zero_advantage_when_pruned: true,
     emit_pruned_edges: false,
+
+    // Logging: how many SHARE / PRUNE demo rows to emit per tree to wandb.
+    // Set 0 to disable demo tables entirely (per-depth rates stay on).
+    demo_examples_per_tree: 2,
   },
 }

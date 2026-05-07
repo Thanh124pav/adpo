@@ -34,6 +34,13 @@ from treetune.logging_utils import get_logger
 logger = get_logger(__name__)
 
 
+from ingpo_ext.core.logging_helpers import (
+    DEMO_COLUMNS,
+    collect_demo_rows,
+    per_depth_action_counts,
+)
+
+
 @EpisodeGenerator.register("ingpo_episode_generator")
 class InGPOEpisodeGenerator(HybridEpisodeGenerator):
     """Tree → edges with online Share/Prune awareness."""
@@ -43,12 +50,16 @@ class InGPOEpisodeGenerator(HybridEpisodeGenerator):
         ingpo_zero_advantage_when_pruned: bool = True,
         ingpo_emit_pruned_edges: bool = False,
         ingpo_share_inherit: str = "value_and_reward",  # or "value_only"
+        ingpo_demo_examples_per_tree: int = 2,  # how many SHARE / PRUNE demos to log per tree
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.ingpo_zero_advantage_when_pruned = ingpo_zero_advantage_when_pruned
         self.ingpo_emit_pruned_edges = ingpo_emit_pruned_edges
         self.ingpo_share_inherit = ingpo_share_inherit
+        self.ingpo_demo_examples_per_tree = int(ingpo_demo_examples_per_tree)
+        # Reservoir of demo rows; flushed at the end of each tree.
+        self._tree_seen = 0
 
     # ------------------------------------------------------------------
     # Override edge extraction
@@ -79,8 +90,24 @@ class InGPOEpisodeGenerator(HybridEpisodeGenerator):
         collect(tree_copy)
 
         ingpo_stats = tree_copy.get("ingpo_stats", {})
-        if ingpo_stats:
-            self._cloud_log({**ingpo_stats, "ingpo/answer_set_size": tree_copy.get("ingpo_answer_set_size", 0)})
+        per_depth = self._per_depth_action_counts(tree_copy)
+        demo_payload = self._build_demo_payload(
+            tree_copy,
+            index_by_seg_id,
+            question_id=question_id,
+        )
+        self._tree_seen += 1
+        if ingpo_stats or per_depth:
+            log_entry = {
+                **ingpo_stats,
+                "ingpo/answer_set_size": tree_copy.get("ingpo_answer_set_size", 0),
+                "ingpo/tree_idx": self._tree_seen,
+                **per_depth,
+            }
+            log_entry.update(demo_payload["scalars"])
+            if demo_payload["table"] is not None:
+                log_entry["ingpo/demos"] = demo_payload["table"]
+            self._cloud_log(log_entry)
 
         def BoK(value, bok=4):
             return 1 - (1 - value) ** bok
@@ -169,3 +196,39 @@ class InGPOEpisodeGenerator(HybridEpisodeGenerator):
         # (matches SPO behaviour).
         edges = json.loads(json.dumps(edges, default=lambda o: None))
         return edges
+
+    # ------------------------------------------------------------------
+    # Logging helpers (thin wrappers around module-level pure helpers)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _per_depth_action_counts(tree) -> Dict[str, float]:
+        return per_depth_action_counts(tree)
+
+    def _build_demo_payload(
+        self,
+        tree,
+        index_by_seg_id: Dict[str, Dict[str, Any]],
+        question_id,
+    ) -> Dict[str, Any]:
+        rows = collect_demo_rows(
+            tree,
+            index_by_seg_id,
+            question_id=question_id,
+            n_each=max(self.ingpo_demo_examples_per_tree, 0),
+        )
+        share_rows, prune_rows = rows["share"], rows["prune"]
+        scalars = {
+            "ingpo/n_prune_demos_in_tree": len(prune_rows),
+            "ingpo/n_share_demos_in_tree": len(share_rows),
+        }
+        if not (prune_rows or share_rows):
+            return {"scalars": scalars, "table": None}
+        try:
+            import wandb  # type: ignore
+        except ImportError:
+            return {"scalars": scalars, "table": None}
+        table = wandb.Table(columns=DEMO_COLUMNS)
+        for r in share_rows + prune_rows:
+            table.add_data(*r)
+        return {"scalars": scalars, "table": table}

@@ -249,6 +249,8 @@ class InGPOInferenceStrategy(HybridInferenceStrategy):
                 child_seg_id = f"{node.get('ingpo_segment_id', 'root')}/{depth}/{ch_idx}"
                 child["ingpo_segment_id"] = child_seg_id
                 child["ingpo_action"] = Action.EXPAND.value
+                child["ingpo_depth"] = depth + 1
+                child["ingpo_parent_segment_id"] = node.get("ingpo_segment_id", "root")
                 if child["finish_reason"] != "length":
                     child["reward"], _ = self.reward_function(
                         query=prefix,
