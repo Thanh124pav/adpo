@@ -27,23 +27,54 @@ ingpo/
 │       └── episode_generators/ingpo_episode_generator.py
 ├── configs/
 │   ├── ingpo_defaults.libsonnet
-│   ├── polIter_*_ingpo_tree_*.jsonnet
-│   ├── episode_generators/branch_factor_{444,666,888}.jsonnet
-│   ├── ablations/abl{1..7}_*.jsonnet
-│   └── baselines/{spo_tree,ppo,rft}_*.jsonnet
+│   ├── ingpo_overlay.libsonnet            # SPO-tree -> InGPO-tree overlay
+│   ├── debug.jsonnet                      # tiny smoke-test config
+│   ├── polIter_qwen1_5b_base_ingpo_tree_MATH.jsonnet
+│   ├── polIter_qwen1b_ingpo_tree_{MATH,point24}.jsonnet
+│   ├── polIter_qwen05b_ingpo_tree_GSM8K.jsonnet
+│   ├── polIter_rho1bSft2_ingpo_tree_{MATH,GSM8K}.jsonnet
+│   ├── episode_generators/
+│   │   ├── branch_factor_{333,444,456,555,654,666,777,888}.jsonnet
+│   │   ├── branch_factor_{3333,4444}.jsonnet     # D=4
+│   │   ├── branch_factor_33333.jsonnet           # D=5
+│   │   └── depth_2_W6.jsonnet                    # D=2 control
+│   ├── ablations/
+│   │   ├── abl1_K{1,5,10,20}_m{20,50,100,200,500}.jsonnet
+│   │   ├── abl2_eta_{0p005,0p01,0p02,0p05,0p10,0p20}.jsonnet
+│   │   ├── abl3_share_target_{parent,root}.jsonnet
+│   │   ├── abl4_{share-only,prune-only,neither}.jsonnet
+│   │   ├── abl{5,6,7}_*.jsonnet
+│   │   └── abl_y_temperature_{0p3,1p0}.jsonnet
+│   └── baselines/
+│       ├── spo_{tree,chain}_{MATH,GSM8K,...}.jsonnet
+│       ├── {ppo,grpo,dpo_positive,restem}_{MATH,GSM8K}.jsonnet
+│       ├── vineppo_GSM8K.jsonnet
+│       └── rft_MATH.jsonnet
 ├── scripts/
-│   ├── setup.sh                 # clone + pip install + dataset prep
-│   ├── start_vllm_server.sh     # alias of SPO's
+│   ├── setup.sh                          # clone + pip install + dataset prep
+│   ├── start_vllm_server.sh              # alias of SPO's
+│   ├── download_cached.sh                # alias of SPO's cache helper
 │   ├── train_ingpo_tree_{MATH,GSM8K}.sh
-│   ├── run_baseline.sh          # SPO / PPO / RFT
+│   ├── train_ingpo_tree_{qwen1b_MATH,qwen1b_point24,qwen05b_GSM8K,rho_MATH}.sh
+│   ├── train_debug.sh                    # 2-iter end-to-end smoke run
+│   ├── run_baseline.sh                   # SPO / PPO / GRPO / DPO / ReSTEM / VinePPO / RFT
+│   ├── run_seeds.sh                      # multi-seed driver
+│   ├── run_smoke.sh                      # config compile + unit tests (CPU-only)
+│   ├── run_all_models.sh                 # iterate every (model, dataset) pair
 │   ├── run_exp1_sample_efficiency.sh
 │   ├── run_exp2_prune_share_rate.sh
 │   ├── run_exp3_overhead.sh
+│   ├── run_exp_deep_tree.sh              # D in {2,3,4,5} compute Pareto
+│   ├── run_exp_eta_sweep.sh              # eta soundness/throughput trade-off
+│   ├── run_exp_K_m_sweep.sh              # scoring budget trade-off
 │   ├── run_ablations.sh
-│   ├── evaluate.sh
-│   ├── build_global_Y.py        # Abl 5 helper
-│   └── oracle_audit.py          # Abl 7 helper
-└── tests/                       # 17 unit tests on the core
+│   ├── evaluate.sh                       # SPO/InGPO checkpoint eval
+│   ├── evaluate_long_cot.sh              # lighteval recipe (math_500 / gsm8k)
+│   ├── inspect_tree.py                   # pretty-print one InGPO tree JSON
+│   ├── aggregate_stats.py                # episodes/*.json -> stats.csv
+│   ├── build_global_Y.py                 # Abl 5 helper
+│   └── oracle_audit.py                   # Abl 7 helper
+└── tests/                                # 17 unit tests on the core
 ```
 
 ## Algorithm map
@@ -135,6 +166,20 @@ PYTHONPATH=ingpo_src python -m pytest tests/ -q
 
 17 unit tests cover the BST, log-prob matrix, TV computation, threshold
 formulas, and the trigger state machine on stub LP vectors.
+
+For a CPU-only smoke check (compiles every jsonnet config + runs the unit
+tests, no GPU/vLLM needed):
+
+```sh
+bash scripts/run_smoke.sh
+```
+
+For an end-to-end debug run (2 iterations, depth-2 tree, m=8) once vLLM is
+up:
+
+```sh
+bash scripts/train_debug.sh
+```
 
 ## Notes
 
