@@ -17,8 +17,13 @@ fi
 # PYTHONPATH: SPO src first (so `treetune` is importable), then InGPO ext.
 export PYTHONPATH="${SPO_ROOT}/src:${INGPO_SRC}:${PYTHONPATH:-}"
 
-# Make jsonnet `import` resolve both InGPO configs and the inherited SPO ones.
-export APP_JSONNET_PATH="${INGPO_ROOT}/configs:${SPO_ROOT}/configs"
+# Make jsonnet `import` resolve in this order:
+#   1. InGPO configs/  -- our overrides
+#   2. SPO  configs/   -- the inherited SPO library
+#   3. SPO root        -- needed because some upstream SPO configs use cwd
+#                         relative imports like 'configs/trainers/...' (SPO is
+#                         normally launched with cwd=SPO_ROOT).
+export APP_JSONNET_PATH="${INGPO_ROOT}/configs:${SPO_ROOT}/configs:${SPO_ROOT}"
 
 # Standard SPO env vars.
 export APP_SEED="${APP_SEED:-42}"
