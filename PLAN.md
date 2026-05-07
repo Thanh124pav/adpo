@@ -1,382 +1,179 @@
-# Chỉ Mục Công Việc — Tái Cấu Trúc ADPO
+# InGTS: Information-Gated Tree Search
+## Unifying Value Sharing and Stopping via Answer-Level Log-Probability
 
-Nhánh làm việc: `reconstruct-project`
+### 1. Problem Statement
+LLM tree search (SPO) expand nhiều node:
+1. **Semantic duplicates**: `P(·|s) ≈ P(·|s')` với `s'` bất kỳ đã tồn tại trong cây.
+2. **Information-irrelevant**: `I(A*; Y_s | Y_pa(s)) ≈ 0`, tức `s` không thêm thông tin so với cha.
 
----
+Goal: Dùng 1 ma trận log-prob để phát hiện cả 2, không hyperparameter, có bound.
 
-## PHASE A — Sửa Lỗi Trong Code Hiện Có (Ưu tiên cao nhất) [DONE]
+### 2. Definitions
 
-| # | File | Lỗi | Cách sửa |
-|---|------|-----|---------|
-| A1 | Tất cả class | `super(self, ClassName).__init__()` | Đổi thành `super().__init__()` |
-| A2 | `reward_computers/base.py` | `compute()` thiếu `self` | Thêm `self` làm tham số đầu tiên |
-| A3 | `reward_computers/attention_reward.py` | `batch_size` dùng trước khi khai báo | Chuyển `batch_size, seq_len = response_mask.shape` lên đầu hàm |
-| A4 | `reward_computers/attention_reward.py` | Thiếu `continue` sau `n_phases <= 1` | Thêm `continue` sau dòng `phase_rewards_batch.append(...)` |
-| A5 | `reward_computers/attention_reward.py` | `from adpo.pure_entropy_algorithm import _partial_forward` | Xóa import này — `_partial_forward` đã định nghĩa trong file |
-| A6 | `reward_computers/attention_reward.py` | Trả về `List[np.ndarray]` thay vì `Tuple[Tensor, Tensor, dict]` | Xem hướng dẫn B2 |
-| A7 | `reward_computers/judge_reward.py` | `self.phase_method` không tồn tại | Xóa dòng logger.info đó |
-| A8 | `reward_computers/judge_reward.py` | Trả về `phase_rewards` thiếu mask và dict | `return phase_rewards, phase_mask_tensor, {}` |
-| A9 | `phase_splitters/pure_entropy_splitter.py` | `split()` thiếu `log_probs=None` | Thêm tham số vào signature cho khớp base |
+**Notation**
+- `s`: node. `pa(s)`: parent. `root`: prompt.
+- `Y = {y_1,...,y_m}`: tập answer global, sinh 1 lần bằng cách prompt model với GT answer.
+- `K`: fast subset, `K << m`. `m`: full set để quyết định.
+- `R_max`: max reward.
 
----
+**Def 2.1 – Log-Probability Matrix**
+Duy trì `LP[i][s] = log P(y_i | s)`, `i=1..m`. Dùng log để ổn định số học.
+`δ_s = log(1 - Σ_i exp(LP[i][s]))`
 
-## PHASE B — Hoàn Thiện Các File Đang Dở
-
-### B1. `reward_computers/entropy_credit_reward.py` — Hoàn thành bị truncate
-
-**Tham số `__init__`:**
+**Def 2.2 – Average Log-Prob & TV**
 ```
-config.algorithm.psi               → self.psi        (default 0.95)
-config.algorithm.default_threshold_percentile → self.threshold_pct (default 90.0)
-config.algorithm.correct_total     → self.correct_total  (default 1.0)
-config.algorithm.incorrect_total   → self.incorrect_total (default -1.0)
-config.algorithm.partial_total     → self.partial_total  (default 0.1)
+AvgLP_K(s) := (1/K) * Σ_{i=1..K} LP
+TV_m(a,b) := 0.5 * Σ_{i=1..m} |exp(LP) - exp(LP)|
+             + 0.5 * (exp(δ_a) + exp(δ_b))
 ```
 
-**`compute()` signature:**
-```python
-def compute(self, boundaries_batch, response_mask, index,
-            entropy,           # Tensor (batch, seq_len) — BẮT BUỘC
-            outcome_rewards,   # List[float] — BẮT BUỘC
-            **context)
--> Tuple[Tensor (batch, max_K), Tensor (batch, max_K), dict]
-```
+**Lemma 2.3 – TV bounds Value [To Prove]**
+Nếu `TV_m(a,b) ≤ η`, thì `|V*(a) - V*(b)| ≤ R_max * (η + exp(δ_avg))`.
 
-**Luồng bên trong** — lấy code từ file cũ:
-1. Gọi `compute_phase_cumulative_entropy(entropy, response_mask, boundaries_batch, psi=self.psi)`
-   → Code: `entropy_credit_algorithm.py:108-166`
-2. Gọi `compute_entropy_credit_rewards(cum_entropy, outcome_rewards, index, correct_total=..., incorrect_total=..., partial_total=..., default_percentile=...)`
-   → Code: `entropy_credit_algorithm.py:173-314`
-3. Convert `List[np.ndarray]` → `Tensor (batch, max_K)` và tạo `phase_mask_tensor`
-4. `return phase_rewards, phase_mask_tensor, {}`
+**Lemma 2.4 – TV bounds Conditional IG [To Prove]**
+`I(A*; Y_s | Y_pa) ≥ 2 * TV_m(s,pa)^2 - O(exp(δ_s)+exp(δ_pa))`.
 
-**Lưu ý:** Cả 2 hàm helper đó có thể import từ `entropy_credit_algorithm.py` hoặc copy vào file mới.
+**Corollary 2.5 – Threshold từ toán**
+Cho `ε` là sai số chấp nhận. Đặt `η = ε / R_max - exp(δ_avg)`. Không cần tune.
 
----
+### 3. Algorithm: InGTS
 
-### B2. Fix return type `AttentionReward.compute()`
-
-Hiện tại trả về `List[np.ndarray]`. Cần convert sang tensor + tạo mask:
-
-```python
-# Sau vòng lặp for b in range(batch_size)...
-max_K = max(len(r) for r in phase_rewards_batch)
-device = response_mask.device
-phase_rewards_tensor = torch.zeros(batch_size, max_K, device=device)
-phase_mask_tensor = torch.zeros(batch_size, max_K, device=device)
-for b, rewards in enumerate(phase_rewards_batch):
-    k = len(rewards)
-    phase_rewards_tensor[b, :k] = torch.tensor(rewards, dtype=torch.float32)
-    phase_mask_tensor[b, :k] = 1.0
-return phase_rewards_tensor, phase_mask_tensor, {}
-```
-
----
-
-## PHASE C — Implement File Còn Trống
-
-### C1. `reward_computers/stitcher_reward.py`
-
-**Constructor nhận 2 objects:**
-```python
-def __init__(self, stitcher: TrajectoryStitcher, splitter: PhaseSplitter, config)
-```
-
-**`compute()` signature:**
-```python
-def compute(self, boundaries_batch, response_mask, index,
-            outcome_rewards,    # List[float]
-            phase_texts_batch,  # List[List[str]]
-            questions,          # List[str]
-            golden_answers,     # List[str]
-            data_sources,       # List[str]
-            entropy=None,       # Tensor (batch, seq_len) — cho entropy splice scoring
-            log_probs=None,     # Tensor (batch, seq_len) — nếu dùng DeliEntropySplitter
-            **context)
--> Tuple[Tensor (batch, max_K), Tensor (batch, max_K), dict]
-  # dict = {"splice_results": Dict[int, SpliceResult]}
-```
-
-**Luồng bên trong:**
-1. Tìm all-wrong groups: `index` + `outcome_rewards` → `all_wrong: Dict[uid, List[int]]`
-2. Với mỗi all-wrong group:
-   a. Gọi `GoldenPathGenerator` để lấy `golden_text` (tái dùng logic `adpo_trainer.py:687-733`)
-   b. Gọi endpoint `echo=True, logprobs=1` trên `golden_text` → lấy `token_logprobs`
-   c. Xấp xỉ: `log_probs_golden[t] = token_logprobs[t]`, `entropy_golden[t] ≈ -log_probs_golden[t]`
-   d. Tạo `response_mask_golden` toàn 1s với shape `(1, len_golden_tokens)`
-   e. Gọi `self.splitter.split(entropy=entropy_golden, response_mask=response_mask_golden, log_probs=log_probs_golden)` → `golden_boundaries`
-   f. Slice `golden_text` theo `golden_boundaries` → `golden_phase_texts: List[str]`
-   g. Gọi `self.stitcher.stitch_group(questions, phase_texts_batch_group, golden_phase_texts, golden_answers, data_sources, boundaries_group)`
-3. Convert `SpliceResult` → `phase_rewards`:
-   - Token trước splice: reward = 0.0
-   - Token tại splice: reward = `result.reward`
-   - Token sau splice: reward giảm dần
-4. `return phase_rewards, phase_mask_tensor, {"splice_results": splice_results_dict}`
-
-**Sửa `TrajectoryStitcher.stitch_group()` (`trajectory_stitching.py:466`):**
-- Xóa tham số `golden_path: str`
-- Thêm tham số `golden_phase_texts: List[str]`  — phases đã chia sẵn từ bên ngoài
-- Xóa dòng gọi `self.segment_golden_path(...)` (dòng 491-493)
-- Dùng `golden_phase_texts` trực tiếp thay vào chỗ `golden_phases`
-- Xóa method `segment_golden_path()` (dòng 184-260) sau khi đã migrate
-
----
-
-### C2. `advantages_computers/phase_advantage.py`
-
-**Class `PhaseAdvantageComputer`:**
-```python
-def __init__(self, config):
-    self.alpha = config.algorithm.get("alpha", 0.5)
-    self.decay_gamma = config.algorithm.get("decay_gamma", 0.0)
-    self.eps = 1e-8
-
-def compute(self, phase_rewards, phase_mask, response_mask,
-            boundaries_batch, index,
-            alpha=None, decay_gamma=None, eps=None)
--> Tensor (batch, seq_len)
-```
-
-**Tham số:**
-- `alpha`: float — tỷ lệ local vs global. `alpha=None` → dùng `self.alpha`
-- `decay_gamma`: float — in-phase decay. `0.0` = không decay (hard assignment)
-
-**Luồng** — copy từ `adpo_algorithm.py`:
-1. `compute_phase_advantages(phase_rewards, phase_mask, index, eps)` → `phase_adv`
-   Code: `adpo_algorithm.py:751-795`
-2. `build_phase_mask(boundaries_batch, seq_len, response_mask)` → `phase_ids`
-   Code: `adpo_algorithm.py:647-674`
-3. `assign_phase_advantages_to_tokens(phase_adv, phase_ids, response_mask, decay_gamma, boundaries_batch)` → `token_adv`
-   Code: `adpo_algorithm.py:798-888`
-4. Normalize by n_phases:
-   ```python
-   for b in range(batch_size):
-       n_phases = len(boundaries_batch[b])
-       if n_phases > 0:
-           token_adv[b] /= n_phases
-   ```
-
-**Lưu ý về alpha:** Hiện tại `compute_phase_advantages()` trong code cũ KHÔNG có alpha — nó dùng adaptive lambda. Kế hoạch refactor thêm alpha mới để:
-```
-A_final = alpha * A_local + (1 - alpha) * A_global
-```
-Đây là thay đổi mới so với code cũ. Cần import/copy `compute_local_advantages` và `compute_global_advantages` từ `adpo_algorithm.py:681-748` rồi kết hợp với alpha.
-
----
-
-### C3. `trainer.py` — Unified Trainer
-
-```python
-class ADPOTrainer:
-    def __init__(self, splitter, reward_computer, advantage_computer, config):
-        self.splitter = splitter
-        self.reward_computer = reward_computer
-        self.advantage_computer = advantage_computer
-        self.alpha = config.algorithm.get("alpha", 0.5)
-
-    def compute_advantages(self, data) -> torch.Tensor:
-        ...
-```
-
-**Luồng `compute_advantages`** — tái dùng pattern từ `adpo_trainer.py:359-991`:
-1. Extract batch fields từ `data`:
-   - `input_ids`, `response_mask`, `log_probs`, `index`
-   - `questions`, `golden_answers`, `data_sources`, `full_responses`
-   - Code tham khảo: `adpo_trainer.py:100-230`
-2. Tính entropy: `compute_token_entropy(log_probs, response_mask)`
-   - Code: `adpo_algorithm.py:431-464` (cũng có ở `pure_entropy_algorithm.py:128-151`)
-3. Split: `self.splitter.split(entropy, response_mask, log_probs, input_ids, tokenizer)` → `boundaries`
-4. Extract phase texts: `self.splitter.extract_phase_texts(...)` → `phase_texts_batch`
-5. Pre-compute `outcome_rewards` bằng `compute_score`
-6. `self.reward_computer.compute(boundaries, response_mask, index, ...)` → `(phase_rewards, phase_mask, metadata)`
-7. `self.advantage_computer.compute(phase_rewards, phase_mask, response_mask, boundaries, index)` → `token_advantages`
-8. Post-process nếu StitcherReward: `compute_stitched_advantages(token_advantages, response_mask, metadata["splice_results"], ...)`
-   Code: `trajectory_stitching.py:545-603`
-9. Return `token_advantages`
-
----
-
-## PHASE D — Tests
-
-### D1. Test PhaseSplitter
-
-**File:** `tests/test_phase_splitters.py`
-
-```python
-# Fixture: tạo tensor giả
-def make_batch(batch_size, seq_len, entropy_values, mask_start=0):
-    entropy = torch.zeros(batch_size, seq_len)
-    # điền entropy_values vào vị trí response
-    response_mask = torch.zeros(batch_size, seq_len)
-    response_mask[:, mask_start:] = 1
-    return entropy, response_mask
-
-# Test 1: Output đúng type
-def test_split_returns_list_of_lists():
-    splitter = PureEntropySplitter(config)
-    boundaries = splitter.split(entropy, response_mask)
-    assert isinstance(boundaries, list)
-    assert all(isinstance(b, list) for b in boundaries)
-
-# Test 2: Boundaries nằm trong range hợp lệ
-def test_boundaries_in_range():
-    boundaries = splitter.split(entropy, response_mask)
-    for b_idx, bounds in enumerate(boundaries):
-        active = response_mask[b_idx].nonzero()[0]
-        start, end = active[0].item(), active[-1].item() + 1
-        assert bounds[0] == start
-        assert all(start <= bd < end for bd in bounds)
-
-# Test 3: Số phases không vượt max_phases
-def test_max_phases_respected():
-    boundaries = splitter.split(entropy, response_mask)
-    assert all(len(b) <= config.phase_max_K for b in boundaries)
-
-# Test 4: Khoảng cách tối thiểu giữa boundaries
-def test_min_phase_len():
-    boundaries = splitter.split(entropy, response_mask)
-    for bounds in boundaries:
-        for i in range(1, len(bounds)):
-            assert bounds[i] - bounds[i-1] >= config.phase_min_len
-
-# Test 5: DeliEntropySplitter — think boundary
-def test_deli_finds_think_boundary():
-    # Tạo token_ids có </think> token
-    ...
-    boundaries = splitter.split(entropy, response_mask, token_ids=ids, tokenizer=tok)
-    # think_end phải xuất hiện trong boundaries
-    assert think_end_pos in boundaries[0]
-```
-
-### D2. Test RewardComputer
-
-**File:** `tests/test_reward_computers.py`
-
-```python
-# Kiểm tra interface contract (quan trọng nhất)
-def test_compute_returns_triple():
-    result = reward.compute(boundaries_batch, response_mask, index, ...)
-    assert len(result) == 3
-    phase_rewards, phase_mask, metadata = result
-    assert isinstance(phase_rewards, torch.Tensor)
-    assert isinstance(phase_mask, torch.Tensor)
-    assert isinstance(metadata, dict)
-
-# Kiểm tra shape
-def test_compute_shape():
-    phase_rewards, phase_mask, _ = reward.compute(...)
-    batch_size = response_mask.shape[0]
-    max_K = max(len(b) for b in boundaries_batch)
-    assert phase_rewards.shape == (batch_size, max_K)
-    assert phase_mask.shape == (batch_size, max_K)
-
-# Kiểm tra mask đúng
-def test_phase_mask_correct():
-    phase_rewards, phase_mask, _ = reward.compute(...)
-    for b, bounds in enumerate(boundaries_batch):
-        n_phases = len(bounds)
-        assert phase_mask[b, :n_phases].all()        # active phases = 1
-        assert not phase_mask[b, n_phases:].any()    # padding = 0
-
-# EntropyReward: sum(rewards) ≈ R_total
-def test_entropy_reward_sum_equals_total():
-    phase_rewards, phase_mask, _ = entropy_reward.compute(
-        ..., outcome_rewards=[1.0, 0.0, 1.0, 0.0]
-    )
-    for b in range(batch_size):
-        n = int(phase_mask[b].sum().item())
-        expected = 1.0 if outcome_rewards[b] >= 1.0 else -1.0
-        actual = phase_rewards[b, :n].sum().item()
-        assert abs(actual - expected) < 1e-4
-```
-
-### D3. Test PhaseAdvantageComputer
-
-**File:** `tests/test_advantage_computer.py`
-
-```python
-# Shape đúng
-def test_output_shape():
-    token_adv = adv_computer.compute(phase_rewards, phase_mask, response_mask, boundaries, index)
-    assert token_adv.shape == response_mask.shape
-
-# Non-response tokens = 0
-def test_non_response_tokens_zero():
-    token_adv = adv_computer.compute(...)
-    assert (token_adv * (1 - response_mask)).abs().max() < 1e-6
-
-# alpha=0 → chỉ global
-def test_alpha_zero_is_pure_global():
-    adv_global = adv_computer.compute(..., alpha=0.0)
-    # Tất cả responses trong cùng group nên có cùng token_adv pattern
-    # (chỉ phụ thuộc vào response score, không phụ thuộc phase distribution)
-
-# alpha=1 → chỉ local
-def test_alpha_one_is_pure_local():
-    adv_local = adv_computer.compute(..., alpha=1.0)
-    # Responses giống nhau trong group vẫn có adv khác nhau (do phases khác nhau)
-
-# Verify: giống output của compute_adpo_phase_advantages() từ code cũ
-def test_matches_old_implementation():
-    old_adv = compute_adpo_phase_advantages(
-        log_probs, phase_rewards, phase_mask, response_mask, index, boundaries
-    )
-    new_adv = adv_computer.compute(phase_rewards, phase_mask, response_mask, boundaries, index, alpha=0.5)
-    # Không cần exact match (alpha mới vs adaptive lambda cũ) nhưng shape và sign phải gần nhau
-```
-
-### D4. Test End-to-End Combo
-
-**File:** `tests/test_trainer_combos.py`
-
-```python
-# Combo 1: (DeliEntropySplitter, JudgeReward, PhaseAdvantageComputer)
-# Combo 2: (PureEntropySplitter, EntropyReward, PhaseAdvantageComputer)
-# Combo 3: (PureEntropySplitter, AttentionReward, PhaseAdvantageComputer)
-
-def test_combo_runs_without_error(splitter, reward_computer, adv_computer):
-    trainer = ADPOTrainer(splitter, reward_computer, adv_computer, config)
-    # Tạo fake data batch
-    data = make_fake_data_batch(batch_size=4, seq_len=64, n_phases=3)
-    token_adv = trainer.compute_advantages(data)
-    assert token_adv.shape == (4, 64)
-    assert not torch.isnan(token_adv).any()
-    assert not torch.isinf(token_adv).any()
-```
-
----
-
-## Thứ Tự Thực Hiện
+InGTS kế thừa SPO: expand song song tất cả con của 1 node. Khi 1 node `s` sinh ra, tính ngay `LP[i][s]` với `i=1..K` và đưa vào BST toàn cục để check duplicate.
 
 ```
-A (fix bugs)
-    ↓
-B1 + B2 (hoàn thiện EntropyReward + AttentionReward return type)
-    ↓
-C2 (PhaseAdvantageComputer) ← đơn giản nhất, không phụ thuộc gì mới
-    ↓
-D1 + D2 + D3 (tests cho splitter, reward, advantage)
-    ↓
-C1 (StitcherReward) + sửa TrajectoryStitcher ← phức tạp nhất
-    ↓
-C3 (Trainer) ← wiring tất cả lại
-    ↓
-D4 (end-to-end test)
+Algorithm: InGTS
+Input: root, depth D, width W, Y={y_1..y_m}, K, η
+Output: tree
+
+1 Global LP[*] ← {}
+2 Global BST ← BinarySortTree() // key = AvgLP_K(s), val = s
+3 Y ← GenerateAnswers(root, m) // prompt model: "List m diverse correct answers"
+4
+5 Procedure ExpandParallel(p, d):
+6 If d > D: return
+7 children ← LLM_Generate(p, W) // W con song song, như SPO
+8 For s in children in parallel do
+9 For i = 1 to K do
+10 LP ← logprob(y_i | s) // vLLM batch
+11 End for
+12 AvgLP_K ← (1/K)*Σ_{i=1..K} LP
+13
+14 // Hướng 1: ValueShare - so với node BẤT KỲ trong cây
+15 s' ← FindNearest(BST, AvgLP_K) // s' có thể ≠ pa(s)
+16 If s' ≠ null and |AvgLP_K - AvgLP_K(s')| < τ_share(K,η) then
+17 TV_m ← ComputeTV_m(s, s') // check full m
+18 If TV_m ≤ η then
+19 ValueShare(s, s') // s.value = s'.value, đánh dấu s.shared
+20 Insert(BST, key=AvgLP_K, value=s) // vẫn insert để cluster
+21 Continue // không expand s nữa
+22 End if
+23 End if
+24
+25 // Hướng 2: Prune - so với CHA, vì đo IG điều kiện
+26 If AvgLP_K < AvgLP_K(pa(s)) - τ_prune(K,η) then
+27 If AvgLP_m(s) < AvgLP_m(pa(s)) - η then // check full m
+28 PruneNode(s) // I(A*;Y_s|Y_pa)≈0
+29 Continue // không expand s
+30 End if
+31 End if
+32
+33 Insert(BST, key=AvgLP_K, value=s)
+34 ExpandParallel(s, d+1)
+35 End parallel for
+36 End Procedure
+37
+38 ExpandParallel(root, 1)
+39 return tree
 ```
 
----
+**Procedure: ComputeTV_m(a, b)**
+```
+1 TV ← 0
+2 For i = 1 to m do
+3 TV ← TV + 0.5*|exp(LP) - exp(LP)|
+4 End for
+5 TV ← TV + 0.5*(exp(δ_a) + exp(δ_b))
+6 return TV
+```
 
-## Mapping Code Cũ → Code Mới
+**Thresholds từ DKW Bound**
+```
+τ(K,η) = η + sqrt(log(2/α) / (2K)), α=0.05
+```
+`τ_share`, `τ_prune` dùng chung công thức. `η` từ Cor 2.5.
 
-| Code mới | Lấy từ đâu |
-|----------|-----------|
-| `PureEntropySplitter.split()` | `pure_entropy_algorithm.py:31-121` |
-| `DeliEntropySplitter.split()` | `adpo_algorithm.py:264-576` (detect_phase_boundaries_adaptive/entropy) |
-| `PhaseSplitter.extract_phase_texts()` | `adpo_algorithm.py:625-644` (segment_response_into_phases) |
-| `AttentionReward.compute()` | `pure_entropy_trainer.py:437-493` |
-| `JudgeReward.compute()` | `adpo_trainer.py:750-930` |
-| `EntropyReward.compute()` | `entropy_credit_trainer.py:250-285` |
-| `PhaseAdvantageComputer.compute()` | `adpo_algorithm.py:681-947` |
-| `compute_stitched_advantages()` | `trajectory_stitching.py:545-603` (giữ nguyên) |
-| Helper: `compute_token_entropy()` | `adpo_algorithm.py:431` hoặc `pure_entropy_algorithm.py:128` |
-| Helper: `build_phase_mask()` | `adpo_algorithm.py:647` |
+**Theorem 3.1 – Regret Bound [To Prove]**
+InGTS đạt `Regret(T) ≤ Õ(√T + R_max · m · η · T)`.
+
+### 4. Experiments to Run
+
+Kế thừa 100% setup SPO để so sánh công bằng.
+
+**Models**: DeepSeek-Distill-Qwen-1.5B, Rho-math-1.1b-SFT.
+**Tree**: 4-4-4, 6-6-6, 8-8-8.
+**Datasets**: GSM8K, MATH, CollegeMath, OlympiadBench, split như SPO.
+
+**Baselines**
+1. **SPO**: gốc.
+2. **ToT-SC**: entropy pruning `τ=0.5`.
+3. **LATS**: `λ=0.1`.
+4. **InGTS**: `K=10`, `m=100`, `η` từ Cor 2.5.
+
+**Exp 1: Compute-Accuracy Pareto**
+Metrics: Pass@1, Majority@64 vs Total FLOPs.
+Goal: InGTS <50% FLOPs tại cùng Pass@1.
+
+**Exp 2: Share/Prune Stats**
+Metrics: `%nodes ValueShared`, `%nodes Pruned`, `avg TV_m khi share`, `avg ΔAvgLP_m khi prune`.
+Goal: 30-60% node bị loại, acc drop <1%.
+
+**Exp 3: Latency**
+Metrics: Time cho `LP[i][s]` K=10, BST ops, toàn run.
+Goal: Overhead <5% nhờ `K<<m`.
+
+### 5. Ablation Studies
+
+**Abl 1: `K` vs `m`**
+Vary `K∈{5,10,20,50}`, `m∈{20,50,100,200}`. Metrics: FP rate của fast filter, time, acc.
+Hypothesis: `K=10, m=100` tối ưu.
+
+**Abl 2: `η` theory vs tuned**
+So `η` từ Cor 2.5 vs grid `{0.005,0.01,0.02,0.05}`.
+Metrics: Pareto curve. Hypothesis: theory `η` nằm trên Pareto.
+
+**Abl 3: Duplicate vs Parent vs Root**
+- V1: ValueShare chỉ với `pa(s)`.
+- V2: ValueShare với `root`.
+- V3: ValueShare với `nearest` như InGTS.
+Metrics: Share rate, acc. Hypothesis: V3 >> V1, V2.
+
+**Abl 4: Share-only vs Prune-only vs Both**
+Tắt lần lượt line 15-22, 25-30.
+Metrics: FLOPs vs acc. Hypothesis: Both tốt nhất.
+
+**Abl 5: LogP vs Prob**
+Implement lại dùng `exp(LP)` từ đầu.
+Metrics: số lần NaN/overflow, acc. Hypothesis: LogP bắt buộc với `y_i` dài.
+
+**Abl 6: BST vs Linear Scan**
+Thay BST bằng scan toàn bộ node.
+Metrics: Time trên 8-8-8. Hypothesis: BST nhanh 5-10x.
+
+**Abl 7: Oracle False Rate**
+Sample 100 node bị Share/Prune. Check GT: Share sai nếu `|V*(s)-V*(s')|>ε`. Prune sai nếu có path tới GT.
+Metrics: False Share, False Prune. Hypothesis: <3% tại `η=0.01`.
+
+### 6. Implementation Notes
+1. **Answer set Y**: Prompt 1 lần: `"Given problem and solution, list {m} diverse complete answers:"`. Temp=0.7.
+2. **vLLM**: `SamplingParams(prompt_logprobs=1)`. Với mỗi `y_i`, concat `prompt+s+y_i`, lấy sum logprob của `y_i` tokens. Batch K `y_i` * W children.
+3. **BST**: `sortedcontainers.SortedDict` key=`AvgLP_K`. `FindNearest` = O(logN).
+4. **Numerical**: Mọi sum dùng `torch.logsumexp`. Chỉ `exp` khi tính `TV_m`.
+5. **Parallel**: `ThreadPoolExecutor` cho vòng `For s in children`. `LP` là `defaultdict`.
+
+### 7. Contributions
+1. **Algorithm**: InGTS, SPO-style parallel search với ValueShare cho duplicate bất kỳ + Prune cho IG≈0.
+2. **Theory**: Thresholds `η,τ` derive từ bound, không tune.
+3. **Practice**: Giảm 2-3x FLOPs trên setup SPO gốc, không đổi model/data.
+
+### 8. Reproducibility
+Sẽ release code + `Y` + config. `K=10, m=100`. Mọi siêu tham số khác kế thừa SPO.
