@@ -38,6 +38,8 @@ from ingpo_ext.core.logging_helpers import (
     DEMO_COLUMNS,
     collect_demo_rows,
     per_depth_action_counts,
+    render_md_section,
+    to_jsonl_record,
 )
 
 
@@ -51,6 +53,8 @@ class InGPOEpisodeGenerator(HybridEpisodeGenerator):
         ingpo_emit_pruned_edges: bool = False,
         ingpo_share_inherit: str = "value_and_reward",  # or "value_only"
         ingpo_demo_examples_per_tree: int = 2,  # how many SHARE / PRUNE demos to log per tree
+        ingpo_demos_dir: Optional[str] = None,  # absolute path; else exp_root/ingpo_demos
+        ingpo_log_demos_to_wandb: bool = False,  # for offline servers, default off
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -58,7 +62,13 @@ class InGPOEpisodeGenerator(HybridEpisodeGenerator):
         self.ingpo_emit_pruned_edges = ingpo_emit_pruned_edges
         self.ingpo_share_inherit = ingpo_share_inherit
         self.ingpo_demo_examples_per_tree = int(ingpo_demo_examples_per_tree)
-        # Reservoir of demo rows; flushed at the end of each tree.
+        self.ingpo_log_demos_to_wandb = bool(ingpo_log_demos_to_wandb)
+        # Where to dump local-file demos. Resolves on first use because
+        # exp_root is only set after super().__init__ on some SPO branches.
+        self._ingpo_demos_dir_override = ingpo_demos_dir
+        self._ingpo_demos_dir_resolved = None  # type: Optional[Any]
+        self._ingpo_jsonl_handle = None
+        self._ingpo_md_handle = None
         self._tree_seen = 0
 
     # ------------------------------------------------------------------
@@ -91,22 +101,38 @@ class InGPOEpisodeGenerator(HybridEpisodeGenerator):
 
         ingpo_stats = tree_copy.get("ingpo_stats", {})
         per_depth = self._per_depth_action_counts(tree_copy)
-        demo_payload = self._build_demo_payload(
+        demo_rows = collect_demo_rows(
             tree_copy,
             index_by_seg_id,
             question_id=question_id,
+            n_each=max(self.ingpo_demo_examples_per_tree, 0),
         )
         self._tree_seen += 1
+
+        # ---- Local-file demo dump (works offline, no wandb required) -----
+        self._dump_demos_to_disk(
+            tree_idx=self._tree_seen,
+            question_id=question_id,
+            stats=ingpo_stats,
+            per_depth=per_depth,
+            demo_rows=demo_rows,
+            answer_set_size=tree_copy.get("ingpo_answer_set_size", 0),
+        )
+
+        # ---- Optional wandb scalar+table logging --------------------------
         if ingpo_stats or per_depth:
             log_entry = {
                 **ingpo_stats,
                 "ingpo/answer_set_size": tree_copy.get("ingpo_answer_set_size", 0),
                 "ingpo/tree_idx": self._tree_seen,
                 **per_depth,
+                "ingpo/n_share_demos_in_tree": len(demo_rows["share"]),
+                "ingpo/n_prune_demos_in_tree": len(demo_rows["prune"]),
             }
-            log_entry.update(demo_payload["scalars"])
-            if demo_payload["table"] is not None:
-                log_entry["ingpo/demos"] = demo_payload["table"]
+            if self.ingpo_log_demos_to_wandb:
+                table = self._maybe_build_wandb_table(demo_rows)
+                if table is not None:
+                    log_entry["ingpo/demos"] = table
             self._cloud_log(log_entry)
 
         def BoK(value, bok=4):
@@ -205,30 +231,102 @@ class InGPOEpisodeGenerator(HybridEpisodeGenerator):
     def _per_depth_action_counts(tree) -> Dict[str, float]:
         return per_depth_action_counts(tree)
 
-    def _build_demo_payload(
-        self,
-        tree,
-        index_by_seg_id: Dict[str, Dict[str, Any]],
-        question_id,
-    ) -> Dict[str, Any]:
-        rows = collect_demo_rows(
-            tree,
-            index_by_seg_id,
-            question_id=question_id,
-            n_each=max(self.ingpo_demo_examples_per_tree, 0),
-        )
-        share_rows, prune_rows = rows["share"], rows["prune"]
-        scalars = {
-            "ingpo/n_prune_demos_in_tree": len(prune_rows),
-            "ingpo/n_share_demos_in_tree": len(share_rows),
-        }
-        if not (prune_rows or share_rows):
-            return {"scalars": scalars, "table": None}
+    def _maybe_build_wandb_table(self, demo_rows):
+        if not (demo_rows["share"] or demo_rows["prune"]):
+            return None
         try:
             import wandb  # type: ignore
         except ImportError:
-            return {"scalars": scalars, "table": None}
+            return None
         table = wandb.Table(columns=DEMO_COLUMNS)
-        for r in share_rows + prune_rows:
+        for r in demo_rows["share"] + demo_rows["prune"]:
             table.add_data(*r)
-        return {"scalars": scalars, "table": table}
+        return table
+
+    # ------------------------------------------------------------------
+    # Offline-friendly file dump
+    # ------------------------------------------------------------------
+
+    def _resolve_demos_dir(self):
+        if self._ingpo_demos_dir_resolved is not None:
+            return self._ingpo_demos_dir_resolved
+
+        from pathlib import Path
+
+        if self._ingpo_demos_dir_override:
+            base = Path(self._ingpo_demos_dir_override)
+        elif getattr(self, "exp_root", None) is not None:
+            base = Path(self.exp_root) / "ingpo_demos"
+        else:
+            base = Path.cwd() / "ingpo_demos"
+
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning(f"InGPO: could not create demos dir {base}: {exc}")
+            self._ingpo_demos_dir_resolved = False
+            return False
+        self._ingpo_demos_dir_resolved = base
+        return base
+
+    def _open_demo_handles(self):
+        base = self._resolve_demos_dir()
+        if base is False:
+            return None, None
+        if self._ingpo_jsonl_handle is None:
+            self._ingpo_jsonl_handle = (base / "demos.jsonl").open("a", buffering=1)
+        if self._ingpo_md_handle is None:
+            self._ingpo_md_handle = (base / "demos.md").open("a", buffering=1)
+            if self._ingpo_md_handle.tell() == 0:
+                self._ingpo_md_handle.write(
+                    "# InGPO SHARE / PRUNE demos\n\n"
+                    "One section per tree. `tail -F demos.md` to follow live.\n\n"
+                )
+        return self._ingpo_jsonl_handle, self._ingpo_md_handle
+
+    def _dump_demos_to_disk(
+        self,
+        tree_idx: int,
+        question_id,
+        stats: Dict[str, Any],
+        per_depth: Dict[str, float],
+        demo_rows: Dict[str, List[List[Any]]],
+        answer_set_size: int,
+    ) -> None:
+        if max(self.ingpo_demo_examples_per_tree, 0) == 0 and not stats:
+            return
+
+        jsonl, md = self._open_demo_handles()
+        if jsonl is None:
+            return  # silent: never block training because logging failed
+
+        # JSONL row: machine-readable. One line per tree.
+        record = to_jsonl_record(
+            tree_idx=tree_idx,
+            question_id=question_id,
+            answer_set_size=answer_set_size,
+            stats=stats,
+            per_depth=per_depth,
+            demo_rows=demo_rows,
+        )
+        try:
+            jsonl.write(json.dumps(record, default=str) + "\n")
+        except Exception as exc:
+            logger.warning(f"InGPO: failed to append demos.jsonl: {exc}")
+
+        # Markdown: human-readable. One section per tree, only if there's
+        # something interesting (rates or demos) to show.
+        if not (demo_rows["share"] or demo_rows["prune"]):
+            return
+        try:
+            md.write(render_md_section(tree_idx, question_id, stats, demo_rows))
+        except Exception as exc:
+            logger.warning(f"InGPO: failed to append demos.md: {exc}")
+
+    def __del__(self):
+        for h in (self._ingpo_jsonl_handle, self._ingpo_md_handle):
+            try:
+                if h is not None:
+                    h.close()
+            except Exception:
+                pass

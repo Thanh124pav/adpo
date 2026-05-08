@@ -159,3 +159,73 @@ def test_truncate():
     assert truncate("abc", 5) == "abc"
     assert truncate("abcdefghij", 6) == "abc..."
     assert truncate("a\nb") == "a \\n b"
+
+
+def test_render_md_section_share_and_prune():
+    from ingpo_ext.core.logging_helpers import render_md_section, to_jsonl_record
+
+    tree, index = make_tree()
+    rows = collect_demo_rows(tree, index, question_id="q-7", n_each=4)
+    md = render_md_section(
+        tree_idx=3,
+        question_id="q-7",
+        stats={"ingpo/share_rate": 0.5, "ingpo/prune_rate": 0.5,
+               "ingpo/shared_count": 1, "ingpo/pruned_count": 1,
+               "ingpo/expanded_count": 2},
+        demo_rows=rows,
+    )
+    assert "Tree #3" in md
+    assert "share_rate: **0.500**" in md
+    assert "prune_rate: **0.500**" in md
+    assert "### SHARE demos" in md
+    assert "### PRUNE demos" in md
+    # Per-row content is included.
+    assert "duplicate-of-root child B" in md
+    assert "way-off-track" in md
+    assert "shared->`root`" in md
+
+
+def test_render_md_section_no_demos_still_safe():
+    from ingpo_ext.core.logging_helpers import render_md_section
+
+    md = render_md_section(
+        tree_idx=0,
+        question_id="qid",
+        stats={},
+        demo_rows={"share": [], "prune": []},
+    )
+    assert md.startswith("## Tree #0")
+    # No demo subsections when there are no rows.
+    assert "### SHARE" not in md
+    assert "### PRUNE" not in md
+
+
+def test_to_jsonl_record_roundtrip():
+    import json as _json
+    from ingpo_ext.core.logging_helpers import to_jsonl_record
+
+    tree, index = make_tree()
+    rows = collect_demo_rows(tree, index, question_id="q-7", n_each=2)
+    record = to_jsonl_record(
+        tree_idx=11,
+        question_id="q-7",
+        answer_set_size=42,
+        stats={"ingpo/share_rate": 0.5},
+        per_depth={"ingpo/depth_1/share_rate": 0.5},
+        demo_rows=rows,
+    )
+    # Must be JSON-serialisable.
+    blob = _json.dumps(record, default=str)
+    parsed = _json.loads(blob)
+    assert parsed["tree_idx"] == 11
+    assert parsed["answer_set_size"] == 42
+    # demo dict has share/prune lists with column-keyed entries.
+    assert isinstance(parsed["demos"]["share"], list)
+    if parsed["demos"]["share"]:
+        s = parsed["demos"]["share"][0]
+        assert s["action"] == "share"
+        assert "child_text" in s
+        assert "parent_text" in s
+    if parsed["demos"]["prune"]:
+        p = parsed["demos"]["prune"][0]
+        assert p["action"] == "prune"

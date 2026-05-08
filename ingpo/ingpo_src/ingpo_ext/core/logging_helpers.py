@@ -105,3 +105,76 @@ def collect_demo_rows(
         "share": share_rows[:n_each],
         "prune": prune_rows[:n_each],
     }
+
+
+def row_to_dict(row: List[Any]) -> Dict[str, Any]:
+    return dict(zip(DEMO_COLUMNS, row))
+
+
+def render_md_section(
+    tree_idx: int,
+    question_id,
+    stats: Dict[str, Any],
+    demo_rows: Dict[str, List[List[Any]]],
+) -> str:
+    """One Markdown section for one tree, ready to append to demos.md."""
+
+    out = [f"## Tree #{tree_idx}  (question_id={question_id})\n"]
+    if stats:
+        share_rate = float(stats.get("ingpo/share_rate", 0.0) or 0.0)
+        prune_rate = float(stats.get("ingpo/prune_rate", 0.0) or 0.0)
+        out.append(
+            f"- share_rate: **{share_rate:.3f}**, prune_rate: **{prune_rate:.3f}**, "
+            f"#shared={stats.get('ingpo/shared_count', 0)}, "
+            f"#pruned={stats.get('ingpo/pruned_count', 0)}, "
+            f"#expanded={stats.get('ingpo/expanded_count', 0)}\n"
+        )
+
+    for label, rows in (("SHARE", demo_rows["share"]), ("PRUNE", demo_rows["prune"])):
+        if not rows:
+            continue
+        out.append(f"### {label} demos\n")
+        for row in rows:
+            d = row_to_dict(row)
+            line = (
+                f"- depth={d['depth']}  seg={d['seg_id']}  "
+                f"AvgLP_K={float(d['avg_lp_K']):.3f}  "
+            )
+            if d.get("tv_m") is not None:
+                line += f"TV_m={float(d['tv_m']):.3f}  "
+            if d.get("gap_m") is not None:
+                line += f"gap_m={float(d['gap_m']):.3f}  "
+            line += f"(eta={float(d['eta']):.3f}, tau={float(d['tau']):.3f})\n"
+            out.append(line)
+            out.append(f"  - parent : `{d['parent_text']}`\n")
+            out.append(f"  - child  : `{d['child_text']}`\n")
+            if d.get("target_text"):
+                out.append(
+                    f"  - shared->`{d['target_seg_id']}` : `{d['target_text']}`\n"
+                )
+        out.append("\n")
+    out.append("\n")
+    return "".join(out)
+
+
+def to_jsonl_record(
+    tree_idx: int,
+    question_id,
+    answer_set_size: int,
+    stats: Dict[str, Any],
+    per_depth: Dict[str, float],
+    demo_rows: Dict[str, List[List[Any]]],
+) -> Dict[str, Any]:
+    """Pack one tree's metrics + demos into a JSONL-ready dict."""
+
+    return {
+        "tree_idx": tree_idx,
+        "question_id": question_id,
+        "answer_set_size": answer_set_size,
+        "stats": stats,
+        "per_depth": per_depth,
+        "demos": {
+            "share": [row_to_dict(r) for r in demo_rows["share"]],
+            "prune": [row_to_dict(r) for r in demo_rows["prune"]],
+        },
+    }
