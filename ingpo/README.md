@@ -181,6 +181,88 @@ up:
 bash scripts/train_debug.sh
 ```
 
+## Logging (offline-friendly)
+
+InGPO logging works **without internet / wandb** — demos and rates are
+written to local files under
+`<APP_DIRECTORY>/<exp_name>/ingpo_demos/` per tree. wandb is optional
+(`ingpo.log_demos_to_wandb = false` by default, so no upload attempts).
+
+### Per-tree scalar metrics (always emitted, also to wandb if enabled)
+
+Aggregate rates:
+
+* `ingpo/share_rate`, `ingpo/prune_rate`,
+  `ingpo/expanded_count`, `ingpo/shared_count`, `ingpo/pruned_count`
+* `ingpo/avg_tv_when_share`, `ingpo/avg_gap_when_prune`
+* `ingpo/answer_set_size`
+
+Per-depth breakdown (one set per depth `d` reached in the tree):
+
+* `ingpo/depth_<d>/n`, `expand_count`, `share_count`, `prune_count`,
+  `share_rate`, `prune_rate`
+
+### Demo files (local filesystem)
+
+Two append-only files written next to your experiment dir:
+
+| File                                     | Audience            | Format                         |
+|------------------------------------------|---------------------|--------------------------------|
+| `ingpo_demos/demos.jsonl`                | scripts / analysis  | JSON-Lines, one record/tree    |
+| `ingpo_demos/demos.md`                   | humans              | Markdown, section per tree     |
+
+Each tree contributes up to `ingpo.demo_examples_per_tree` SHARE rows and
+the same for PRUNE rows. Each row carries:
+
+| column        | meaning                                                  |
+|---------------|----------------------------------------------------------|
+| question_id   | dataset row id                                           |
+| action        | `share` or `prune`                                       |
+| depth         | depth of the child segment                               |
+| seg_id        | tree-internal id of the child segment                    |
+| parent_text   | text of the parent segment (truncated to 240 chars)      |
+| child_text    | text of the candidate segment that fired the trigger     |
+| target_text   | SHARE only — text of the segment we shared into          |
+| target_seg_id | id of that share target                                  |
+| avg_lp_K      | the candidate's K-subset AvgLP                           |
+| tv_m          | TV_m to share target (SHARE only)                        |
+| gap_m         | AvgLP_m gap to parent (PRUNE only)                       |
+| eta, tau      | thresholds in effect for this decision                   |
+
+### Reading demos on a server with no GUI
+
+Watch the human-readable Markdown live during training:
+
+```sh
+bash scripts/tail_demos.sh <exp_name>           # tail -F demos.md
+bash scripts/tail_demos.sh <exp_name> jsonl     # raw JSONL stream
+```
+
+Filter / pretty-print after the run:
+
+```sh
+# show first 20 share+prune demos
+python scripts/inspect_demos.py experiments/<exp>/ingpo_demos/demos.jsonl
+
+# only PRUNE demos at depth 2, first 5
+python scripts/inspect_demos.py experiments/<exp>/ingpo_demos/demos.jsonl \
+    --action prune --depth 2 --limit 5
+
+# just totals, no demo bodies
+python scripts/inspect_demos.py experiments/<exp>/ingpo_demos/demos.jsonl --summary
+```
+
+`inspect_demos.py` only needs the standard library — copy it onto any
+offline machine.
+
+### Knobs (override in any jsonnet via `ingpo+: { ... }`)
+
+| Knob                             | Default | Purpose                                |
+|----------------------------------|---------|----------------------------------------|
+| `demo_examples_per_tree`         | `2`     | rows of each (SHARE/PRUNE) per tree    |
+| `demos_dir`                      | `null`  | absolute override; else `<exp_root>/ingpo_demos` |
+| `log_demos_to_wandb`             | `false` | also push the wandb.Table when running with wandb |
+
 ## Notes
 
 * The vLLM `/v1/completions` endpoint is hit with `echo=True, logprobs=1,
