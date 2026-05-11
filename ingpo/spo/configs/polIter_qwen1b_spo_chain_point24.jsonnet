@@ -1,4 +1,4 @@
-local hf_model_name = 'deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B';
+local hf_model_name = '/workspace/storage-shared/models/DeepSeek-R1-Distill-Qwen-1.5B';
 
 local task = (import 'tasks/point24.jsonnet');
 

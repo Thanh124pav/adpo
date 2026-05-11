@@ -1,4 +1,4 @@
-local hf_model_name = 'deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B';
+local hf_model_name = '/workspace/storage-shared/models/DeepSeek-R1-Distill-Qwen-1.5B';
 
 local math_task = (import 'tasks/math_inplace_no_answer_prefix.jsonnet') + {
   prepend_in_context_few_shot: false,
