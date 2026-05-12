@@ -346,7 +346,21 @@ class EfficientIIDExpander(NodeExpander):
                 logger.warning(
                     f"Overriding max_tokens: {program_kwargs.get('max_tokens')} -> {new_max_tokens}"
                 )
-            assert new_max_tokens > 0, f"new_max_tokens: {new_max_tokens}"
+            if new_max_tokens <= 0:
+                logger.warning(
+                    "Non-positive max_tokens after context clamp; "
+                    "returning truncated leaf nodes."
+                )
+                return [
+                    {
+                        "text": "",
+                        "depth": depth,
+                        "full_text": prefix,
+                        "stop_text": None,
+                        "finish_reason": "length",
+                    }
+                    for _ in range(branch_factor)
+                ]
             program_kwargs["max_tokens"] = new_max_tokens
 
         program_kwargs["num_samples"] = branch_factor
