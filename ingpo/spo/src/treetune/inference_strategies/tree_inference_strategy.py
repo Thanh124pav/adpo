@@ -311,56 +311,74 @@ class TreeInferenceStrategy(InferenceStrategy):
             "text": initial_prompt,
             "depth": 0,
             "full_text": initial_prompt,
-            # `stop_text` is not used for the root node,
-            # but we set it to some random string Milad said.
             "stop_text": "aaa",
-            # We only store the data instance in the root node
-            # to cover the cases where node_expander or answer_extractor
-            # needs it
             "_request_object": data_instance,
         }
 
-        async def dfs(node: Node, prefix: str, depth: int) -> None:
-            if depth >= max_depth:
-                return
-
-            children = await self.node_expander.expand(node, prefix, depth)
-            node["children"] = children
-
-            # Either the child has finished (and we need to extract the answer)
-            # or we need to expand the child further.
-            # Both tasks can be done concurrently.
+        # BFS + Level-Wise Batching approach
+        # Instead of DFS recursion, we process nodes level by level
+        current_level_nodes = [tree]
+        
+        for depth in range(max_depth):
+            if not current_level_nodes:
+                break
+            
+            # Collect all nodes at the current level that need expansion
+            nodes_to_expand = []
+            prefixes = []
+            
+            for node in current_level_nodes:
+                # Check if this node should be expanded (trigger logic is inside expander usually,
+                # but here we assume if it has children or not determined by expander)
+                # In original DFS, expand() is called and returns children.
+                # We need to call expand() for all nodes in this level.
+                nodes_to_expand.append(node)
+                prefixes.append(node["full_text"])
+            
+            # Expand all nodes in the current level concurrently
+            # This leverages the EfficientIIDExpander's ability to batch if configured,
+            # or at least runs expansions in parallel without deep recursion overhead
+            expansion_tasks = []
+            for node, prefix in zip(nodes_to_expand, prefixes):
+                expansion_tasks.append(
+                    self.node_expander.expand(node, prefix, depth)
+                )
+            
+            # Wait for all expansions at this level to complete
+            children_lists = await asyncio.gather(*expansion_tasks)
+            
+            # Assign children to nodes
+            next_level_nodes = []
             answer_extraction_tasks = []
-            children_expansion_tasks = []
-            for child in children:
-                # Check if the child can be produce an answer
-                if child["stop_text"] is None:
-                    # This means we have reached the end of the reasoning chain
-                    answer_extraction_tasks.append(
-                        asyncio.create_task(
+            
+            for node, children in zip(nodes_to_expand, children_lists):
+                node["children"] = children
+                for child in children:
+                    next_level_nodes.append(child)
+                    
+                    # Check if the child can produce an answer
+                    if child.get("stop_text") is None:
+                        # Reached end of reasoning chain
+                        answer_extraction_tasks.append(
                             self.answer_extractor.extract_from_node(child)
                         )
-                    )
-                else:
-                    # If the child cannot produce an answer, we continue the search
-                    # by expanding the child
-                    answer_extraction_tasks.append(None)
-                    children_expansion_tasks.append(
-                        asyncio.create_task(dfs(child, child["full_text"], depth + 1))
-                    )
+                    else:
+                        answer_extraction_tasks.append(None)
+            
+            # Process answer extractions concurrently
+            if answer_extraction_tasks:
+                answers = await asyncio.gather(*answer_extraction_tasks)
+                idx = 0
+                for node, children in zip(nodes_to_expand, children_lists):
+                    for i, child in enumerate(children):
+                        if child.get("stop_text") is None:
+                            child["answer"] = answers[idx]
+                            idx += 1
+            
+            # Move to next level
+            current_level_nodes = next_level_nodes
 
-            # Wait for the answer extraction tasks to finish
-            for child, answer in zip(children, answer_extraction_tasks):
-                if answer is not None:
-                    child["answer"] = await answer
-
-            # Wait for the children expansion tasks to finish
-            await asyncio.gather(*children_expansion_tasks)
-
-        await dfs(tree, initial_prompt, 0)
-
-        # Remove the `_data_instance` field from the tree
-        # as it is not needed anymore
+        # Remove the `_request_object` field from the tree
         tree.pop("_request_object", None)
 
         return tree

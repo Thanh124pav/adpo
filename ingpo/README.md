@@ -2,7 +2,7 @@
 
 Chào mừng bạn đến với **InGPO** - một cải tiến của thuật toán **SPO (Segment Policy Optimization)** giúp tối ưu hóa việc huấn luyện mô hình ngôn ngữ lớn (LLM) trên các tác vụ suy luận.
 
-## 🎯 InGPO là gì?
+## InGPO là gì?
 
 InGPO thêm hai cơ chế thông minh vào quá trình tìm kiếm cây (tree search) của SPO:
 
@@ -11,7 +11,7 @@ InGPO thêm hai cơ chế thông minh vào quá trình tìm kiếm cây (tree se
 
 Cả hai cơ chế này được kích hoạt dựa trên **Total Variation (TV) bound** - một ngưỡng thống kê đảm bảo tính chính xác.
 
-## 📁 Cấu trúc thư mục
+## Cấu trúc thư mục
 
 ```
 ingpo/
@@ -31,7 +31,7 @@ ingpo/
 └── tests/                       # Unit tests
 ```
 
-## 🚀 Bắt đầu nhanh
+## Bắt đầu nhanh
 
 ### Bước 1: Cài đặt môi trường
 
@@ -72,7 +72,7 @@ bash scripts/evaluate.sh polIter_qwen1_5b_base_ingpo_tree_MATH \
     experiments/ingpo-tree-666-qwen1.5b-math/iteration_0010
 ```
 
-## 🧪 Chạy các thí nghiệm
+## Chạy các thí nghiệm
 
 ### Thí nghiệm chính từ paper
 
@@ -104,7 +104,7 @@ ABLATIONS="abl1 abl2 abl3 abl4 abl5 abl6 abl7" bash scripts/run_ablations.sh
 | `abl6-no-dkw` | Tắt DKW band → τ = η |
 | `abl7-oracle-record` | Giữ lại PRUNE/SHARE edges để audit |
 
-## ✅ Kiểm tra (Tests)
+## Kiểm tra (Tests)
 
 ```bash
 # Chạy unit tests
@@ -117,7 +117,7 @@ bash scripts/run_smoke.sh
 bash scripts/train_debug.sh
 ```
 
-## 📊 Logging và Theo dõi
+## Logging và Theo dõi
 
 InGPO hỗ trợ logging **offline** (không cần internet):
 
@@ -156,7 +156,7 @@ python scripts/inspect_demos.py experiments/<exp>/ingpo_demos/demos.jsonl \
 python scripts/inspect_demos.py experiments/<exp>/ingpo_demos/demos.jsonl --summary
 ```
 
-## ⚙️ Cấu hình quan trọng
+## Cấu hình quan trọng
 
 Các tham số mặc định nằm trong `configs/ingpo_defaults.libsonnet`:
 
@@ -177,17 +177,41 @@ Bạn có thể override bất kỳ tham số nào trong file config `.jsonnet`:
 }
 ```
 
-## 🔍 Lưu ý kỹ thuật
+## Lưu ý kỹ thuật
 
 - **vLLM scoring**: InGPO dùng endpoint `/v1/completions` với `echo=True, logprobs=1, max_tokens=0` để tính log-probability của các đáp án trong tập Y.
 - **Không sửa code SPO**: Tất cả logic InGPO được thêm qua Python decorators và Jsonnet inheritance, code gốc của SPO giữ nguyên.
 - **WandB optional**: Logging wandb tắt mặc định (`log_demos_to_wandb: false`), chỉ bật nếu bạn muốn upload lên wandb.ai.
 
-## 📄 License
+## License
 
 Giống như SPO - MIT License. Xem [`spo/LICENSE`](./spo/LICENSE) để biết chi tiết.
 
-## 📚 Tài liệu tham khảo
+## Tài liệu tham khảo
 
 - **[PLAN.md](./PLAN.md)**: Đặc tả chi tiết thuật toán InGPO
 - **[SPO Repository](https://github.com/AIFrameResearch/SPO)**: Code gốc của SPO
+
+---
+
+## Notes: Các file thực hiện Build Tree
+
+Dưới đây là danh sách các file chính chịu trách nhiệm xây dựng cây tìm kiếm (Tree Building) trong dự án:
+
+### 1. Logic cốt lõi (Core Logic)
+- **`ingpo/spo/tree_builder.py`** (hoặc `spo/tree_builder.py`): Chứa lớp `TreeBuilder` hoặc các hàm đệ quy `build_tree`, `expand_node`. Đây là nơi triển khai thuật toán DFS/BFS và quản lý cấu trúc cây.
+- **`ingpo/spo/nodes.py`** (hoặc tương đương): Định nghĩa các lớp `Node`, `TreeNode`, lưu trữ trạng thái, log_prob, và value của từng node.
+
+### 2. Scripts chạy thực nghiệm (Entry Points)
+- **`ingpo/scripts/build_global_Y.py`**: Script chính để xây dựng cây toàn cục (global tree) cho tập dữ liệu.
+- **`ingpo/scripts/run_tree_search.py`**: Script dùng để test và chạy tìm kiếm cây với các tham số cấu hình cụ thể.
+
+### 3. Cấu hình (Configs)
+- **`ingpo/configs/`** và **`ingpo/spo/configs/`**: Các file `.jsonnet` định nghĩa tham số như `max_depth`, `branching_factor`, `temperature`, và đường dẫn model.
+  - Ví dụ: `polIter_qwen1b_ingpo_tree_MATH.jsonnet`
+
+### 4. Tiện ích hỗ trợ (Utilities)
+- **`ingpo/spo/utils/cache.py`**: Xử lý việc lưu/load cây đã build để tránh tính toán lại.
+- **`ingpo/spo/utils/batch_inference.py`**: Các hàm wrapper để gọi model theo batch (cần kiểm tra xem đã tối ưu cho tree chưa).
+
+> **Lưu ý hiệu năng:** Nếu cần tối ưu tốc độ, hãy tập trung vào `tree_builder.py` để chuyển đổi từ DFS sang BFS kết hợp Batch Inference Across Levels.
