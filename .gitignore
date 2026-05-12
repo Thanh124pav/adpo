@@ -13,33 +13,6 @@
 .vscode/
 .idea/
 
-# Dependencies
-.venv/
-venv/
-__pycache__/
-.mypy_cache/
-.pytest_cache/
-node_modules/
-
-# Build artifacts
-dist/
-build/
-target/
-
-# OS generated files
-.DS_Store
-Thumbs.db
-
-# Coverage reports
-coverage/
-htmlcov/
-.coverage
-
-# Compiled Python
-*.pyc
-*.pyo
-*.pyd
-
 # Original rules preserved
 *.log
 ```
