@@ -260,6 +260,7 @@ def analyse_hf(
     answer_checker: Optional[Callable[[Optional[str], str], bool]] = None,
     extract_answer_fn: Optional[Callable[[str], Optional[str]]] = None,
     compute_p: bool = True,
+    compute_p_inline: bool = False,
     top_k_logprobs: int = 20,
     max_concurrent: int = 4,
 ) -> Node:
@@ -270,18 +271,24 @@ def analyse_hf(
     ----------
     backend : HFBackend
         Loaded :class:`~.hf_helpers.HFBackend` instance.
+    compute_p_inline : bool
+        If True, compute P inline via answer branch during tree building.
+        Supersedes the post-hoc ``compute_p`` forward-pass scoring.
     (other parameters identical to :func:`analyse`)
     """
     checker = answer_checker or default_answer_checker
     ext_fn  = extract_answer_fn or extract_answer
     tkw     = tree_kwargs or {}
 
-    root = backend.build_tree(question, extract_answer_fn=ext_fn, **tkw)
+    root = backend.build_tree(
+        question, extract_answer_fn=ext_fn,
+        compute_p_inline=compute_p_inline, **tkw,
+    )
 
     assign_names(root)
     compute_v(root, gold_answer, checker)
 
-    if compute_p:
+    if compute_p and not compute_p_inline:
         backend.compute_p_tree(root, gold_answer)
 
     backend.annotate_top_logprobs(root, top_k=top_k_logprobs)
@@ -298,6 +305,7 @@ async def analyse_hf_async(
     answer_checker: Optional[Callable[[Optional[str], str], bool]] = None,
     extract_answer_fn: Optional[Callable[[str], Optional[str]]] = None,
     compute_p: bool = True,
+    compute_p_inline: bool = False,
     top_k_logprobs: int = 20,
     max_concurrent: int = 4,
 ) -> Node:
@@ -306,14 +314,19 @@ async def analyse_hf_async(
     ext_fn  = extract_answer_fn or extract_answer
     tkw     = tree_kwargs or {}
 
-    root = await backend.build_tree_async(question, extract_answer_fn=ext_fn, **tkw)
+    root = await backend.build_tree_async(
+        question, extract_answer_fn=ext_fn,
+        compute_p_inline=compute_p_inline, **tkw,
+    )
 
     assign_names(root)
     compute_v(root, gold_answer, checker)
 
-    if compute_p:
+    if compute_p and not compute_p_inline:
         await backend.compute_p_tree_async(root, gold_answer, max_concurrent=max_concurrent)
 
-    await backend.annotate_top_logprobs_async(root, top_k=top_k_logprobs, max_concurrent=max_concurrent)
+    await backend.annotate_top_logprobs_async(
+        root, top_k=top_k_logprobs, max_concurrent=max_concurrent
+    )
     compute_jsd(root)
     return root
