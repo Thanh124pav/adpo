@@ -3,7 +3,7 @@ local temperature = 0;
 
 local tokenizer = {
   type: 'pretrained',
-  hf_model_name: 'deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B',
+  hf_model_name: '/workspace/storage-shared/models/DeepSeek-R1-Distill-Qwen-1.5B',
 };
 
 local math_inference_pipeline =

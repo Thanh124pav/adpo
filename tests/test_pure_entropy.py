@@ -9,7 +9,7 @@ Usage:
     python tests/test_pure_entropy.py --unit
 
     # Full integration test with a real model:
-    python tests/test_pure_entropy.py --model deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+    python tests/test_pure_entropy.py --model /workspace/storage-shared/models/DeepSeek-R1-Distill-Qwen-1.5B
 
     # Full test with local model path:
     python tests/test_pure_entropy.py --model /path/to/model

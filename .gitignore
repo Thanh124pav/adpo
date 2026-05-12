@@ -1,13 +1,45 @@
+```
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# Editors
+.vscode/
+.idea/
+
+# Dependencies
+.venv/
+venv/
 __pycache__/
-*.pyc
-*.egg-info/
+.mypy_cache/
+.pytest_cache/
+node_modules/
+
+# Build artifacts
 dist/
 build/
-data/processed/
-checkpoints/
-results/
-wandb/
-.hydra/
+target/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Coverage reports
+coverage/
+htmlcov/
+.coverage
+
+# Compiled Python
+*.pyc
+*.pyo
+*.pyd
+
+# Original rules preserved
 *.log
-.env
-*/outputs
+```
