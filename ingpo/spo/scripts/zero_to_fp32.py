@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
@@ -10,7 +10,7 @@
 # the future. Once extracted, the weights don't require DeepSpeed and can be used in any
 # application.
 #
-# example: python zero_to_fp32.py . pytorch_model.bin
+# example: python3 zero_to_fp32.py . pytorch_model.bin
 
 import argparse
 import torch

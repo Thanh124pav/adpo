@@ -169,6 +169,7 @@ class VLLMServer(FromParams):
         self.port = port
         self.server_running_check_url = server_running_check_url
         self.process: Optional[subprocess.Popen] = None
+        self._gpu_idx: Optional[int] = None
 
     def _wait_for_server(
         self,
@@ -234,6 +235,8 @@ class VLLMServer(FromParams):
 
         if self.port is None:
             self.port = get_free_port()
+
+        self._gpu_idx = gpu_idx
 
         def launch_func():
             self._launch_process(gpu_idx, hf_ckpt_path_or_model, log_path)
@@ -323,3 +326,46 @@ class VLLMServer(FromParams):
 
         self.process.kill()
         self.process.wait()
+
+        # On B200/newer GPUs, vLLM worker processes can hold CUDA memory even
+        # after the main process is killed. Force-kill processes on this GPU.
+        if self._gpu_idx is not None:
+            self._force_free_gpu_memory(self._gpu_idx)
+
+    def _force_free_gpu_memory(self, gpu_idx: int):
+        """Kill remaining processes holding CUDA memory on a specific GPU."""
+        import signal
+
+        try:
+            result = subprocess.run(
+                [
+                    "nvidia-smi",
+                    f"--id={gpu_idx}",
+                    "--query-compute-apps=pid",
+                    "--format=csv,noheader",
+                ],
+                text=True,
+                capture_output=True,
+            )
+            pids = [
+                int(p.strip())
+                for p in result.stdout.splitlines()
+                if p.strip().isdigit()
+            ]
+        except Exception as e:
+            logger.warning(f"Could not query GPU {gpu_idx} processes: {e}")
+            pids = []
+
+        if pids:
+            logger.info(
+                f"Force-killing {len(pids)} process(es) still on GPU {gpu_idx}: {pids}"
+            )
+            for pid in pids:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except Exception as e:
+                    logger.warning(f"Could not kill PID {pid}: {e}")
+
+        time.sleep(5)

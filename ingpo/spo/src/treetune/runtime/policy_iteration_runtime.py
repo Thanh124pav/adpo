@@ -976,7 +976,7 @@ class PolicyIterationRuntime(DistributedRuntime):
             # We need to use `zero_to_fp32.py` to convert the checkpoint
             # to a format that can be loaded by vLLM
             logger.info("Converting DeepSpeed checkpoint to vLLM checkpoint")
-            command = f"python {get_zero_to_fp32_script_path()} {ckpt_dir} {output_dir}/pytorch_model.bin"
+            command = f"python3 {get_zero_to_fp32_script_path()} {ckpt_dir} {output_dir}/pytorch_model.bin"
 
             # Run the command using subprocess
             try:
