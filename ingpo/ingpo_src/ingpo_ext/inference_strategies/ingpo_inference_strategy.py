@@ -52,6 +52,7 @@ from ingpo_ext.core.local_value_share import (
     pair_budget,
     sampled_tv_from_logps,
     select_candidate_pairs,
+    stable_softmax,
 )
 from ingpo_ext.core.vllm_scorer import VLLMLogprobClient, make_lp_scorer
 
@@ -192,13 +193,10 @@ class InGPOInferenceStrategy(HybridInferenceStrategy):
         gold = data_instance.get(self.ingpo_y_field) if data_instance else None
         problem_id = str(data_instance.get("_treetune__idx", uuid.uuid4())) if data_instance else str(uuid.uuid4())
 
-        needs_answer_set = (
-            self.ingpo_enable_prune
-            or (self.ingpo_enable_share and not self.ingpo_local_value_share)
-        )
+        needs_answer_set = self.ingpo_enable_share and not self.ingpo_local_value_share
 
-        # Pruning and the legacy ValueShare trigger still need Y.  The
-        # sibling-local ValueShare path does not.
+        # The sibling-local ValueShare / Prune path does not need Y.  We only
+        # build Y for the legacy answer-set ValueShare trigger.
         answer_set: AnswerSet = AnswerSet(problem_id=problem_id, gold=gold or "", y=[])
         y_task = (
             asyncio.create_task(
@@ -211,6 +209,8 @@ class InGPOInferenceStrategy(HybridInferenceStrategy):
         engine: Optional[TriggerEngine] = None
         local_shared_count = 0
         local_avg_tv_share = 0.0
+        local_pruned_count = 0
+        local_avg_gap_prune = 0.0
 
         tree: Node = {
             "text": initial_prompt,
@@ -240,7 +240,7 @@ class InGPOInferenceStrategy(HybridInferenceStrategy):
                 scorer=scorer,
                 thresholds=self.cfg_thresholds,
                 enable_share=self.ingpo_enable_share and not self.ingpo_local_value_share,
-                enable_prune=self.ingpo_enable_prune,
+                enable_prune=False,
                 share_target=self.ingpo_share_target,
                 root_segment_id="root",
             )
@@ -287,8 +287,21 @@ class InGPOInferenceStrategy(HybridInferenceStrategy):
             )
             return sampled_tv_from_logps(src_scores, tgt_scores)
 
-        async def _try_local_value_share(siblings: Sequence[Node]) -> None:
+        async def _score_sibling_probs(parent: Node, siblings: Sequence[Node]) -> Dict[str, float]:
+            if not siblings:
+                return {}
+            scores = await asyncio.gather(
+                *(scorer.score_one(parent["full_text"], child.get("text", "")) for child in siblings)
+            )
+            probs = stable_softmax(scores)
+            return {
+                child["ingpo_segment_id"]: float(probs[idx])
+                for idx, child in enumerate(siblings)
+            }
+
+        async def _try_local_value_share_and_prune(parent: Node, siblings: Sequence[Node]) -> None:
             nonlocal local_shared_count, local_avg_tv_share
+            nonlocal local_pruned_count, local_avg_gap_prune
             candidates = [
                 child for child in siblings
                 if child.get("ingpo_action") == Action.EXPAND.value
@@ -308,14 +321,11 @@ class InGPOInferenceStrategy(HybridInferenceStrategy):
                 budget=budget,
             )
             eta = _share_eta()
+            pair_tvs: Dict[frozenset, float] = {}
 
             for i, j in pairs:
                 src = candidates[j]
                 tgt = candidates[i]
-                if src.get("ingpo_action") != Action.EXPAND.value:
-                    continue
-                if tgt.get("ingpo_action") != Action.EXPAND.value:
-                    continue
 
                 continuations = []
                 seen = set()
@@ -335,8 +345,13 @@ class InGPOInferenceStrategy(HybridInferenceStrategy):
                     logger.warning(f"InGPO local ValueShare failed: {exc}")
                     continue
 
+                pair_tvs[frozenset((src["ingpo_segment_id"], tgt["ingpo_segment_id"]))] = tv
                 radius = confidence_radius(len(continuations), self.cfg_thresholds.alpha)
                 lhs = tv + radius if self.ingpo_share_use_confidence else tv
+                if src.get("ingpo_action") != Action.EXPAND.value:
+                    continue
+                if tgt.get("ingpo_action") != Action.EXPAND.value:
+                    continue
                 if lhs <= eta:
                     decision = LocalShareDecision(
                         source_id=src["ingpo_segment_id"],
@@ -367,6 +382,59 @@ class InGPOInferenceStrategy(HybridInferenceStrategy):
                             local_avg_tv_share * local_shared_count + tv
                         ) / n
                         local_shared_count = n
+
+            if not self.ingpo_enable_prune:
+                return
+
+            try:
+                sibling_probs = await _score_sibling_probs(parent, candidates)
+            except Exception as exc:
+                logger.warning(f"InGPO local Prune probability scoring failed: {exc}")
+                return
+
+            for child in candidates:
+                if child.get("ingpo_action") != Action.EXPAND.value:
+                    continue
+                if child.get("leaf", False):
+                    continue
+                # Never prune depth-1 nodes.  The root's first branching layer
+                # is too early for a stable value comparison.
+                if int(child.get("ingpo_depth", 0) or 0) <= 1:
+                    continue
+
+                weighted_bound = 0.0
+                child_id = child["ingpo_segment_id"]
+                for other in candidates:
+                    other_id = other["ingpo_segment_id"]
+                    if other_id == child_id:
+                        continue
+                    tv = pair_tvs.get(frozenset((child_id, other_id)), 1.0)
+                    weighted_bound += (
+                        sibling_probs.get(other_id, 0.0)
+                        * self.cfg_thresholds.r_max
+                        * tv
+                    )
+
+                if weighted_bound < self.cfg_thresholds.epsilon:
+                    child["ingpo_action"] = Action.PRUNE.value
+                    child["ingpo_share_target"] = None
+                    child["ingpo_value_parent_gap_bound"] = weighted_bound
+                    child["ingpo_prune_value_eps"] = self.cfg_thresholds.epsilon
+                    child["ingpo_prune_policy_prob"] = sibling_probs.get(child_id, 0.0)
+                    child["leaf"] = True
+                    child["reward"] = float("nan")
+                    child.pop("children", None)
+
+                    if engine is not None:
+                        if engine.stats.expanded > 0:
+                            engine.stats.expanded -= 1
+                        engine.stats.update_prune(weighted_bound)
+                    else:
+                        n = local_pruned_count + 1
+                        local_avg_gap_prune = (
+                            local_avg_gap_prune * local_pruned_count + weighted_bound
+                        ) / n
+                        local_pruned_count = n
 
         def _set_reward_summary(node: Node) -> None:
             child_rewards = []
@@ -505,8 +573,8 @@ class InGPOInferenceStrategy(HybridInferenceStrategy):
                     probe["ingpo_parent_segment_id"] = child["ingpo_segment_id"]
                 child["children"] = probe_children
 
-            if self.ingpo_enable_share and self.ingpo_local_value_share:
-                await _try_local_value_share(children)
+            if self.ingpo_local_value_share and (self.ingpo_enable_share or self.ingpo_enable_prune):
+                await _try_local_value_share_and_prune(node, children)
 
             expansion_tasks = []
             for child in children:
@@ -530,16 +598,16 @@ class InGPOInferenceStrategy(HybridInferenceStrategy):
         if engine is not None:
             tree["ingpo_stats"] = engine.stats.as_dict()
         else:
-            total = local_shared_count
+            total = local_shared_count + local_pruned_count
             tree["ingpo_stats"] = {
                 "ingpo/expanded_count": 0,
                 "ingpo/shared_count": local_shared_count,
-                "ingpo/pruned_count": 0,
+                "ingpo/pruned_count": local_pruned_count,
                 "ingpo/share_rate": local_shared_count / max(total, 1),
-                "ingpo/prune_rate": 0.0,
+                "ingpo/prune_rate": local_pruned_count / max(total, 1),
                 "ingpo/avg_tv_when_share": local_avg_tv_share,
-                "ingpo/avg_gap_when_prune": 0.0,
-            } if local_shared_count else {}
+                "ingpo/avg_gap_when_prune": local_avg_gap_prune,
+            } if total else {}
         tree["ingpo_answer_set_size"] = answer_set.m
         return tree
 

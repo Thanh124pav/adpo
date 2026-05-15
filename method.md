@@ -226,6 +226,58 @@ For each parent node `p`:
 This spends a small probe budget to identify redundant siblings, then avoids
 expanding redundant subtrees to full depth.
 
+## Value-Based Pruning
+
+Pruning now uses the same sibling-local rollout geometry as ValueShare and does
+not require the global answer set. Let the children of a parent be sampled under
+the local policy:
+
+$$
+p_j = \pi_\theta(s_j \mid p)
+$$
+
+The parent value decomposes as:
+
+$$
+V(p) = \sum_j p_j V(s_j)
+$$
+
+For one child `s_i`, subtracting the parent value gives:
+
+$$
+V(s_i) - V(p) = \sum_j p_j\left(V(s_i) - V(s_j)\right)
+$$
+
+The pairwise value gap is bounded by the local rollout TV used by ValueShare:
+
+$$
+\left|V(s_i) - V(s_j)\right| \leq R_{\max}\widehat{TV}_{C_{ij}}(s_i,s_j)
+$$
+
+Therefore the child-parent value gap is bounded by:
+
+$$
+\left|V(s_i) - V(p)\right| \leq \sum_j p_j R_{\max}\widehat{TV}_{C_{ij}}(s_i,s_j)
+$$
+
+The prune rule is:
+
+$$
+\sum_j p_j R_{\max}\widehat{TV}_{C_{ij}}(s_i,s_j) < \epsilon
+$$
+
+If this holds, the child is close enough to the parent value that expanding the
+child is not useful. The node is marked PRUNE, recursion below it stops, and
+its downstream value is resolved as a deterministic random point in:
+
+$$
+[V(p)-\epsilon, V(p)+\epsilon]
+$$
+
+Depth-1 children are never pruned. This avoids cutting the first branching
+layer before the tree has enough local rollout evidence. Nodes already marked
+SHARE are not eligible for PRUNE.
+
 ## Why This Replaces the Global Answer Set for ValueShare
 
 The previous ValueShare trigger used a global set of full solutions and raw
