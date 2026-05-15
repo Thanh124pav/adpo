@@ -19,6 +19,7 @@ The corresponding `*_strategy` registration lets configs use
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 from typing import Any, Dict, List, Optional
@@ -152,6 +153,12 @@ class InGPOEpisodeGenerator(HybridEpisodeGenerator):
                             return float(target_r)
                     return float(fallback_parent_reward)
                 if action == "prune":
+                    eps = node.get("ingpo_prune_value_eps")
+                    if eps is not None:
+                        key = str(node.get("ingpo_segment_id", node.get("text", "")))
+                        digest = hashlib.sha256(key.encode("utf-8")).digest()
+                        u = int.from_bytes(digest[:8], "big") / float(2**64 - 1)
+                        return float(fallback_parent_reward) + (2.0 * u - 1.0) * float(eps)
                     return float(fallback_parent_reward)
                 return None
             return float(r)
