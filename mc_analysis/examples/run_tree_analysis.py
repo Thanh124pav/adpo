@@ -6,7 +6,7 @@ Rho-Math-1.1B with three tree configs, then save results as HTML.
 
 Models
 ------
-  DeepSeek-R1-Distill-Qwen-1.5B   deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+  DeepSeek-R1-Distill-Qwen-1.5B   /workspace/storage-shared/models/DeepSeek-R1-Distill-Qwen-1.5B
   Rho-Math-1.1B                   microsoft/rho-math-1.1b-v0.1
 
 Tree structures
@@ -23,14 +23,14 @@ Usage
 -----
   # Script starts/stops vLLM automatically
   python run_tree_analysis.py \\
-      --model deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \\
+      --model /workspace/storage-shared/models/DeepSeek-R1-Distill-Qwen-1.5B \\
       --save-dir ./results/deepseek
 
   # vLLM already running → skip auto-start
   python run_tree_analysis.py \\
       --server http://localhost:8000/v1 \\
       --no-auto-server \\
-      --model deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+      --model /workspace/storage-shared/models/DeepSeek-R1-Distill-Qwen-1.5B
 
   # Rho-Math, only 6-6-6, question 0
   python run_tree_analysis.py \\
@@ -92,7 +92,7 @@ TREE_CONFIGS = {
 }
 
 MODELS = {
-    "deepseek": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+    "deepseek": "/workspace/storage-shared/models/DeepSeek-R1-Distill-Qwen-1.5B",
     "rho":      "microsoft/rho-math-1.1b-v0.1",
 }
 

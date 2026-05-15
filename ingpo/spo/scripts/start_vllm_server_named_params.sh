@@ -30,7 +30,7 @@ done
 
 export VLLM_HF_FOLDER_CACHE_FILE=$HF_HOME/vllm_hf_folder_cache.json
 
-CUDA_VISIBLE_DEVICES=$GPU_IDX python -m vllm.entrypoints.openai.api_server \
+CUDA_VISIBLE_DEVICES=$GPU_IDX python3 -m vllm.entrypoints.openai.api_server \
     --model "$MODEL" \
     --host 0.0.0.0 \
     --port "$PORT" \

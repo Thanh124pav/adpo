@@ -311,56 +311,62 @@ class TreeInferenceStrategy(InferenceStrategy):
             "text": initial_prompt,
             "depth": 0,
             "full_text": initial_prompt,
-            # `stop_text` is not used for the root node,
-            # but we set it to some random string Milad said.
             "stop_text": "aaa",
-            # We only store the data instance in the root node
-            # to cover the cases where node_expander or answer_extractor
-            # needs it
             "_request_object": data_instance,
         }
 
-        async def dfs(node: Node, prefix: str, depth: int) -> None:
-            if depth >= max_depth:
-                return
+        queue = asyncio.Queue()
+        await queue.put((tree, initial_prompt, 0))
 
-            children = await self.node_expander.expand(node, prefix, depth)
-            node["children"] = children
+        num_workers = max(1, self.max_concurrent_programs)
+        worker_errors = []
 
-            # Either the child has finished (and we need to extract the answer)
-            # or we need to expand the child further.
-            # Both tasks can be done concurrently.
-            answer_extraction_tasks = []
-            children_expansion_tasks = []
-            for child in children:
-                # Check if the child can be produce an answer
-                if child["stop_text"] is None:
-                    # This means we have reached the end of the reasoning chain
-                    answer_extraction_tasks.append(
-                        asyncio.create_task(
-                            self.answer_extractor.extract_from_node(child)
-                        )
-                    )
-                else:
-                    # If the child cannot produce an answer, we continue the search
-                    # by expanding the child
-                    answer_extraction_tasks.append(None)
-                    children_expansion_tasks.append(
-                        asyncio.create_task(dfs(child, child["full_text"], depth + 1))
-                    )
+        async def worker() -> None:
+            while True:
+                node, prefix, depth = await queue.get()
+                try:
+                    if depth >= max_depth:
+                        continue
 
-            # Wait for the answer extraction tasks to finish
-            for child, answer in zip(children, answer_extraction_tasks):
-                if answer is not None:
-                    child["answer"] = await answer
+                    children = await self.node_expander.expand(node, prefix, depth)
+                    node["children"] = children
 
-            # Wait for the children expansion tasks to finish
-            await asyncio.gather(*children_expansion_tasks)
+                    answer_extraction_tasks = []
+                    answer_extraction_children = []
 
-        await dfs(tree, initial_prompt, 0)
+                    for child in children:
+                        if child.get("stop_text") is None:
+                            answer_extraction_tasks.append(
+                                self.answer_extractor.extract_from_node(child)
+                            )
+                            answer_extraction_children.append(child)
+                        else:
+                            await queue.put((child, child["full_text"], depth + 1))
 
-        # Remove the `_data_instance` field from the tree
-        # as it is not needed anymore
+                    if answer_extraction_tasks:
+                        answers = await asyncio.gather(*answer_extraction_tasks)
+                        for child, answer in zip(answer_extraction_children, answers):
+                            child["answer"] = answer
+                except Exception as exc:
+                    worker_errors.append(exc)
+                finally:
+                    queue.task_done()
+
+        workers = [
+            asyncio.create_task(worker())
+            for _ in range(num_workers)
+        ]
+
+        await queue.join()
+
+        for worker_task in workers:
+            worker_task.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+
+        if worker_errors:
+            raise worker_errors[0]
+
+        # Remove the `_request_object` field from the tree
         tree.pop("_request_object", None)
 
         return tree

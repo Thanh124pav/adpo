@@ -6,7 +6,7 @@ Designed for machines with limited VRAM (≥4 GB) using 4-bit quantization.
 
 Models
 ------
-  DeepSeek-R1-Distill-Qwen-1.5B   deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+  DeepSeek-R1-Distill-Qwen-1.5B   /workspace/storage-shared/models/DeepSeek-R1-Distill-Qwen-1.5B
   Rho-Math-1.1B                   microsoft/rho-math-1.1b-v0.1
 
 Tree structures
@@ -23,12 +23,12 @@ Usage
 -----
   # Built-in questions, tree 4-4-4, int4 quantization
   python run_local_hf.py \
-      --model deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
+      --model /workspace/storage-shared/models/DeepSeek-R1-Distill-Qwen-1.5B \
       --tree 4-4-4 --load-in-4bit
 
   # Load 8 random examples from a parquet dataset
   python run_local_hf.py \
-      --model deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
+      --model /workspace/storage-shared/models/DeepSeek-R1-Distill-Qwen-1.5B \
       --parquet /path/to/gsm8k.parquet --num-examples 8 --seed 7 \
       --tree 4-4-4 --load-in-4bit
 
@@ -85,7 +85,7 @@ TREE_CONFIGS = {
 }
 
 MODELS = {
-    "deepseek": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+    "deepseek": "/workspace/storage-shared/models/DeepSeek-R1-Distill-Qwen-1.5B",
     "rho":      "microsoft/rho-math-1.1b-v0.1",
 }
 

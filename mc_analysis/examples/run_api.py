@@ -39,7 +39,7 @@ Usage
   # Local vLLM already running (no API key)
   python run_api.py \\
       --api-url  http://localhost:8000/v1 \\
-      --model    deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+      --model    /workspace/storage-shared/models/DeepSeek-R1-Distill-Qwen-1.5B
 """
 
 import argparse

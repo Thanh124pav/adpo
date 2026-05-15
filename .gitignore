@@ -1,13 +1,18 @@
-__pycache__/
-*.pyc
-*.egg-info/
-dist/
-build/
-data/processed/
-checkpoints/
-results/
-wandb/
-.hydra/
+```
+# Logs and temp files
 *.log
+*.tmp
+*.swp
+
+# Environment
 .env
-*/outputs
+.env.local
+*.env.*
+
+# Editors
+.vscode/
+.idea/
+
+# Original rules preserved
+*.log
+```
