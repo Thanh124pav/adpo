@@ -70,29 +70,17 @@ $$
 Normalize the scores on the sampled support:
 
 $$
-\hat p_i(c)
-=
-\frac{\exp(L_i(c))}
-{\sum_{c' \in C_{ij}} \exp(L_i(c'))}
+\hat p_i(c) = \frac{\exp(L_i(c))}{\sum_{c' \in C_{ij}} \exp(L_i(c'))}
 $$
 
 $$
-\hat p_j(c)
-=
-\frac{\exp(L_j(c))}
-{\sum_{c' \in C_{ij}} \exp(L_j(c'))}
+\hat p_j(c) = \frac{\exp(L_j(c))}{\sum_{c' \in C_{ij}} \exp(L_j(c'))}
 $$
 
 The sampled local total variation distance is:
 
 $$
-\widehat{TV}_{C_{ij}}(s_i,s_j)
-=
-\frac{1}{2}
-\sum_{c \in C_{ij}}
-\left|
-\hat p_i(c) - \hat p_j(c)
-\right|
+\widehat{TV}_{C_{ij}}(s_i,s_j) = \frac{1}{2}\sum_{c \in C_{ij}}\left|\hat p_i(c) - \hat p_j(c)\right|
 $$
 
 The implementation computes this with a stable log-softmax-style shift, so very
@@ -109,30 +97,19 @@ $$
 A Hoeffding-style concentration radius is:
 
 $$
-r(n_{ij}, \alpha)
-=
-\sqrt{
-\frac{\log(2/\alpha)}
-{2n_{ij}}
-}
+r(n_{ij}, \alpha) = \sqrt{\frac{\log(2/\alpha)}{2n_{ij}}}
 $$
 
 Given tolerated value error `epsilon` and reward bound `R_max`, define:
 
 $$
-\eta_{\text{share}}
-=
-\frac{\epsilon}{R_{\max}}
+\eta_{\text{share}} = \frac{\epsilon}{R_{\max}}
 $$
 
 The conservative share rule is:
 
 $$
-\widehat{TV}_{C_{ij}}(s_i,s_j)
-+
-r(n_{ij}, \alpha)
-\leq
-\eta_{\text{share}}
+\widehat{TV}_{C_{ij}}(s_i,s_j) + r(n_{ij}, \alpha) \leq \eta_{\text{share}}
 $$
 
 The implementation exposes the confidence term as an option. By default, the
@@ -140,9 +117,7 @@ online rule drops the radius because small rollout supports make the radius too
 conservative for the current default epsilon:
 
 $$
-\widehat{TV}_{C_{ij}}(s_i,s_j)
-\leq
-\eta_{\text{share}}
+\widehat{TV}_{C_{ij}}(s_i,s_j) \leq \eta_{\text{share}}
 $$
 
 When the selected rule holds, one sibling is marked SHARE and points to the
@@ -156,13 +131,7 @@ latency, the implementation evaluates only a fixed fraction of sibling pairs.
 The default budget is:
 
 $$
-B
-=
-\min
-\left(
-\frac{W(W-1)}{2},
-\left\lfloor 0.25 W^2 \right\rceil
-\right)
+B = \min\left(\frac{W(W-1)}{2}, \left\lfloor 0.25 W^2 \right\rceil\right)
 $$
 
 This is approximately:
@@ -202,31 +171,14 @@ $$
 The standard TV inequality gives:
 
 $$
-\left|
-\mathbb{E}_{c \sim P_H(\cdot \mid s_i)}[f(c)]
--
-\mathbb{E}_{c \sim P_H(\cdot \mid s_j)}[f(c)]
-\right|
-\leq
-R_{\max}
-TV(P_H(\cdot \mid s_i), P_H(\cdot \mid s_j))
+\left|\mathbb{E}_{c \sim P_H(\cdot \mid s_i)}[f(c)] - \mathbb{E}_{c \sim P_H(\cdot \mid s_j)}[f(c)]\right| \leq R_{\max}TV(P_H(\cdot \mid s_i), P_H(\cdot \mid s_j))
 $$
 
 The implementation estimates this TV using the sampled support. The total
 estimation error decomposes as:
 
 $$
-\left|
-\widehat{TV}_{C_{ij}}
--
-TV(P_H^i, P_H^j)
-\right|
-\leq
-\epsilon_{\text{MC}}
-+
-\epsilon_H
-+
-\epsilon_B
+\left|\widehat{TV}_{C_{ij}} - TV(P_H^i, P_H^j)\right| \leq \epsilon_{\text{MC}} + \epsilon_H + \epsilon_B
 $$
 
 The terms are:
@@ -238,33 +190,14 @@ The terms are:
 A practical concentration term for the Monte Carlo component is:
 
 $$
-\epsilon_{\text{MC}}
-=
-O
-\left(
-\sqrt{
-\frac{\log(1/\delta)}
-{n_{ij}}
-}
-\right)
+\epsilon_{\text{MC}} = O\left(\sqrt{\frac{\log(1/\delta)}{n_{ij}}}\right)
 $$
 
 With the confidence option enabled, a sufficient operational condition for
 sharing is:
 
 $$
-R_{\max}
-\left(
-\widehat{TV}_{C_{ij}}
-+
-r(n_{ij}, \alpha)
-+
-\epsilon_H
-+
-\epsilon_B
-\right)
-\leq
-\epsilon
+R_{\max}\left(\widehat{TV}_{C_{ij}} + r(n_{ij}, \alpha) + \epsilon_H + \epsilon_B\right) \leq \epsilon
 $$
 
 In code, the rollout-depth error and pair-selection bias are controlled by the
@@ -272,9 +205,7 @@ rollout budget and pair budget rather than explicitly estimated. The default
 practical rule is:
 
 $$
-\widehat{TV}_{C_{ij}}
-\leq
-\frac{\epsilon}{R_{\max}}
+\widehat{TV}_{C_{ij}} \leq \frac{\epsilon}{R_{\max}}
 $$
 
 ## Online Algorithm
