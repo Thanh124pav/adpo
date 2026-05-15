@@ -23,11 +23,10 @@ disabled.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import uuid
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 import openai
@@ -47,6 +46,13 @@ from ingpo_ext.core.answer_set import (
 )
 from ingpo_ext.core.thresholds import ThresholdConfig
 from ingpo_ext.core.triggers import Action, TriggerEngine
+from ingpo_ext.core.local_value_share import (
+    LocalShareDecision,
+    confidence_radius,
+    pair_budget,
+    sampled_tv_from_logps,
+    select_candidate_pairs,
+)
 from ingpo_ext.core.vllm_scorer import VLLMLogprobClient, make_lp_scorer
 
 logger = get_logger(__name__)
@@ -67,6 +73,9 @@ class InGPOInferenceStrategy(HybridInferenceStrategy):
         ingpo_enable_share: bool = True,
         ingpo_enable_prune: bool = True,
         ingpo_share_target: str = "nearest",
+        ingpo_local_value_share: bool = True,
+        ingpo_share_pair_budget_fraction: float = 0.25,
+        ingpo_share_use_confidence: bool = False,
         ingpo_y_prompt_template: str = DEFAULT_Y_PROMPT_TEMPLATE,
         ingpo_y_temperature: float = 0.7,
         ingpo_y_max_tokens: int = 512,
@@ -88,6 +97,9 @@ class InGPOInferenceStrategy(HybridInferenceStrategy):
         self.ingpo_enable_share = bool(ingpo_enable_share)
         self.ingpo_enable_prune = bool(ingpo_enable_prune)
         self.ingpo_share_target = ingpo_share_target
+        self.ingpo_local_value_share = bool(ingpo_local_value_share)
+        self.ingpo_share_pair_budget_fraction = float(ingpo_share_pair_budget_fraction)
+        self.ingpo_share_use_confidence = bool(ingpo_share_use_confidence)
         self.ingpo_y_prompt_template = ingpo_y_prompt_template
         self.ingpo_y_temperature = float(ingpo_y_temperature)
         self.ingpo_y_max_tokens = int(ingpo_y_max_tokens)
@@ -180,14 +192,25 @@ class InGPOInferenceStrategy(HybridInferenceStrategy):
         gold = data_instance.get(self.ingpo_y_field) if data_instance else None
         problem_id = str(data_instance.get("_treetune__idx", uuid.uuid4())) if data_instance else str(uuid.uuid4())
 
-        # Y must exist before the first decide() call. Build it concurrently
-        # with the first depth so we don't add latency on the critical path.
+        needs_answer_set = (
+            self.ingpo_enable_prune
+            or (self.ingpo_enable_share and not self.ingpo_local_value_share)
+        )
+
+        # Pruning and the legacy ValueShare trigger still need Y.  The
+        # sibling-local ValueShare path does not.
         answer_set: AnswerSet = AnswerSet(problem_id=problem_id, gold=gold or "", y=[])
-        y_task = asyncio.create_task(
-            self._build_answer_set(problem_id, problem_text or "", gold or "")
+        y_task = (
+            asyncio.create_task(
+                self._build_answer_set(problem_id, problem_text or "", gold or "")
+            )
+            if needs_answer_set
+            else None
         )
 
         engine: Optional[TriggerEngine] = None
+        local_shared_count = 0
+        local_avg_tv_share = 0.0
 
         tree: Node = {
             "text": initial_prompt,
@@ -202,6 +225,8 @@ class InGPOInferenceStrategy(HybridInferenceStrategy):
 
         async def _ensure_engine() -> Optional[TriggerEngine]:
             nonlocal engine, answer_set
+            if not needs_answer_set or y_task is None:
+                return None
             if engine is not None:
                 return engine
             answer_set = await y_task
@@ -214,13 +239,148 @@ class InGPOInferenceStrategy(HybridInferenceStrategy):
                 answer_set=answer_set,
                 scorer=scorer,
                 thresholds=self.cfg_thresholds,
-                enable_share=self.ingpo_enable_share,
+                enable_share=self.ingpo_enable_share and not self.ingpo_local_value_share,
                 enable_prune=self.ingpo_enable_prune,
                 share_target=self.ingpo_share_target,
                 root_segment_id="root",
             )
             await engine.register_root(initial_prompt)
             return engine
+
+        def _share_eta() -> float:
+            if self.cfg_thresholds.eta_override is not None:
+                return float(self.cfg_thresholds.eta_override)
+            return max(
+                self.cfg_thresholds.epsilon / max(self.cfg_thresholds.r_max, 1e-8),
+                1e-6,
+            )
+
+        def _cheap_share_score(child: Node) -> float:
+            val = child.get("ingpo_avg_lp_K")
+            if val is not None:
+                return float(val)
+            return float(len(self._tokenize(child.get("text", ""))))
+
+        def _continuation_texts(node: Node) -> List[str]:
+            texts: List[str] = []
+            seen = set()
+            for child in node.get("children", []) or []:
+                text = child.get("text", "")
+                if not text or text in seen:
+                    continue
+                seen.add(text)
+                texts.append(text)
+                if len(texts) >= self.ingpo_m:
+                    break
+            return texts
+
+        async def _score_local_tv(
+            src: Node,
+            tgt: Node,
+            continuations: Sequence[str],
+        ) -> float:
+            src_prefix = src["full_text"]
+            tgt_prefix = tgt["full_text"]
+            src_scores, tgt_scores = await asyncio.gather(
+                asyncio.gather(*(scorer.score_one(src_prefix, c) for c in continuations)),
+                asyncio.gather(*(scorer.score_one(tgt_prefix, c) for c in continuations)),
+            )
+            return sampled_tv_from_logps(src_scores, tgt_scores)
+
+        async def _try_local_value_share(siblings: Sequence[Node]) -> None:
+            nonlocal local_shared_count, local_avg_tv_share
+            candidates = [
+                child for child in siblings
+                if child.get("ingpo_action") == Action.EXPAND.value
+                and not child.get("leaf", False)
+                and child.get("children")
+            ]
+            if len(candidates) < 2:
+                return
+
+            budget = pair_budget(
+                len(candidates),
+                fraction=self.ingpo_share_pair_budget_fraction,
+            )
+            pairs = select_candidate_pairs(
+                [c["ingpo_segment_id"] for c in candidates],
+                [_cheap_share_score(c) for c in candidates],
+                budget=budget,
+            )
+            eta = _share_eta()
+
+            for i, j in pairs:
+                src = candidates[j]
+                tgt = candidates[i]
+                if src.get("ingpo_action") != Action.EXPAND.value:
+                    continue
+                if tgt.get("ingpo_action") != Action.EXPAND.value:
+                    continue
+
+                continuations = []
+                seen = set()
+                for text in _continuation_texts(src) + _continuation_texts(tgt):
+                    if text in seen:
+                        continue
+                    seen.add(text)
+                    continuations.append(text)
+                    if len(continuations) >= self.ingpo_m:
+                        break
+                if not continuations:
+                    continue
+
+                try:
+                    tv = await _score_local_tv(src, tgt, continuations)
+                except Exception as exc:
+                    logger.warning(f"InGPO local ValueShare failed: {exc}")
+                    continue
+
+                radius = confidence_radius(len(continuations), self.cfg_thresholds.alpha)
+                lhs = tv + radius if self.ingpo_share_use_confidence else tv
+                if lhs <= eta:
+                    decision = LocalShareDecision(
+                        source_id=src["ingpo_segment_id"],
+                        target_id=tgt["ingpo_segment_id"],
+                        tv=tv,
+                        n_continuations=len(continuations),
+                        confidence_radius=radius,
+                        eta_used=eta,
+                    )
+                    src["ingpo_action"] = Action.SHARE.value
+                    src["ingpo_share_target"] = decision.target_id
+                    src["ingpo_tv_m"] = decision.tv
+                    src["ingpo_local_support_size"] = decision.n_continuations
+                    src["ingpo_confidence_radius"] = decision.confidence_radius
+                    src["ingpo_eta"] = decision.eta_used
+                    src["ingpo_tau"] = decision.confidence_radius
+                    src["ingpo_local_value_share"] = True
+                    src["leaf"] = True
+                    src["reward"] = float("nan")
+                    src.pop("children", None)
+                    if engine is not None:
+                        if engine.stats.expanded > 0:
+                            engine.stats.expanded -= 1
+                        engine.stats.update_share(tv)
+                    else:
+                        n = local_shared_count + 1
+                        local_avg_tv_share = (
+                            local_avg_tv_share * local_shared_count + tv
+                        ) / n
+                        local_shared_count = n
+
+        def _set_reward_summary(node: Node) -> None:
+            child_rewards = []
+            for ch in node.get("children", []) or []:
+                r = ch.get("reward")
+                if r is None or (isinstance(r, float) and np.isnan(r)):
+                    continue
+                child_rewards.append(r)
+            if child_rewards:
+                node["reward"] = float(np.mean(child_rewards))
+                node["reward_std"] = float(np.std(child_rewards))
+            else:
+                node["reward"] = 0.0
+                node["reward_std"] = 0.0
 
         async def dfs(node: Node, prefix: str, depth: int) -> None:
             if depth == max_depth:
@@ -234,19 +394,24 @@ class InGPOInferenceStrategy(HybridInferenceStrategy):
 
             max_tokens = None if depth == max_depth - 1 else self.M
 
-            children = await self.node_expander.expand(
-                current_node=node,
-                prefix=prefix,
-                depth=depth,
-                max_tokens=max_tokens,
-            )
+            children = node.get("children")
+            if children is None:
+                children = await self.node_expander.expand(
+                    current_node=node,
+                    prefix=prefix,
+                    depth=depth,
+                    max_tokens=max_tokens,
+                )
             node["children"] = children
 
             local_engine = await _ensure_engine()
 
-            expansion_tasks = []
+            probe_tasks = []
             for ch_idx, child in enumerate(children):
-                child_seg_id = f"{node.get('ingpo_segment_id', 'root')}/{depth}/{ch_idx}"
+                child_seg_id = child.get(
+                    "ingpo_segment_id",
+                    f"{node.get('ingpo_segment_id', 'root')}/{depth}/{ch_idx}",
+                )
                 child["ingpo_segment_id"] = child_seg_id
                 child["ingpo_action"] = Action.EXPAND.value
                 child["ingpo_depth"] = depth + 1
@@ -273,9 +438,15 @@ class InGPOInferenceStrategy(HybridInferenceStrategy):
 
                 child["leaf"] = False
                 if local_engine is None:
-                    expansion_tasks.append(
-                        asyncio.create_task(dfs(child, child["full_text"], depth + 1))
-                    )
+                    if depth + 1 < max_depth:
+                        probe_tasks.append((child, asyncio.create_task(
+                            self.node_expander.expand(
+                                current_node=child,
+                                prefix=child["full_text"],
+                                depth=depth + 1,
+                                max_tokens=None if depth + 1 == max_depth - 1 else self.M,
+                            )
+                        )))
                     continue
 
                 try:
@@ -287,17 +458,29 @@ class InGPOInferenceStrategy(HybridInferenceStrategy):
                     )
                 except Exception as exc:
                     logger.warning(f"InGPO decide() failed: {exc}")
-                    expansion_tasks.append(
-                        asyncio.create_task(dfs(child, child["full_text"], depth + 1))
-                    )
+                    if depth + 1 < max_depth:
+                        probe_tasks.append((child, asyncio.create_task(
+                            self.node_expander.expand(
+                                current_node=child,
+                                prefix=child["full_text"],
+                                depth=depth + 1,
+                                max_tokens=None if depth + 1 == max_depth - 1 else self.M,
+                            )
+                        )))
                     continue
 
                 self._annotate_node(child, decision)
 
                 if decision.action is Action.EXPAND:
-                    expansion_tasks.append(
-                        asyncio.create_task(dfs(child, child["full_text"], depth + 1))
-                    )
+                    if depth + 1 < max_depth:
+                        probe_tasks.append((child, asyncio.create_task(
+                            self.node_expander.expand(
+                                current_node=child,
+                                prefix=child["full_text"],
+                                depth=depth + 1,
+                                max_tokens=None if depth + 1 == max_depth - 1 else self.M,
+                            )
+                        )))
                 elif decision.action is Action.SHARE:
                     # Inherit value from share_target (set later in episode
                     # generator) but mark as a leaf so the tree code stops.
@@ -307,6 +490,31 @@ class InGPOInferenceStrategy(HybridInferenceStrategy):
                     child["leaf"] = True
                     child["reward"] = float("nan")  # sentinel; replaced later
 
+            for child, task in probe_tasks:
+                try:
+                    probe_children = await task
+                except Exception as exc:
+                    logger.warning(f"InGPO probe expansion failed: {exc}")
+                    continue
+                for probe_idx, probe in enumerate(probe_children):
+                    probe["ingpo_segment_id"] = (
+                        f"{child['ingpo_segment_id']}/{depth + 1}/{probe_idx}"
+                    )
+                    probe["ingpo_action"] = Action.EXPAND.value
+                    probe["ingpo_depth"] = depth + 2
+                    probe["ingpo_parent_segment_id"] = child["ingpo_segment_id"]
+                child["children"] = probe_children
+
+            if self.ingpo_enable_share and self.ingpo_local_value_share:
+                await _try_local_value_share(children)
+
+            expansion_tasks = []
+            for child in children:
+                if child.get("ingpo_action") == Action.EXPAND.value and not child.get("leaf", False):
+                    expansion_tasks.append(
+                        asyncio.create_task(dfs(child, child["full_text"], depth + 1))
+                    )
+
             if expansion_tasks:
                 await asyncio.gather(*expansion_tasks)
 
@@ -314,18 +522,7 @@ class InGPOInferenceStrategy(HybridInferenceStrategy):
             # SHARE / PRUNE children, we postpone the value until the episode
             # generator can resolve them; for now use the parent's prior
             # average to keep tree-level statistics finite.
-            child_rewards = []
-            for ch in children:
-                r = ch.get("reward")
-                if r is None or (isinstance(r, float) and np.isnan(r)):
-                    continue
-                child_rewards.append(r)
-            if child_rewards:
-                node["reward"] = float(np.mean(child_rewards))
-                node["reward_std"] = float(np.std(child_rewards))
-            else:
-                node["reward"] = 0.0
-                node["reward_std"] = 0.0
+            _set_reward_summary(node)
 
         await dfs(tree, initial_prompt, 0)
 
@@ -333,7 +530,16 @@ class InGPOInferenceStrategy(HybridInferenceStrategy):
         if engine is not None:
             tree["ingpo_stats"] = engine.stats.as_dict()
         else:
-            tree["ingpo_stats"] = {}
+            total = local_shared_count
+            tree["ingpo_stats"] = {
+                "ingpo/expanded_count": 0,
+                "ingpo/shared_count": local_shared_count,
+                "ingpo/pruned_count": 0,
+                "ingpo/share_rate": local_shared_count / max(total, 1),
+                "ingpo/prune_rate": 0.0,
+                "ingpo/avg_tv_when_share": local_avg_tv_share,
+                "ingpo/avg_gap_when_prune": 0.0,
+            } if local_shared_count else {}
         tree["ingpo_answer_set_size"] = answer_set.m
         return tree
 
