@@ -1,243 +1,301 @@
-# Method: Budget Allocation with Value Sharing and Pruning
+# Method: Sibling-Local Value Sharing and Pruning
 
 ## Motivation
 
-In tree-based policy optimization, a fixed maximum depth and branch factor define a large nominal search space. Expanding this tree uniformly is wasteful: many partial reasoning prefixes are either redundant with previously explored prefixes or unlikely to improve the final answer. Our method treats inference-time tree expansion as a budget allocation problem. Instead of spending the same generation budget on every node, we use online value estimates to decide whether a newly generated segment should be expanded, shared with an existing segment, or pruned.
+Tree-based policy optimization spends a large generation budget on subtrees
+that often become redundant. The goal of ValueShare is not merely to ask
+whether two partial reasoning states look textually similar. It asks whether
+the model would behave similarly after those states. If two sibling nodes induce
+nearly the same local continuation distribution, expanding both descendants is
+unnecessary; one node can reuse the value of the other.
 
-The two central mechanisms are:
+This version removes the global answer set used by the original ValueShare
+trigger. Instead, sharing is based on intrinsic model signals from sibling
+rollouts generated during tree expansion.
 
-- **Value Sharing**: if two partial trajectories induce nearly the same distribution over plausible final solutions, they can share downstream value.
-- **Pruning**: if a child trajectory is significantly worse than its parent under the same answer-set probe, we stop expanding it.
+Pruning remains a separate trigger. It can still use the answer-set probe to
+stop branches whose likelihood over plausible final solutions drops sharply
+relative to their parent.
 
-Together, these mechanisms reallocate generation budget from redundant or low-value branches to branches that are more likely to contribute useful training signal.
+## Tree Setup
 
-## Setup
+For a problem prompt, the policy constructs a reasoning tree. A node $$s$$
+corresponds to a partial trajectory:
 
-For each problem \(x\), the model constructs a reasoning tree. A node \(s\) corresponds to a partial trajectory:
+$$
+\tau(s) = x \oplus z_1 \oplus \cdots \oplus z_d
+$$
 
-\[
-\tau(s) = x \oplus z_1 \oplus \cdots \oplus z_d,
-\]
+where each $$z_i$$ is a generated reasoning segment. Let the branch factor at a
+parent node $$p$$ be $$W$$. Expanding $$p$$ produces siblings:
 
-where \(z_i\) are generated reasoning segments. A vanilla SPO-style tree expands each non-terminal node according to a branch factor schedule until a maximum depth is reached. In contrast, our method decides online whether each newly generated node should continue to receive budget.
+$$
+S(p) = \{s_1, \ldots, s_W\}
+$$
 
-For each problem, we first construct a finite answer set:
+The new ValueShare trigger only compares nodes inside the same sibling set
+$$S(p)$$. This keeps the comparison local and avoids a global nearest-neighbor
+index based on an external probe set.
 
-\[
-Y = \{y_1, \ldots, y_m\}.
-\]
+## Rollout Continuation Set
 
-Intuitively, \(Y\) is a probe set of plausible complete solutions for the problem. The model is then asked: under the partial trajectory \(\tau(s)\), how likely are these final solutions?
+For each sibling $$s_i$$, we first generate a small rollout set from that node:
 
-For each segment/node \(s\), define:
+$$
+G_i = \{g_{i,1}, \ldots, g_{i,m_i}\}
+$$
 
-\[
-LP_i(s) = \log \pi_\theta(y_i \mid \tau(s)).
-\]
+The elements of $$G_i$$ can be immediate children, grandchildren, or short
+descendant rollouts from $$s_i$$. In practice, the implementation uses the next
+expanded layer as the rollout probe and reuses those nodes if $$s_i$$ is not
+shared.
 
-The vector
+Using descendants rather than only immediate next tokens gives a better Monte
+Carlo estimate of whether two states have similar downstream behavior. A node
+can still be cut after these probe descendants are generated. The descendants
+serve as samples for the sharing test; if the node is marked SHARE, the probe
+subtree is discarded and not used for training edges.
 
-\[
-LP(s) = [LP_1(s), \ldots, LP_m(s)]
-\]
+## Sampled Local TV
 
-is a compact signature of what the current partial trajectory believes about the final answer space.
+For two siblings $$s_i$$ and $$s_j$$, define the shared candidate support:
 
-Because scoring all \(m\) answers for every node is expensive, the method uses a two-stage check:
+$$
+C_{ij} = G_i \cup G_j
+$$
 
-- a fast estimate using only \(K \ll m\) answers;
-- a full verification using all \(m\) answers only when a trigger is likely.
+For every continuation $$c \in C_{ij}$$, score the same continuation under both
+prefixes:
 
-We denote:
+$$
+L_i(c) = \log \pi_\theta(c \mid \tau(s_i))
+$$
 
-\[
-\text{AvgLP}_K(s) = \frac{1}{K} \sum_{i=1}^{K} LP_i(s),
-\]
+$$
+L_j(c) = \log \pi_\theta(c \mid \tau(s_j))
+$$
 
-and, after full scoring,
+The scores are normalized on the sampled support:
 
-\[
-\text{AvgLP}_m(s) = \frac{1}{m} \sum_{i=1}^{m} LP_i(s).
-\]
+$$
+\hat p_i(c) =
+\frac{\exp(L_i(c))}
+{\sum_{c' \in C_{ij}} \exp(L_i(c'))}
+$$
 
-## Residual Mass Outside the Answer Set
+$$
+\hat p_j(c) =
+\frac{\exp(L_j(c))}
+{\sum_{c' \in C_{ij}} \exp(L_j(c'))}
+$$
 
-The finite answer set \(Y\) does not cover the full completion space. For a node \(s\), define the residual probability mass outside \(Y\):
+The sampled local total variation distance is:
 
-\[
-\delta(s) = \log \left(1 - \sum_{i=1}^{m} \exp(LP_i(s))\right).
-\]
+$$
+\widehat{TV}_{C_{ij}}(s_i,s_j)
+= \frac{1}{2}\sum_{c \in C_{ij}}
+\left|\hat p_i(c) - \hat p_j(c)\right|
+$$
 
-Thus:
+The implementation computes the normalization with a stable log-softmax-style
+shift, so very large or very small log probabilities do not overflow.
 
-\[
-\exp(\delta(s))
-\]
+## Share Rule
 
-is the probability mass assigned to completions not represented in \(Y\). If \(\exp(\delta(s))\) is close to 1, then the answer set poorly covers the model's conditional distribution at node \(s\). In that case, value-sharing and pruning decisions should be conservative because the observed answer-set probabilities describe only a tiny part of the model's distribution.
+Let $$n_{ij} = |C_{ij}|$$. A concentration radius is:
+
+$$
+r(n_{ij}, \alpha)
+= \sqrt{\frac{\log(2/\alpha)}{2n_{ij}}}
+$$
+
+Given a tolerated value error $$\epsilon$$ and reward bound $$R_{\max}$$, define:
 
-In the implementation, the threshold computation uses the average residual mass across fully scored rows:
-
-\[
-\overline{\Delta} = \mathbb{E}_s[\exp(\delta(s))].
-\]
-
-This quantity reduces the trust placed in answer-set comparisons when \(Y\) has poor coverage.
-
-## Thresholds
-
-The method uses two thresholds:
-
-\[
-\eta = \frac{\epsilon}{R_{\max}} - \overline{\Delta},
-\]
-
-clamped to a small positive minimum, and
-
-\[
-\tau(K,\eta,\alpha) = \eta + \sqrt{\frac{\log(2/\alpha)}{2K}}.
-\]
-
-Here:
-
-- \(\epsilon\) is the tolerated value error.
-- \(R_{\max}\) bounds the reward scale.
-- \(\overline{\Delta}\) is the average residual mass outside the answer set.
-- \(K\) is the number of fast probe answers.
-- \(\alpha\) controls the confidence band.
-
-The fast threshold \(\tau\) is looser than \(\eta\) because it accounts for uncertainty from using only \(K\) samples. The full threshold \(\eta\) is used after all \(m\) answers have been scored.
-
-## Value Sharing
-
-### Intuition
-
-Two partial trajectories may look different at the token level but imply nearly the same future answer distribution. Expanding both subtrees wastes budget. Value Sharing detects this redundancy and lets one node reuse the value estimate of another.
-
-For a new segment \(s\), the method searches for a candidate target \(t\), typically the nearest previously expanded segment under \(\text{AvgLP}_K\). Other choices are possible, such as sharing with the parent or root.
-
-The fast check is:
-
-\[
-|\text{AvgLP}_K(s) - \text{AvgLP}_K(t)| < \tau.
-\]
-
-If this passes, the method computes the full \(m\)-answer vectors and estimates an upper bound on total variation distance:
-
-\[
-TV_m(s,t)
-= \frac{1}{2} \sum_{i=1}^{m}
-\left| \exp(LP_i(s)) - \exp(LP_i(t)) \right|
-+ \frac{1}{2}\left(\exp(\delta(s)) + \exp(\delta(t))\right).
-\]
-
-The first term compares the probability assigned to the finite answer set. The second term accounts for probability mass outside \(Y\). This makes the comparison conservative: if \(Y\) does not cover the model distribution well, the residual term becomes large and sharing is less likely.
-
-The share rule is:
-
-\[
-TV_m(s,t) \leq \eta.
-\]
-
-If this condition holds, the method marks \(s\) as **SHARE** and stops expanding it. Its downstream value can be inherited from the target segment \(t\).
-
-### Why This Preserves Budget
-
-If \(TV_m(s,t)\) is small, then for any bounded reward function \(r\),
-
-\[
-|\mathbb{E}[r \mid \tau(s)] - \mathbb{E}[r \mid \tau(t)]|
-\]
-
-is small. Therefore, expanding both subtrees is unlikely to produce meaningfully different value estimates. Sharing avoids redundant expansion while keeping the node in the tree as an edge for training-time accounting.
-
-## Pruning
-
-### Intuition
-
-Pruning removes branches that are significantly worse than their parent. The key comparison is between a child segment \(s\) and its parent \(pa(s)\). If conditioning on the child prefix makes the model much less likely to complete into the plausible answer set, then this branch is unlikely to lead to high-value rollouts.
-
-The fast prune check is:
-
-\[
-\text{AvgLP}_K(pa(s)) - \text{AvgLP}_K(s) > \tau.
-\]
-
-If the child is much worse than the parent under the \(K\)-answer probe, the method scores the full answer set and checks:
-
-\[
-\text{AvgLP}_m(pa(s)) - \text{AvgLP}_m(s) > \eta.
-\]
-
-If this condition holds, the method marks \(s\) as **PRUNE** and stops expanding it.
-
-### Interpretation
-
-The parent represents the state before committing to the child segment. If the child sharply reduces likelihood over plausible final solutions, then the child has moved the trajectory toward a lower-value region. Continuing to generate descendants from this prefix spends budget on a branch that is already unlikely to be useful.
-
-Pruning is therefore a budget allocation rule:
-
-- do not spend future tokens on branches whose answer-set likelihood has dropped substantially;
-- redirect the expansion budget to branches that remain competitive.
-
-## Online Decision Rule
-
-For each newly generated non-terminal segment \(s\):
-
-1. Score \(K\) answer-set log probabilities \(LP_i(s)\).
-2. Try **Value Sharing**:
-   - find a candidate target \(t\);
-   - if \(|\text{AvgLP}_K(s) - \text{AvgLP}_K(t)| < \tau\), score full \(m\);
-   - if \(TV_m(s,t) \leq \eta\), mark \(s\) as SHARE.
-3. If not shared, try **Pruning**:
-   - compare \(s\) to its parent \(pa(s)\);
-   - if \(\text{AvgLP}_K(pa(s)) - \text{AvgLP}_K(s) > \tau\), score full \(m\);
-   - if \(\text{AvgLP}_m(pa(s)) - \text{AvgLP}_m(s) > \eta\), mark \(s\) as PRUNE.
-4. If neither trigger fires, mark \(s\) as EXPAND and continue expanding its children.
-
-The fast \(K\)-answer pass avoids full scoring for most nodes. Full \(m\)-answer scoring is used only when a decision is close enough to matter.
-
-## Budget Allocation View
-
-The method can be understood as adaptive allocation of model-evaluation budget. A uniform tree allocates budget according to the nominal search structure: every node at the same depth receives similar expansion effort. Our method allocates budget according to online evidence:
-
-- redundant nodes share value instead of expanding;
-- low-value nodes are pruned;
-- remaining budget flows to branches whose answer-set signature remains promising and distinct.
-
-This creates an effective tree that can be much smaller than the nominal tree while preserving or improving downstream performance.
-
-Two natural budget metrics follow from this view:
-
-- **Generated-token budget**: the number of tokens spent expanding tree nodes.
-- **Model-evaluation budget**: generated tokens plus answer-set generation and log-probability scoring tokens.
-
-The first metric measures search budget. The second measures total model compute more fairly, including the overhead introduced by Value Sharing and Pruning.
-
-## Important Failure Mode: Poor Answer-Set Coverage
-
-If \(\exp(LP_i(s))\) is extremely small for all answers \(y_i\), then:
-
-\[
-\sum_i \exp(LP_i(s)) \approx 0,
-\]
-
-so:
-
-\[
-\exp(\delta(s)) \approx 1.
-\]
-
-This means the answer set \(Y\) covers almost none of the model's conditional probability mass. In that regime, \(\eta\) can collapse to a very small value, making pruning overly aggressive. Practically, this may appear as prune rate near 1.0 at shallow depths.
-
-Possible mitigations include:
-
-- setting a positive \(\eta\) override;
-- using shorter or better-aligned answer-set completions;
-- reducing answer-set temperature;
-- normalizing log probabilities by answer length;
-- shortening early segments so depth-1 prefixes do not overcommit too strongly.
-
-## Summary
-
-Value Sharing and Pruning both use answer-set log probabilities as a low-dimensional probe of a partial trajectory's future value. Value Sharing removes redundant computation by merging nodes with similar answer distributions. Pruning removes branches whose answer likelihood degrades sharply relative to the parent. Together, they turn fixed tree search into adaptive budget allocation: the model spends fewer tokens on redundant or low-value branches and reserves more budget for promising, diverse reasoning paths.
+$$
+\eta_{\text{share}} =
+\frac{\epsilon}{R_{\max}}
+$$
+
+or use an explicit override in ablations.
+
+The conservative share rule is:
+
+$$
+\widehat{TV}_{C_{ij}}(s_i,s_j)
++ r(n_{ij}, \alpha)
+\leq \eta_{\text{share}}
+$$
+
+The implementation exposes this confidence term as an option. By default, the
+online rule uses $$\widehat{TV}_{C_{ij}} \leq \eta_{\text{share}}$$ because
+small rollout supports make the Hoeffding radius overly conservative for the
+current default $$\epsilon$$. When the confidence option is enabled, the rule
+above is used.
+
+When the selected rule holds, one sibling is marked SHARE and points to the
+other sibling as its value target. The shared node is kept in the tree for
+accounting, but its probe descendants are removed and recursion below it stops.
+
+## Candidate Pair Budget
+
+Comparing all sibling pairs costs $$O(W^2)$$ pair evaluations. To reduce
+latency, the implementation evaluates only a fixed fraction of the pairs. The
+default budget is:
+
+$$
+B =
+\min\left(
+\frac{W(W-1)}{2},
+\left\lfloor 0.25 W^2 \right\rceil
+\right)
+$$
+
+This is approximately $$\left(W/2\right)^2$$ candidate pairs.
+
+Pairs are ranked by a cheap precomputed score. When the prune engine is active,
+the score is the node's fast average log probability $$\text{AvgLP}_K$$.
+Otherwise the implementation falls back to a simple text-length proxy. Only the
+closest $$B$$ pairs under this cheap score are fully scored with sampled local
+TV.
+
+This keeps the expensive cross-scoring cost near:
+
+$$
+O(Bm)
+$$
+
+instead of:
+
+$$
+O(W^2m)
+$$
+
+where $$m$$ is the sampled continuation budget.
+
+## Value Error Bound
+
+Let $$P_H(\cdot \mid s)$$ be the true distribution over $$H$$-step rollout
+continuations from node $$s$$. For any bounded downstream value or reward
+function $$f$$ with:
+
+$$
+|f(c)| \leq R_{\max}
+$$
+
+the standard TV inequality gives:
+
+$$
+\left|
+\mathbb{E}_{c \sim P_H(\cdot \mid s_i)}[f(c)]
+-
+\mathbb{E}_{c \sim P_H(\cdot \mid s_j)}[f(c)]
+\right|
+\leq
+R_{\max}
+TV(P_H(\cdot \mid s_i), P_H(\cdot \mid s_j))
+$$
+
+The implementation estimates this TV using the sampled support $$C_{ij}$$. The
+total estimation error decomposes into:
+
+$$
+\left|
+\widehat{TV}_{C_{ij}} - TV(P_H^i, P_H^j)
+\right|
+\leq
+\epsilon_{\text{MC}}
++ \epsilon_H
++ \epsilon_B
+$$
+
+where:
+
+- $$\epsilon_{\text{MC}}$$ is the Monte Carlo error from using finitely many
+  sampled continuations.
+- $$\epsilon_H$$ is the truncation error from using finite-depth rollouts rather
+  than full completions.
+- $$\epsilon_B$$ is the candidate-selection bias from evaluating only $$B$$
+  sibling pairs instead of all pairs.
+
+A practical concentration term for the Monte Carlo component is:
+
+$$
+\epsilon_{\text{MC}}
+=
+O\left(
+\sqrt{\frac{\log(1/\delta)}{n_{ij}}}
+\right)
+$$
+
+The conservative trigger can use the explicit radius $$r(n_{ij}, \alpha)$$ as
+a finite-sample guard. Therefore a sufficient operational condition for sharing
+is:
+
+$$
+R_{\max}
+\left(
+\widehat{TV}_{C_{ij}}
++ r(n_{ij}, \alpha)
++ \epsilon_H
++ \epsilon_B
+\right)
+\leq
+\epsilon
+$$
+
+In code, $$\epsilon_H$$ and $$\epsilon_B$$ are controlled by rollout depth,
+rollout budget, and pair budget rather than explicitly estimated. With the
+confidence option enabled, the online rule uses:
+
+$$
+\widehat{TV}_{C_{ij}} + r(n_{ij}, \alpha)
+\leq
+\frac{\epsilon}{R_{\max}}
+$$
+
+as the actionable share criterion. With the default confidence option disabled,
+the practical rule drops the radius and uses:
+
+$$
+\widehat{TV}_{C_{ij}}
+\leq
+\frac{\epsilon}{R_{\max}}
+$$
+
+## Online Algorithm
+
+For each parent node $$p$$:
+
+1. Generate $$W$$ sibling children.
+2. Run the prune trigger for each child when enabled.
+3. For each remaining expandable sibling, generate one probe descendant layer.
+4. Rank sibling pairs by the cheap precomputed score.
+5. Evaluate only the top $$B \approx (W/2)^2$$ pairs.
+6. For each evaluated pair, compute sampled local TV on $$G_i \cup G_j$$.
+7. If the conservative share rule passes, mark one sibling as SHARE and stop
+   recursion below it.
+8. Recurse only into siblings that remain EXPAND.
+
+This preserves the main budget-saving behavior: the method may spend a small
+probe budget to identify redundant siblings, but it avoids expanding redundant
+subtrees to full depth.
+
+## Why This Replaces the Global Answer Set for ValueShare
+
+The previous ValueShare trigger used a global set of full solutions $$Y$$ and
+raw sequence probabilities $$\pi_\theta(y \mid \tau(s))$$. For long full
+solutions, these probabilities can be extremely small, making the residual mass
+outside $$Y$$ dominate the TV estimate. In that regime the estimate becomes too
+loose to justify sharing.
+
+The sibling-local trigger instead compares the model's own local continuation
+distribution around the nodes being considered. This better matches the desired
+behavioral question:
+
+$$
+\text{Do these two sibling states lead the policy toward the same next rollout
+distribution?}
+$$
+
+The method is therefore an intrinsic policy-distribution signal for approximate
+state merging in LLM reasoning trees.

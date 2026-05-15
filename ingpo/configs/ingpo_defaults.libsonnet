@@ -17,6 +17,9 @@
     enable_share: true,
     enable_prune: true,
     share_target: 'nearest',  // 'nearest' | 'parent' | 'root'
+    local_value_share: true,
+    share_pair_budget_fraction: 0.25,  // roughly (W/2)^2 sibling pairs
+    share_use_confidence: false,
 
     // Y generation
     y_temperature: 0.7,
