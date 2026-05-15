@@ -265,6 +265,7 @@ class InGPOInferenceStrategy(HybridInferenceStrategy):
                                 parent_id=node.get("ingpo_segment_id", "root"),
                                 prefix=child["full_text"],
                                 is_leaf=True,
+                                depth=child["ingpo_depth"],
                             )
                             self._annotate_node(child, decision)
                         except Exception as exc:
@@ -284,6 +285,7 @@ class InGPOInferenceStrategy(HybridInferenceStrategy):
                         parent_id=node.get("ingpo_segment_id", "root"),
                         prefix=child["full_text"],
                         is_leaf=False,
+                        depth=child["ingpo_depth"],
                     )
                 except Exception as exc:
                     logger.warning(f"InGPO decide() failed: {exc}")

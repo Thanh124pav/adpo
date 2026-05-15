@@ -134,6 +134,7 @@ class TriggerEngine:
         parent_id: str,
         prefix: str,
         is_leaf: bool,
+        depth: Optional[int] = None,
     ) -> Decision:
         """Score the new segment and pick Action.SHARE / PRUNE / EXPAND."""
 
@@ -176,7 +177,13 @@ class TriggerEngine:
                         return decision
 
         # ---- Trigger 2: Prune --------------------------------------------
-        if self.enable_prune and parent_id is not None and self.lp_matrix.has(parent_id):
+        # Hard-code: không prune nodes có depth == 1
+        if (
+            self.enable_prune
+            and parent_id is not None
+            and self.lp_matrix.has(parent_id)
+            and depth != 1
+        ):
             row_pa = self.lp_matrix.get(parent_id)
             gap_K = row_pa.avg_lp_K - row_s.avg_lp_K
             decision.avg_lp_diff_to_pa_K = gap_K
