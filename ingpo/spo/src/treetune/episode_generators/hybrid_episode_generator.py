@@ -168,6 +168,7 @@ class HybridEpisodeGenerator(MathEpisodeGenerator):
             metrics["timing/episode_generation/traj_inference"] = time.time() - t0
             release_memory()
         try:
+            timing_metrics = dict(metrics)
             metrics = {
                 "parse_failed": [],
                 "once_hit": [],
@@ -182,11 +183,14 @@ class HybridEpisodeGenerator(MathEpisodeGenerator):
             trajectories = []
 
             all_edges = []
+            tree_construction_seconds = []
 
             # Add all the edges
             for idx, item in enumerate(traj_infer_results):
                 # noinspection PyTypeChecker
                 tree = json.loads(item["_treetune__reasoning_tree"])
+                if "tree_construction_seconds" in tree:
+                    tree_construction_seconds.append(float(tree["tree_construction_seconds"]))
                 edges = self.extract_edges_from_tree(tree, 
                                                      adv_method=self.adv_method, 
                                                      only_adv_greater_than_zero=self.only_adv_greater_than_zero,
@@ -324,6 +328,12 @@ class HybridEpisodeGenerator(MathEpisodeGenerator):
                 for k, values in metrics.items()
                 if len(values) > 0
             }
+            if tree_construction_seconds:
+                metrics["tree_construction_seconds_mean"] = (
+                    sum(tree_construction_seconds) / len(tree_construction_seconds)
+                )
+                metrics["tree_construction_seconds_max"] = max(tree_construction_seconds)
+            metrics.update(timing_metrics)
             if len(metrics) > 0:
                 logs = {f"episodes_metric/{k}": v for k, v in metrics.items()}
                 self._cloud_log({**logs, "train/global_iteration": iteration})

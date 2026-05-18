@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from typing import List, Optional, Dict, Any
 
 from datasets import Dataset
@@ -306,6 +307,7 @@ class TreeInferenceStrategy(InferenceStrategy):
         max_depth: int,
         data_instance: Optional[Dict[str, Any]] = None,
     ):
+        t0_tree = time.time()
         # First, we create the root node
         tree = {
             "text": initial_prompt,
@@ -369,6 +371,7 @@ class TreeInferenceStrategy(InferenceStrategy):
         # Remove the `_request_object` field from the tree
         tree.pop("_request_object", None)
 
+        tree["tree_construction_seconds"] = time.time() - t0_tree
         return tree
 
     def _convert_tree_to_string(self, tree: Node) -> str:

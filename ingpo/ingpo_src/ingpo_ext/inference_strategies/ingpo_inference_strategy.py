@@ -622,6 +622,7 @@ class InGPOInferenceStrategy(HybridInferenceStrategy):
         tree["ingpo_stats"] = stats
         tree["ingpo_answer_set_size"] = answer_set.m
         tree["ingpo_tree_construction_seconds"] = time.time() - t0_tree
+        tree["tree_construction_seconds"] = tree["ingpo_tree_construction_seconds"]
         tree["ingpo_problem_id"] = problem_id
         return tree
 
