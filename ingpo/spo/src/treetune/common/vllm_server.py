@@ -265,7 +265,6 @@ class VLLMServer(FromParams):
             f" --model {hf_ckpt_path_or_model}"
             f" --port {self.port}"
             f" --seed {self.seed}"
-            f" --swap-space {self.swap_space}"
             f" --gpu-memory-utilization {self.gpu_memory_utilization}"
             f" --max-num-seqs {self.max_num_seqs}"
         )

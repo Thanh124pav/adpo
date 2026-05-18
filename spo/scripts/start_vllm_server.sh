@@ -15,5 +15,4 @@ CUDA_VISIBLE_DEVICES=$GPU_IDX python -m vllm.entrypoints.openai.api_server \
 	--host 0.0.0.0 \
 	--port "$PORT" \
 	--seed "$SEED" \
-	--swap-space "$SWAP_SPACE" \
 	--dtype bfloat16
