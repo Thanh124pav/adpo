@@ -4,7 +4,7 @@ so they don't need SPO/transformers/etc."""
 
 from __future__ import annotations
 
-from ingpo_ext.core.logging_helpers import (
+from treetune.ingpo.logging_helpers import (
     DEMO_COLUMNS,
     collect_demo_rows,
     per_depth_action_counts,
@@ -162,7 +162,7 @@ def test_truncate():
 
 
 def test_render_md_section_share_and_prune():
-    from ingpo_ext.core.logging_helpers import render_md_section, to_jsonl_record
+    from treetune.ingpo.logging_helpers import render_md_section, to_jsonl_record
 
     tree, index = make_tree()
     rows = collect_demo_rows(tree, index, question_id="q-7", n_each=4)
@@ -186,7 +186,7 @@ def test_render_md_section_share_and_prune():
 
 
 def test_render_md_section_no_demos_still_safe():
-    from ingpo_ext.core.logging_helpers import render_md_section
+    from treetune.ingpo.logging_helpers import render_md_section
 
     md = render_md_section(
         tree_idx=0,
@@ -202,7 +202,7 @@ def test_render_md_section_no_demos_still_safe():
 
 def test_to_jsonl_record_roundtrip():
     import json as _json
-    from ingpo_ext.core.logging_helpers import to_jsonl_record
+    from treetune.ingpo.logging_helpers import to_jsonl_record
 
     tree, index = make_tree()
     rows = collect_demo_rows(tree, index, question_id="q-7", n_each=2)

@@ -1,217 +1,189 @@
-# InGPO: Information-Gated Policy Optimization
+# treetune: Unified RL Framework for Reasoning LLMs
 
-Chào mừng bạn đến với **InGPO** - một cải tiến của thuật toán **SPO (Segment Policy Optimization)** giúp tối ưu hóa việc huấn luyện mô hình ngôn ngữ lớn (LLM) trên các tác vụ suy luận.
+Một codebase thống nhất để huấn luyện LLM trên các tác vụ suy luận (MATH, GSM8K, Point24) bằng nhiều thuật toán RL khác nhau. Tất cả các thuật toán đứng ngang hàng, chọn bằng config.
 
-## InGPO là gì?
+## Algorithm catalog
 
-InGPO thêm hai cơ chế thông minh vào quá trình tìm kiếm cây (tree search) của SPO:
+| Thuật toán | Trainer | Episode generator | Inference strategy | Script |
+|------------|---------|-------------------|--------------------|--------|
+| **PPO** — vanilla Proximal Policy Optimization | `ppo` | `math_episode_generator` | `cot` | `train_ppo_MATH.sh` |
+| **GRPO** — Group Relative PO (DeepSeek) | `ppo` | `math_episode_generator_w_group_advantages` (adv=`grpo`) | `cot` | `train_grpo_MATH.sh` |
+| **RLOO** — REINFORCE Leave-One-Out | `ppo` | `math_episode_generator_w_group_advantages` (adv=`rloo`) | `cot` | `train_rloo_GSM8K.sh` |
+| **VinePPO** — PPO với vine-style value baseline | `ppo` | `vineppo_episode_generator` | `cot` | `train_vineppo_GSM8K.sh` |
+| **DPO** — Direct Preference Optimization (positive variant) | `dpo_positive` | `math_dpo_positive_episode_generator` | `cot` | `train_dpo_MATH.sh` |
+| **RestEM** — Rejection sampling + EM-style FT | `restem` | `math_restem_episode_generator` | `cot` | `train_restem_MATH.sh` |
+| **SPO-chain** — Segment PO trên chain | `ppo` | `math_episode_generator` | `cot` | `train_spo_chain_MATH.sh` |
+| **SPO-tree** — Segment PO trên cây branching | `ppo` | `hybrid_episode_generator` | `hybrid` | `train_spo_tree_MATH.sh` |
+| **InGPO** — Information-Gated PO (SPO + ValueShare + Prune) | `ppo` | `ingpo_episode_generator` | `ingpo` | `train_ingpo_tree_MATH.sh` |
 
-1. **ValueShare (Chia sẻ)**: Khi phát hiện các đoạn văn bản dư thừa (có phân phối xác suất giống nhau), InGPO sẽ chia sẻ giá trị thay vì tính toán lại, giúp tiết kiệm thời gian.
-2. **Prune (Cắt tỉa)**: Khi phát hiện các đoạn văn bản không liên quan đến thông tin cần thiết, InGPO sẽ loại bỏ chúng khỏi cây tìm kiếm, giảm chi phí tính toán.
-
-Cả hai cơ chế này được kích hoạt dựa trên **Total Variation (TV) bound** - một ngưỡng thống kê đảm bảo tính chính xác.
+Mỗi thuật toán có file canonical ở `configs/algorithms/<algo>.libsonnet` — thin overlay set `(trainer, episode_generator, inference_strategy)` types. Người dùng compose với model/task base để tạo full experiment config.
 
 ## Cấu trúc thư mục
 
 ```
 ingpo/
-├── spo/                         # Code gốc của SPO (không sửa đổi)
-├── ingpo_src/                   # Code mở rộng cho InGPO
-│   ├── ingpo_main.py            # Điểm khởi chạy chính
-│   └── ingpo_ext/               # Các thành phần cốt lõi
-│       ├── core/                # Toán học: TV distance, thresholds, triggers
-│       ├── inference_strategies/# Chiến lược xây dựng cây InGPO
-│       └── episode_generators/  # Tạo episodes từ cây
-├── configs/                     # File cấu hình cho các thí nghiệm
-│   ├── ingpo_defaults.libsonnet # Cài đặt mặc định
-│   ├── polIter_*.jsonnet        # Config cho từng model/dataset
-│   ├── ablations/               # Config cho các ablation studies
-│   └── baselines/               # Config cho các baseline (SPO, PPO, GRPO...)
-├── scripts/                     # Script để chạy training, evaluation, analysis
-└── tests/                       # Unit tests
+├── treetune/                         # Python package thống nhất
+│   ├── common/                       # registry, FromParams, Params utilities
+│   ├── trainers/                     # ppo, dpo_positive, restem, mle, ...
+│   ├── episode_generators/           # tất cả episode generators (PPO/GRPO/DPO/RestEM/VinePPO/SPO/InGPO)
+│   ├── inference_strategies/         # cot, hybrid, ingpo, ...
+│   ├── ingpo/                        # InGPO core helpers (TV bound, answer set, triggers)
+│   ├── runtime/                      # policy iteration runtime
+│   ├── models/, tasks/, analyzers/   # SPO infrastructure
+│   └── main.py                       # entry point (treetune.main)
+├── guidance/                         # vendored guidance lib (parsing prompts)
+├── configs/
+│   ├── algorithms/                   # ppo.libsonnet, grpo.libsonnet, ... (9 files)
+│   ├── trainers/, episode_generators/, inference_strategies/, models/, tasks/
+│   ├── polIter_<model>_<algo>_<dataset>.jsonnet  # full experiment configs
+│   ├── ablations/, baselines/        # InGPO-specific overlays
+│   ├── ingpo_defaults.libsonnet, ingpo_overlay.libsonnet
+│   └── episode_generators/branch_factor_*.jsonnet  # tree shape overlays
+├── scripts/                          # train_<algo>_<dataset>.sh + utilities
+├── tests/                            # unit tests
+├── docs/legacy/                      # legacy SPO README/LICENSE/Dockerfile
+└── README.md
 ```
 
 ## Bắt đầu nhanh
 
-### Bước 1: Cài đặt môi trường
+### Cài đặt
 
 ```bash
-# Cài đặt dependencies và tải datasets
 bash scripts/setup.sh
 ```
 
-### Bước 2: Khởi động server vLLM (cần thiết để scoring)
-
-Mở một terminal khác và chạy:
+### Khởi động vLLM server (cần cho scoring)
 
 ```bash
-# Thay thế model path bằng đường dẫn local hoặc HuggingFace repo
-bash scripts/start_vllm_server.sh /workspace/storage-shared/models/Qwen2.5-1.5B 8000 42 32 0
-
-# Đặt biến môi trường cho API
+bash scripts/start_vllm_server.sh /path/to/model 8000 42 32 0
 export APP_OPENAI_VLLM_API_BASE=http://127.0.0.1:8000/v1
 ```
 
-### Bước 3: Huấn luyện mô hình
+### Huấn luyện một thuật toán
 
 ```bash
-# Chọn cấu hình cây (ví dụ: 666 = branch factor 6-6-6)
+# PPO trên MATH với model mặc định
+bash scripts/train_ppo_MATH.sh
+
+# GRPO với model khác
+MODEL=qwen1b bash scripts/train_grpo_MATH.sh
+
+# DPO
+bash scripts/train_dpo_MATH.sh
+
+# VinePPO trên GSM8K
+bash scripts/train_vineppo_GSM8K.sh
+
+# SPO-tree với tree shape tùy chỉnh
+TREE=6666 bash scripts/train_spo_tree_MATH.sh
+
+# InGPO-tree (mặc định 666)
 INGPO_TREE=666 bash scripts/train_ingpo_tree_MATH.sh
 ```
 
-Một số script training có sẵn:
-- `train_ingpo_tree_MATH.sh` - Huấn luyện trên dataset MATH
-- `train_ingpo_tree_GSM8K.sh` - Huấn luyện trên dataset GSM8K
-- `train_ingpo_tree_qwen1b_MATH.sh` - Dùng model Qwen 1.5B
-- `train_debug.sh` - Chạy thử 2 iterations để kiểm tra
-
-### Bước 4: Đánh giá mô hình
+### Đánh giá
 
 ```bash
 bash scripts/evaluate.sh polIter_qwen1_5b_base_ingpo_tree_MATH \
     experiments/ingpo-tree-666-qwen1.5b-math/iteration_0010
 ```
 
-## Chạy các thí nghiệm
+## Compose configs
 
-### Thí nghiệm chính từ paper
+Mỗi config experiment ghép từ các lớp overlay:
 
-```bash
-# Exp 1: Hiệu quả sample trên Qwen-MATH và Rho-GSM8K
-TREES="444 666 888" MODELS="qwen rho" bash scripts/run_exp1_sample_efficiency.sh
-
-# Exp 2: Tỷ lệ prune/share theo độ sâu cây
-INGPO_TREE=666 bash scripts/run_exp2_prune_share_rate.sh
-
-# Exp 3: So sánh overhead với SPO
-INGPO_TREE=666 NUM_ITER=10 bash scripts/run_exp3_overhead.sh
+```
+[gvar.jsonnet]                              # global vars
++ [prompt_library/<task>.jsonnet]           # task-specific prompts
++ [runtimes/policy_iteration.jsonnet]       # runtime
++ [episode_generators/<eg>.jsonnet]         # episode generator type
++ [trainers/<algo>_<dataset>.jsonnet]       # trainer hyper-params
++ [models/<model>.jsonnet]                  # model
++ {custom overrides}
 ```
 
-### Ablation studies
+Để tạo experiment mới, copy một `polIter_*.jsonnet` đã có rồi đổi các overlay.
 
-```bash
-# Chạy tất cả ablations
-ABLATIONS="abl1 abl2 abl3 abl4 abl5 abl6 abl7" bash scripts/run_ablations.sh
-```
+## InGPO — chi tiết thuật toán
 
-| Tên run | Mục đích |
-|---------|----------|
-| `abl1-K{5,20}-m{50,200}` | Khảo sát K vs m (kích thước sample) |
-| `abl2-eta-{0.005..0.05}` | Khảo sát ngưỡng η |
-| `abl3-share-{parent,root}` | So sánh share target (parent vs root) |
-| `abl4-{share-only,prune-only,neither}` | Tách riêng ảnh hưởng của Share và Prune |
-| `abl5-y-per-dataset` | Precompute answer set Y một lần |
-| `abl6-no-dkw` | Tắt DKW band → τ = η |
-| `abl7-oracle-record` | Giữ lại PRUNE/SHARE edges để audit |
+InGPO mở rộng SPO-tree với hai cơ chế gated bằng Total Variation bound:
 
-## Kiểm tra (Tests)
+1. **ValueShare**: phát hiện các segment có log-prob distribution gần giống một segment đã đánh giá → chia sẻ value, không tính lại.
+2. **Prune**: phát hiện các segment không thể tăng value so với parent hơn ε → loại khỏi cây search.
 
-```bash
-# Chạy unit tests
-PYTHONPATH=ingpo_src python -m pytest tests/ -q
+Cả hai trigger được kích hoạt khi TV bound (Total Variation distance trên K logprobs) thoả ngưỡng η.
 
-# Smoke test (kiểm tra config + tests, không cần GPU)
-bash scripts/run_smoke.sh
+Tham số mặc định (`configs/ingpo_defaults.libsonnet`):
 
-# End-to-end debug run (2 iterations, cây độ sâu 2)
-bash scripts/train_debug.sh
-```
+| Tham số | Default | Ý nghĩa |
+|---------|---------|---------|
+| `K` | 10 | Số mẫu logprobs để estimate AvgLP |
+| `m` | 100 | Số mẫu trong answer-set Y |
+| `epsilon` | 0.02 | Ngưỡng value gap cho Prune |
+| `share_target` | `nearest` | Target để share value (`nearest`/`parent`/`root`) |
+| `local_value_share` | true | Path local (so sánh siblings) hay global (qua Y) |
+| `demo_examples_per_tree` | 2 | Số SHARE/PRUNE demo lưu mỗi cây |
 
-## Logging và Theo dõi
+Override trong file `.jsonnet`:
 
-InGPO hỗ trợ logging **offline** (không cần internet):
-
-### Metrics ghi lại tự động
-
-- **Tỷ lệ tổng**: `share_rate`, `prune_rate`, số lượng expand/share/prune
-- **Theo độ sâu**: metrics chi tiết cho mỗi tầng của cây
-- **Answer set size**: Kích thước tập đáp án Y
-
-### File demo (dễ đọc cho con người)
-
-Hai file được ghi trong `<experiment_dir>/ingpo_demos/`:
-
-1. **`demos.md`** - Định dạng Markdown, dễ đọc
-2. **`demos.jsonl`** - JSON Lines, dùng cho phân tích
-
-Xem demo trong khi training:
-```bash
-# Xem file Markdown (live update)
-bash scripts/tail_demos.sh <tên_experiment>
-
-# Xem file JSONL
-bash scripts/tail_demos.sh <tên_experiment> jsonl
-```
-
-Phân tích sau khi chạy:
-```bash
-# Xem 20 demo đầu tiên
-python scripts/inspect_demos.py experiments/<exp>/ingpo_demos/demos.jsonl
-
-# Chỉ xem PRUNE demos ở depth 2
-python scripts/inspect_demos.py experiments/<exp>/ingpo_demos/demos.jsonl \
-    --action prune --depth 2 --limit 5
-
-# Chỉ xem tổng kết (không hiển thị nội dung demo)
-python scripts/inspect_demos.py experiments/<exp>/ingpo_demos/demos.jsonl --summary
-```
-
-## Cấu hình quan trọng
-
-Các tham số mặc định nằm trong `configs/ingpo_defaults.libsonnet`:
-
-| Tham số | Giá trị mặc định | Ý nghĩa |
-|---------|------------------|---------|
-| `K` | 10 | Số mẫu để tính AvgLP |
-| `m` | 100 | Số mẫu để tính TV distance |
-| `η` (eta) | 0.02 | Ngưỡng cho trigger |
-| `demo_examples_per_tree` | 2 | Số demo SHARE/PRUNE lưu mỗi cây |
-
-Bạn có thể override bất kỳ tham số nào trong file config `.jsonnet`:
 ```jsonnet
-{
-  ingpo+: {
-    demo_examples_per_tree: 5,
-    eta: 0.05,
-  }
-}
+{ ingpo+: { epsilon: 0.05, K: 20 } }
 ```
 
-## Lưu ý kỹ thuật
+Ablations & sweep nằm trong `configs/ablations/`, `configs/baselines/`, `configs/num_iter_sweep.libsonnet`.
 
-- **vLLM scoring**: InGPO dùng endpoint `/v1/completions` với `echo=True, logprobs=1, max_tokens=0` để tính log-probability của các đáp án trong tập Y.
-- **Không sửa code SPO**: Tất cả logic InGPO được thêm qua Python decorators và Jsonnet inheritance, code gốc của SPO giữ nguyên.
-- **WandB optional**: Logging wandb tắt mặc định (`log_demos_to_wandb: false`), chỉ bật nếu bạn muốn upload lên wandb.ai.
+## Logging offline (no internet)
+
+InGPO ghi mọi metric ra file để dùng offline:
+
+- `<exp>/training_timing.jsonl` — mỗi iteration 1 dòng: `train_total_seconds` (không gồm eval), `eval_seconds`, cumulative wall.
+- `<exp>/ingpo_demos/demos.jsonl` — mỗi tree: stats, per_depth, tree_construction_seconds, SHARE/PRUNE demos.
+- `<exp>/ingpo_demos/demos.md` — bản Markdown human-readable.
+
+Xem live:
+
+```bash
+bash scripts/tail_demos.sh <exp_name>             # markdown
+bash scripts/tail_demos.sh <exp_name> jsonl       # jsonl
+python scripts/inspect_demos.py <exp>/ingpo_demos/demos.jsonl --summary
+```
+
+## Tests
+
+```bash
+PYTHONPATH=. python -m pytest tests/ -q       # unit tests (no GPU needed)
+bash scripts/run_smoke.sh                     # config compile + unit tests
+bash scripts/train_debug.sh                   # E2E 2 iterations, depth 2 (needs vLLM)
+```
+
+## Migration notes
+
+Phiên bản trước có hai layer riêng: `ingpo/spo/` (SPO) + `ingpo/ingpo_src/` (InGPO ext). Refactor này gộp tất cả vào `treetune/` ở top level:
+
+| Cũ | Mới |
+|----|-----|
+| `ingpo/spo/src/treetune/` | `ingpo/treetune/` |
+| `ingpo/spo/src/guidance/` | `ingpo/guidance/` |
+| `ingpo/ingpo_src/ingpo_ext/core/` | `ingpo/treetune/ingpo/` |
+| `ingpo/ingpo_src/ingpo_ext/episode_generators/ingpo_episode_generator.py` | `ingpo/treetune/episode_generators/ingpo_episode_generator.py` |
+| `ingpo/ingpo_src/ingpo_ext/inference_strategies/ingpo_inference_strategy.py` | `ingpo/treetune/inference_strategies/ingpo_inference_strategy.py` |
+| `ingpo/spo/configs/*` + `ingpo/configs/*` | `ingpo/configs/*` (merged) |
+| `ingpo/spo/scripts/*` + `ingpo/scripts/*` | `ingpo/scripts/*` (merged) |
+| `ingpo_main.py` shim | xoá — dùng `python -m treetune.main` |
+| `import ingpo_ext.X` | `import treetune.ingpo.X` |
+| `setup.py` (ingpo_ext) | `setup.py` (treetune, single package) |
+
+DAPO không có trong scope — dùng GRPO (`scripts/train_grpo_MATH.sh`) thay thế.
 
 ## License
 
-Giống như SPO - MIT License. Xem [`spo/LICENSE`](./spo/LICENSE) để biết chi tiết.
+Code base treetune kế thừa MIT License của SPO. Xem `docs/legacy/LICENSE_SPO`.
 
-## Tài liệu tham khảo
+## Tham khảo
 
-- **[PLAN.md](./PLAN.md)**: Đặc tả chi tiết thuật toán InGPO
-- **[SPO Repository](https://github.com/AIFrameResearch/SPO)**: Code gốc của SPO
-
----
-
-## Notes: Các file thực hiện Build Tree
-
-Dưới đây là danh sách các file chính chịu trách nhiệm xây dựng cây tìm kiếm (Tree Building) trong dự án:
-
-### 1. Logic cốt lõi (Core Logic)
-- **`ingpo/spo/tree_builder.py`** (hoặc `spo/tree_builder.py`): Chứa lớp `TreeBuilder` hoặc các hàm đệ quy `build_tree`, `expand_node`. Đây là nơi triển khai thuật toán DFS/BFS và quản lý cấu trúc cây.
-- **`ingpo/spo/nodes.py`** (hoặc tương đương): Định nghĩa các lớp `Node`, `TreeNode`, lưu trữ trạng thái, log_prob, và value của từng node.
-
-### 2. Scripts chạy thực nghiệm (Entry Points)
-- **`ingpo/scripts/build_global_Y.py`**: Script chính để xây dựng cây toàn cục (global tree) cho tập dữ liệu.
-- **`ingpo/scripts/run_tree_search.py`**: Script dùng để test và chạy tìm kiếm cây với các tham số cấu hình cụ thể.
-
-### 3. Cấu hình (Configs)
-- **`ingpo/configs/`** và **`ingpo/spo/configs/`**: Các file `.jsonnet` định nghĩa tham số như `max_depth`, `branching_factor`, `temperature`, và đường dẫn model.
-  - Ví dụ: `polIter_qwen1b_ingpo_tree_MATH.jsonnet`
-
-### 4. Tiện ích hỗ trợ (Utilities)
-- **`ingpo/spo/utils/cache.py`**: Xử lý việc lưu/load cây đã build để tránh tính toán lại.
-- **`ingpo/spo/utils/batch_inference.py`**: Các hàm wrapper để gọi model theo batch (cần kiểm tra xem đã tối ưu cho tree chưa).
-
-> **Lưu ý hiệu năng:** Nếu cần tối ưu tốc độ, hãy tập trung vào `tree_builder.py` để chuyển đổi từ DFS sang BFS kết hợp Batch Inference Across Levels.
+- [SPO paper](https://github.com/AIFrameResearch/SPO) — Segment Policy Optimization gốc
+- [GRPO paper](https://arxiv.org/abs/2402.03300) — DeepSeek-Math
+- [VinePPO paper](https://arxiv.org/abs/2410.01679) — McGill
+- [DPO paper](https://arxiv.org/abs/2305.18290) — Stanford
+- `PLAN.md` — đặc tả chi tiết thuật toán InGPO

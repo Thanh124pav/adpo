@@ -15,10 +15,10 @@ from typing import Dict, List
 
 import pytest
 
-from ingpo_ext.core.answer_set import AnswerSet
-from ingpo_ext.core.lp_scorer import LPScorer
-from ingpo_ext.core.thresholds import ThresholdConfig
-from ingpo_ext.core.triggers import Action, TriggerEngine
+from treetune.ingpo.answer_set import AnswerSet
+from treetune.ingpo.lp_scorer import LPScorer
+from treetune.ingpo.thresholds import ThresholdConfig
+from treetune.ingpo.triggers import Action, TriggerEngine
 
 
 @dataclass

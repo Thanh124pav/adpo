@@ -3,7 +3,7 @@
 
 {
   // Path to SPO configs relative to ingpo/ (the directory `configs/` lives in).
-  spo_configs:: '../spo/configs/',
+  spo_configs:: '',
   spo(rel):: import './' + rel,  // jsonnet cannot resolve at lib time; users
   // should set jsonpath include path to include both ingpo/configs/ and
   // ingpo/spo/configs/ when invoking jsonnet. This file documents the conv.

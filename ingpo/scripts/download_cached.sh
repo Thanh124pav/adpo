@@ -6,5 +6,5 @@
 
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
-cd "${SPO_ROOT}"
+cd "${INGPO_ROOT}"
 python scripts/download_cached_inference_result.py "$@"

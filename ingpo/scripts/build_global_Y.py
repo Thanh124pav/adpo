@@ -24,7 +24,7 @@ from typing import List
 
 import openai
 
-from ingpo_ext.core.answer_set import DEFAULT_Y_PROMPT_TEMPLATE
+from treetune.ingpo.answer_set import DEFAULT_Y_PROMPT_TEMPLATE
 
 
 async def sample_completions(client, model: str, prompt: str, n: int, max_tokens: int) -> List[str]:

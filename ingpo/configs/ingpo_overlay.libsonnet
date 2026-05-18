@@ -1,7 +1,7 @@
 // Reusable overlay that converts an SPO-tree config into an InGPO-tree
 // config. Apply via:
 //
-//   (import '../spo/configs/polIter_<model>_<dataset>_spo_tree.jsonnet')
+//   (import 'polIter_<model>_<dataset>_spo_tree.jsonnet')
 //   + (import 'ingpo_defaults.libsonnet')
 //   + (import 'ingpo_overlay.libsonnet')
 //

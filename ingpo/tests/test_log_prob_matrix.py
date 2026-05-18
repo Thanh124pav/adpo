@@ -3,7 +3,7 @@ import math
 import numpy as np
 import pytest
 
-from ingpo_ext.core.log_prob_matrix import LogProbMatrix
+from treetune.ingpo.log_prob_matrix import LogProbMatrix
 
 
 def test_add_and_full_fill():

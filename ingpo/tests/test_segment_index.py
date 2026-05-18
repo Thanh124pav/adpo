@@ -1,4 +1,4 @@
-from ingpo_ext.core.segment_index import SegmentBST
+from treetune.ingpo.segment_index import SegmentBST
 
 
 def test_find_nearest_basic():

@@ -15,7 +15,6 @@ LAST_POLICY="${2:?missing last_policy_path}"
 shift 2 || true
 
 CFG="${INGPO_ROOT}/configs/${CFG_NAME}.jsonnet"
-[[ -f "${CFG}" ]] || CFG="${SPO_ROOT}/configs/${CFG_NAME}.jsonnet"
 [[ -f "${CFG}" ]] || { echo "Cannot find config ${CFG_NAME}"; exit 2; }
 
 EXP_NAME="${APP_EXPERIMENT_NAME:-eval-${CFG_NAME}}"

@@ -2,8 +2,8 @@ import math
 
 import pytest
 
-from ingpo_ext.core.log_prob_matrix import LogProbMatrix
-from ingpo_ext.core.tv_distance import (
+from treetune.ingpo.log_prob_matrix import LogProbMatrix
+from treetune.ingpo.tv_distance import (
     avg_lp_diff_K,
     conditional_ig_lower_bound,
     tv_m,

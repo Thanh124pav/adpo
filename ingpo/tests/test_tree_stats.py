@@ -9,7 +9,7 @@ and disagreed with the per-depth breakdown.
 
 from __future__ import annotations
 
-from ingpo_ext.core.logging_helpers import (
+from treetune.ingpo.logging_helpers import (
     aggregate_tree_stats,
     per_depth_action_counts,
 )

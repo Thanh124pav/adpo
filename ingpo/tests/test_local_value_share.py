@@ -1,6 +1,6 @@
 import pytest
 
-from ingpo_ext.core.local_value_share import (
+from treetune.ingpo.local_value_share import (
     confidence_radius,
     pair_budget,
     sampled_tv_from_logps,

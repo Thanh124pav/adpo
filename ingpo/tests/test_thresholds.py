@@ -2,7 +2,7 @@ import math
 
 import pytest
 
-from ingpo_ext.core.thresholds import ThresholdConfig, compute_eta, compute_tau
+from treetune.ingpo.thresholds import ThresholdConfig, compute_eta, compute_tau
 
 
 def test_eta_from_lemma_2_4():
