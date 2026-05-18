@@ -27,6 +27,38 @@ def truncate(s: Optional[str], n: int = _DEMO_TEXT_TRUNC) -> str:
     return s if len(s) <= n else s[: n - 3] + "..."
 
 
+def aggregate_tree_stats(tree) -> Dict[str, float]:
+    """Walk the final tree once and aggregate action counts into the same
+    ``ingpo/...`` keys used by ``TriggerEngine.stats.as_dict()``.  This is the
+    single source of truth: by sharing the tree walk with
+    ``per_depth_action_counts`` we guarantee aggregate rates stay consistent
+    with the per-depth breakdown.
+    """
+
+    counts: Counter = Counter()
+    stack = [tree]
+    while stack:
+        n = stack.pop()
+        a = n.get("ingpo_action")
+        if a is not None:
+            counts[a] += 1
+        stack.extend(n.get("children") or [])
+
+    expanded = counts.get("expand", 0)
+    shared = counts.get("share", 0)
+    pruned = counts.get("prune", 0)
+    total = expanded + shared + pruned
+    if total == 0:
+        return {}
+    return {
+        "ingpo/expanded_count": expanded,
+        "ingpo/shared_count": shared,
+        "ingpo/pruned_count": pruned,
+        "ingpo/share_rate": shared / total,
+        "ingpo/prune_rate": pruned / total,
+    }
+
+
 def per_depth_action_counts(tree) -> Dict[str, float]:
     """Walk the tree and return per-depth share/prune/expand counts and
     rates as a flat dict of wandb-friendly metric names.
@@ -164,10 +196,11 @@ def to_jsonl_record(
     stats: Dict[str, Any],
     per_depth: Dict[str, float],
     demo_rows: Dict[str, List[List[Any]]],
+    tree_construction_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Pack one tree's metrics + demos into a JSONL-ready dict."""
 
-    return {
+    record: Dict[str, Any] = {
         "tree_idx": tree_idx,
         "question_id": question_id,
         "answer_set_size": answer_set_size,
@@ -178,3 +211,6 @@ def to_jsonl_record(
             "prune": [row_to_dict(r) for r in demo_rows["prune"]],
         },
     }
+    if tree_construction_seconds is not None:
+        record["tree_construction_seconds"] = float(tree_construction_seconds)
+    return record

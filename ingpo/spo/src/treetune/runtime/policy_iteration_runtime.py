@@ -189,6 +189,15 @@ class PolicyIterationRuntime(DistributedRuntime):
 
         latest_policy_path = None
         starting_iteration = 0
+
+        # Offline-friendly timing log: one JSON record per iteration with the
+        # train/eval/wall breakdown.  Independent of wandb so it works under
+        # `wandb mode=offline` and on machines without internet.
+        timing_log_path = self.exp_root / "training_timing.jsonl"
+        cumulative_train_seconds = 0.0
+        cumulative_eval_seconds = 0.0
+        loop_start_wall = time.time()
+
         last_checkpoint = trainer.get_last_checkpoint(return_resumable_only=True)
         if not force_rerun and last_checkpoint is not None:
             trainer.load_checkpoint(last_checkpoint)
@@ -228,9 +237,9 @@ class PolicyIterationRuntime(DistributedRuntime):
                     logger.warning(f"Caught an exception: {e}")
                     trainer.state.iteration += 1
                     continue
+                t_ep_gen = time.time() - t0
                 logger.info(f"Num. Episodes={len(episodes)}")
-                # self._cloud_log({"timing/total/episode_generation": time.time() - t0})
-                self._cloud_log({"timing/total/episode_generation": time.time() - t0, "train/global_iteration": iteration})
+                self._cloud_log({"timing/total/episode_generation": t_ep_gen, "train/global_iteration": iteration})
 
                 assert (
                     iteration == trainer.state.iteration
@@ -240,8 +249,8 @@ class PolicyIterationRuntime(DistributedRuntime):
 
                 t0 = time.time()
                 latest_policy_path = trainer.step(episodes)
-                # self._cloud_log({"timing/total/training_step": time.time() - t0})
-                self._cloud_log({"timing/total/training_step": time.time() - t0, "train/global_iteration": iteration})
+                t_train = time.time() - t0
+                self._cloud_log({"timing/total/training_step": t_train, "train/global_iteration": iteration})
 
                 assert (
                     iteration + 1 == trainer.state.iteration
@@ -260,11 +269,40 @@ class PolicyIterationRuntime(DistributedRuntime):
                     logger.info(f"Finished iteration {iteration}")
 
                 # Add evaluation here
+                t_eval = 0.0
                 if self.distributed_state.is_main_process: # Evaluate only on the main process
                    if iteration % self.evaluate_every_n_iterations == 0:
+                       t0_eval = time.time()
                        self.evaluate(iteration, latest_policy_path)
+                       t_eval = time.time() - t0_eval
+                       cumulative_eval_seconds += t_eval
+                       self._cloud_log({"timing/iter/eval_seconds": t_eval, "train/global_iteration": iteration})
 
                 # self.distributed_state.wait_for_everyone() # Wait the main process to finish the evaluation
+
+                # Aggregate per-iteration timing (training time EXCLUDES eval) and
+                # append to the offline JSONL log.
+                t_train_total = t_ep_gen + t_train
+                cumulative_train_seconds += t_train_total
+                wall_seconds = time.time() - loop_start_wall
+                timing_record = {
+                    "iteration": iteration,
+                    "global_step": getattr(trainer.state, "global_step", None),
+                    "timing/iter/episode_generation_seconds": t_ep_gen,
+                    "timing/iter/training_step_seconds": t_train,
+                    "timing/iter/train_total_seconds": t_train_total,
+                    "timing/iter/eval_seconds": t_eval,
+                    "timing/cumulative/train_seconds": cumulative_train_seconds,
+                    "timing/cumulative/eval_seconds": cumulative_eval_seconds,
+                    "timing/cumulative/wall_seconds": wall_seconds,
+                }
+                self._cloud_log({**timing_record, "train/global_iteration": iteration})
+                if is_local_main_process:
+                    try:
+                        with open(timing_log_path, "a", buffering=1) as fh:
+                            fh.write(json.dumps(timing_record) + "\n")
+                    except Exception as exc:
+                        logger.warning(f"Failed to append training_timing.jsonl: {exc}")
 
             except EarlyStop as e:
                 logger.info(e)

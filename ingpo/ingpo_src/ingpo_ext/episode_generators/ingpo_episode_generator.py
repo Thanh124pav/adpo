@@ -118,6 +118,7 @@ class InGPOEpisodeGenerator(HybridEpisodeGenerator):
             per_depth=per_depth,
             demo_rows=demo_rows,
             answer_set_size=tree_copy.get("ingpo_answer_set_size", 0),
+            tree_construction_seconds=tree_copy.get("ingpo_tree_construction_seconds"),
         )
 
         # ---- Optional wandb scalar+table logging --------------------------
@@ -299,6 +300,7 @@ class InGPOEpisodeGenerator(HybridEpisodeGenerator):
         per_depth: Dict[str, float],
         demo_rows: Dict[str, List[List[Any]]],
         answer_set_size: int,
+        tree_construction_seconds: Optional[float] = None,
     ) -> None:
         if max(self.ingpo_demo_examples_per_tree, 0) == 0 and not stats:
             return
@@ -315,6 +317,7 @@ class InGPOEpisodeGenerator(HybridEpisodeGenerator):
             stats=stats,
             per_depth=per_depth,
             demo_rows=demo_rows,
+            tree_construction_seconds=tree_construction_seconds,
         )
         try:
             jsonl.write(json.dumps(record, default=str) + "\n")

@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 import uuid
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -44,6 +45,7 @@ from ingpo_ext.core.answer_set import (
     AnswerSet,
     AnswerSetGenerator,
 )
+from ingpo_ext.core.logging_helpers import aggregate_tree_stats
 from ingpo_ext.core.thresholds import ThresholdConfig
 from ingpo_ext.core.triggers import Action, TriggerEngine
 from ingpo_ext.core.local_value_share import (
@@ -186,6 +188,7 @@ class InGPOInferenceStrategy(HybridInferenceStrategy):
         max_depth: int = 2,
         data_instance: Optional[Dict[str, Any]] = None,
     ):
+        t0_tree = time.time()
         client = self._ensure_lp_client()
         scorer = make_lp_scorer(client, self._tokenize)
 
@@ -594,21 +597,22 @@ class InGPOInferenceStrategy(HybridInferenceStrategy):
 
         await dfs(tree, initial_prompt, 0)
 
-        # Tag the tree with stats and answer-set bookkeeping for downstream.
-        if engine is not None:
-            tree["ingpo_stats"] = engine.stats.as_dict()
-        else:
-            total = local_shared_count + local_pruned_count
-            tree["ingpo_stats"] = {
-                "ingpo/expanded_count": 0,
-                "ingpo/shared_count": local_shared_count,
-                "ingpo/pruned_count": local_pruned_count,
-                "ingpo/share_rate": local_shared_count / max(total, 1),
-                "ingpo/prune_rate": local_pruned_count / max(total, 1),
-                "ingpo/avg_tv_when_share": local_avg_tv_share,
-                "ingpo/avg_gap_when_prune": local_avg_gap_prune,
-            } if total else {}
+        # Aggregate stats from the final tree once.  Same tree walk as
+        # ``per_depth_action_counts`` → aggregate rates can't disagree with
+        # per-depth rates, and the local_value_share path stops dropping
+        # expanded nodes from the denominator.
+        stats = aggregate_tree_stats(tree)
+        if stats:
+            stats["ingpo/avg_tv_when_share"] = (
+                engine.stats.avg_tv_share if engine is not None else local_avg_tv_share
+            )
+            stats["ingpo/avg_gap_when_prune"] = (
+                engine.stats.avg_gap_prune if engine is not None else local_avg_gap_prune
+            )
+        tree["ingpo_stats"] = stats
         tree["ingpo_answer_set_size"] = answer_set.m
+        tree["ingpo_tree_construction_seconds"] = time.time() - t0_tree
+        tree["ingpo_problem_id"] = problem_id
         return tree
 
     @staticmethod
