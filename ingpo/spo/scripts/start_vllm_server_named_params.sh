@@ -30,16 +30,30 @@ done
 
 export VLLM_HF_FOLDER_CACHE_FILE=$HF_HOME/vllm_hf_folder_cache.json
 
-CUDA_VISIBLE_DEVICES=$GPU_IDX python3 -m vllm.entrypoints.openai.api_server \
-    --model "$MODEL" \
-    --host 0.0.0.0 \
-    --port "$PORT" \
-    --seed "$SEED" \
-    --swap-space "$SWAP_SPACE" \
-    --dtype bfloat16 \
-    --gpu-memory-utilization "$GPU_MEM_UTILIZATION" \
-    --max-num-seqs "$MAX_NUM_SEQS" \
-    $(if [ "$ENABLE_PREFIX_CACHING" = true ]; then echo "--enable-prefix-caching"; fi) \
-    $(if [ "$DISABLE_SLIDING_WINDOW" = true ]; then echo "--disable-sliding-window"; fi) \
-    $(if [ -n "$MAX_MODEL_LEN" ]; then echo "--max-model-len $MAX_MODEL_LEN"; fi) \
-    $(if [ "$DISABLE_FRONTEND_MULTIPROCESSING" = true ]; then echo "--disable-frontend-multiprocessing"; fi)
+ARGS=(
+    --model "$MODEL"
+    --host 0.0.0.0
+    --port "$PORT"
+    --seed "$SEED"
+    --dtype bfloat16
+    --gpu-memory-utilization "$GPU_MEM_UTILIZATION"
+    --max-num-seqs "$MAX_NUM_SEQS"
+)
+
+if [ -n "${SWAP_SPACE:-}" ]; then
+    ARGS+=(--swap-space "$SWAP_SPACE")
+fi
+if [ "$ENABLE_PREFIX_CACHING" = true ]; then
+    ARGS+=(--enable-prefix-caching)
+fi
+if [ "$DISABLE_SLIDING_WINDOW" = true ]; then
+    ARGS+=(--disable-sliding-window)
+fi
+if [ -n "$MAX_MODEL_LEN" ]; then
+    ARGS+=(--max-model-len "$MAX_MODEL_LEN")
+fi
+if [ "$DISABLE_FRONTEND_MULTIPROCESSING" = true ]; then
+    ARGS+=(--disable-frontend-multiprocessing)
+fi
+
+CUDA_VISIBLE_DEVICES=$GPU_IDX python3 -m vllm.entrypoints.openai.api_server "${ARGS[@]}"
