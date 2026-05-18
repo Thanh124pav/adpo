@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Train InGPO-tree on MATH with DeepSeek-Distill-Qwen-1.5B by default.
-# Branch factor sweep is selected via INGPO_TREE={444,666,888} (default 666).
+# Branch factor sweep is selected via INGPO_TREE, e.g.
+# {444,666,888,6666,66666,44444} (default 666).
 
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
