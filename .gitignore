@@ -16,3 +16,7 @@
 # Original rules preserved
 *.log
 ```
+# Python
+__pycache__/
+*.pyc
+*.pyo
