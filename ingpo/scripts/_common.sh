@@ -108,7 +108,7 @@ ensure_runtime_config() {
   local value_max_programs="${INGPO_VALUE_MAX_CONCURRENT_PROGRAMS:-512}"
   local value_max_generations="${INGPO_VALUE_MAX_CONCURRENT_GENERATIONS:-512}"
   local vllm_max_num_seqs="${INGPO_VLLM_MAX_NUM_SEQS:-1024}"
-  local vllm_swap_space="${INGPO_VLLM_SWAP_SPACE:-32}"
+  local vllm_swap_space="${INGPO_VLLM_SWAP_SPACE:-null}"
   local ingpo_score_concurrency="${INGPO_SCORE_CONCURRENCY:-64}"
   local ingpo_K="${INGPO_K:-null}"
   local ingpo_m="${INGPO_M:-null}"
@@ -131,6 +131,7 @@ ensure_runtime_config() {
 //   INGPO_MAX_CONCURRENT_GENERATIONS=${max_generations}
 //   INGPO_SCORE_CONCURRENCY=${ingpo_score_concurrency}
 //   INGPO_VLLM_GPU_MEMORY_UTILIZATION=${INGPO_VLLM_GPU_MEMORY_UTILIZATION:-auto}
+//   INGPO_VLLM_SWAP_SPACE=${vllm_swap_space}  // null by default for newer vLLM
 {
   evaluate_every_n_iterations: ${eval_every},
   num_episodes_per_iteration: if ${num_episodes_per_iteration} == null then super.num_episodes_per_iteration else ${num_episodes_per_iteration},

@@ -137,7 +137,7 @@ class VLLMServer(FromParams):
     def __init__(
         self,
         seed: int = 42,
-        swap_space: int = 16,
+        swap_space: Optional[int] = None,
         gpu_memory_utilization: float = 0.9,
         max_num_seqs: int = 256,
         enable_prefix_caching: bool = False,
@@ -265,10 +265,11 @@ class VLLMServer(FromParams):
             f" --model {hf_ckpt_path_or_model}"
             f" --port {self.port}"
             f" --seed {self.seed}"
-            f" --swap-space {self.swap_space}"
             f" --gpu-memory-utilization {self.gpu_memory_utilization}"
             f" --max-num-seqs {self.max_num_seqs}"
         )
+        if self.swap_space is not None:
+            command += f" --swap-space {self.swap_space}"
         if gpu_idx is not None:
             command += f" --gpu-idx {gpu_idx}"
         if self.enable_prefix_caching:
