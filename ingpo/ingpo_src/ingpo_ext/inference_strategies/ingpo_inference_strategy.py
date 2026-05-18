@@ -348,7 +348,13 @@ class InGPOInferenceStrategy(HybridInferenceStrategy):
                 try:
                     tv = await _score_local_tv(src, tgt, continuations)
                 except Exception as exc:
-                    logger.warning(f"InGPO local ValueShare failed: {exc}")
+                    logger.warning(
+                        "InGPO local ValueShare failed for pair src=%s tgt=%s n_continuations=%d",
+                        src.get("ingpo_segment_id"),
+                        tgt.get("ingpo_segment_id"),
+                        len(continuations),
+                        exc_info=True,
+                    )
                     return src, tgt, continuations, None
                 return src, tgt, continuations, tv
 
