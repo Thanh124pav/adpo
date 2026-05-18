@@ -15,7 +15,7 @@ export APP_JSONNET_PATH="${INGPO_ROOT}/configs:${INGPO_ROOT}"
 
 # Standard env vars (kept compatible with upstream SPO conventions).
 export APP_SEED="${APP_SEED:-42}"
-export MASTER_PORT="${MASTER_PORT:-$(python -c "import socket; s=socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.bind(('', 0)); print(s.getsockname()[1]); s.close()")}"
+export MASTER_PORT="${MASTER_PORT:-$(python3 -c "import socket; s=socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.bind(('', 0)); print(s.getsockname()[1]); s.close()")}"
 export APP_DIRECTORY="${APP_DIRECTORY:-${INGPO_ROOT}/experiments}"
 export APP_MINIMIZE_STORED_FILES="${APP_MINIMIZE_STORED_FILES:-True}"
 export WANDB_PROJECT="${WANDB_PROJECT:-treetune}"

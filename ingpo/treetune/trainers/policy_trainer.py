@@ -131,7 +131,7 @@ class PolicyTrainer(Trainer):
         self.deepspeed_plugin = None
         if deepspeed_config is not None:
             self.args.world_size = distributed_state.num_processes
-            from transformers.deepspeed import HfTrainerDeepSpeedConfig
+            from transformers.integrations import HfTrainerDeepSpeedConfig
 
             self.hf_deepspeed_config = HfTrainerDeepSpeedConfig(deepspeed_config)
             self.hf_deepspeed_config.trainer_config_process(self.args)
@@ -442,7 +442,7 @@ class PolicyTrainer(Trainer):
             ds_logger.setLevel(logging.DEBUG)
 
             if getattr(self.args, "hf_deepspeed_config", None) is None:
-                from transformers.deepspeed import HfTrainerDeepSpeedConfig
+                from transformers.integrations import HfTrainerDeepSpeedConfig
 
                 ds_plugin = self.accelerator.state.deepspeed_plugin
 

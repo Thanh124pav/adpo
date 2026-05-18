@@ -211,12 +211,14 @@ class LlamaRewardModel(Model, LlamaForCausalLM):
 
         is_main_process = PartialState().is_main_process
 
+        _use_fa2 = pretrained_args.pop(
+            "use_flash_attention_2", is_flash_attention_available()
+        )
         kwargs = {
-            "use_flash_attention_2": pretrained_args.pop(
-                "use_flash_attention_2", is_flash_attention_available()
-            ),
             "torch_dtype": pretrained_args.pop("torch_dtype", torch.bfloat16),
         }
+        if _use_fa2:
+            kwargs["attn_implementation"] = "flash_attention_2"
 
         if runtime_hf_model_name is not None:
             if is_main_process:

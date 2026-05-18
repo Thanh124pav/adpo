@@ -126,11 +126,6 @@ class BaseRuntime(Runtime):
             wandb_dir = self.global_vars.get("wandb_dir", "./wandb")
             logger.info(f"wandb dir set to {wandb_dir}")
 
-            settings = wandb.Settings()
-            settings.update(
-                _save_requirements=True,
-                _disable_meta=False,
-            )
             wandb.init(
                 config=self.config_dict,
                 project=self.project_name,

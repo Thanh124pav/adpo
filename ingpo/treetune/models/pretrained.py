@@ -100,13 +100,15 @@ class DIPreTrainedModelForCasualLM(Model, PreTrainedModel):
                 )
             hf_model_name = runtime_hf_model_name
 
+        _use_fa2 = pretrained_args.pop(
+            "use_flash_attention_2", is_flash_attention_available()
+        )
         kwargs = {
-            "use_flash_attention_2": pretrained_args.pop(
-                "use_flash_attention_2", is_flash_attention_available()
-            ),
             "torch_dtype": pretrained_args.pop("torch_dtype", torch.bfloat16),
             "trust_remote_code": True,
         }
+        if _use_fa2:
+            kwargs["attn_implementation"] = "flash_attention_2"
         if disable_dropout:
             dropout_config = configure_dropout(hf_model_name, 0.0)
             if is_main_process:
@@ -243,14 +245,15 @@ class DIPreTrainedModel(Model, PreTrainedModel):
             pretrained_args = {}
         # We don't need this as HuggingFace takes care of it
         _ = pretrained_args.pop("device", None)
-        use_flash_attention_2 = pretrained_args.pop(
+        _use_fa2 = pretrained_args.pop(
             "use_flash_attention_2", is_flash_attention_available()
         )
         torch_dtype = pretrained_args.pop("torch_dtype", torch.bfloat16)
+        _fa2_kwargs = {"attn_implementation": "flash_attention_2"} if _use_fa2 else {}
         model = AutoModel.from_pretrained(
             hf_model_name,
             **pretrained_args,
-            use_flash_attention_2=use_flash_attention_2,
+            **_fa2_kwargs,
             torch_dtype=torch_dtype,
         )
         return model

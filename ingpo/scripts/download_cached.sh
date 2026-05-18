@@ -7,4 +7,4 @@
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
 cd "${INGPO_ROOT}"
-python scripts/download_cached_inference_result.py "$@"
+python3 scripts/download_cached_inference_result.py "$@"

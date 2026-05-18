@@ -6,7 +6,7 @@ set -euo pipefail
 INGPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 echo "[smoke] Compiling all jsonnet configs..."
-python - <<PY
+python3 - <<PY
 import _jsonnet, sys
 from pathlib import Path
 root = Path("${INGPO_ROOT}")
@@ -28,6 +28,6 @@ print(f"OK  ({len(list((root/'configs').rglob('*.jsonnet')))} configs)")
 PY
 
 echo "[smoke] Running unit tests..."
-PYTHONPATH="${INGPO_ROOT}" python -m pytest "${INGPO_ROOT}/tests" -q
+PYTHONPATH="${INGPO_ROOT}" python3 -m pytest "${INGPO_ROOT}/tests" -q
 
 echo "[smoke] All checks passed."
