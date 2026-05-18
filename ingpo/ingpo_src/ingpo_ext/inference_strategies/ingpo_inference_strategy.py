@@ -326,6 +326,7 @@ class InGPOInferenceStrategy(HybridInferenceStrategy):
             eta = _share_eta()
             pair_tvs: Dict[frozenset, float] = {}
 
+            pair_jobs = []
             for i, j in pairs:
                 src = candidates[j]
                 tgt = candidates[i]
@@ -341,13 +342,23 @@ class InGPOInferenceStrategy(HybridInferenceStrategy):
                         break
                 if not continuations:
                     continue
+                pair_jobs.append((src, tgt, continuations))
 
+            async def _score_pair_tv(src: Node, tgt: Node, continuations: Sequence[str]):
                 try:
                     tv = await _score_local_tv(src, tgt, continuations)
                 except Exception as exc:
                     logger.warning(f"InGPO local ValueShare failed: {exc}")
-                    continue
+                    return src, tgt, continuations, None
+                return src, tgt, continuations, tv
 
+            scored_pairs = await asyncio.gather(
+                *(_score_pair_tv(src, tgt, continuations) for src, tgt, continuations in pair_jobs)
+            )
+
+            for src, tgt, continuations, tv in scored_pairs:
+                if tv is None:
+                    continue
                 pair_tvs[frozenset((src["ingpo_segment_id"], tgt["ingpo_segment_id"]))] = tv
                 radius = confidence_radius(len(continuations), self.cfg_thresholds.alpha)
                 lhs = tv + radius if self.ingpo_share_use_confidence else tv
