@@ -132,7 +132,8 @@ def get_api_key() -> str:
 
 
 def get_repo_dir() -> Path:
-    return Path(__file__).parent.parent.parent.parent
+    # treetune/common/wandb_utils.py -> treetune/common -> treetune -> repo root
+    return Path(__file__).parent.parent.parent
 
 
 def get_wandb_api() -> wandb.Api:
