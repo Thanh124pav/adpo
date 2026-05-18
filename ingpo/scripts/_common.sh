@@ -109,10 +109,19 @@ ensure_runtime_config() {
   local value_max_generations="${INGPO_VALUE_MAX_CONCURRENT_GENERATIONS:-512}"
   local vllm_max_num_seqs="${INGPO_VLLM_MAX_NUM_SEQS:-1024}"
   local vllm_swap_space="${INGPO_VLLM_SWAP_SPACE:-null}"
-  local ingpo_score_concurrency="${INGPO_SCORE_CONCURRENCY:-64}"
-  local ingpo_K="${INGPO_K:-null}"
-  local ingpo_m="${INGPO_M:-null}"
-  local ingpo_share_pair_budget_fraction="${INGPO_SHARE_PAIR_BUDGET_FRACTION:-null}"
+  local ingpo_inference_overrides=""
+  if [[ -n "${INGPO_SCORE_CONCURRENCY:-}" ]]; then
+    ingpo_inference_overrides+="      ingpo_score_concurrency: ${INGPO_SCORE_CONCURRENCY},"$'\n'
+  fi
+  if [[ -n "${INGPO_K:-}" ]]; then
+    ingpo_inference_overrides+="      ingpo_K: ${INGPO_K},"$'\n'
+  fi
+  if [[ -n "${INGPO_M:-}" ]]; then
+    ingpo_inference_overrides+="      ingpo_m: ${INGPO_M},"$'\n'
+  fi
+  if [[ -n "${INGPO_SHARE_PAIR_BUDGET_FRACTION:-}" ]]; then
+    ingpo_inference_overrides+="      ingpo_share_pair_budget_fraction: ${INGPO_SHARE_PAIR_BUDGET_FRACTION},"$'\n'
+  fi
 
   mkdir -p "${gen_dir}"
   cat > "${out}" <<EOF
@@ -129,7 +138,7 @@ ensure_runtime_config() {
 //   INGPO_DATASET_NUM_SAMPLES_PER_ITERATION=${dataset_num_samples_per_iteration}
 //   INGPO_MAX_CONCURRENT_PROGRAMS=${max_programs}
 //   INGPO_MAX_CONCURRENT_GENERATIONS=${max_generations}
-//   INGPO_SCORE_CONCURRENCY=${ingpo_score_concurrency}
+//   INGPO_SCORE_CONCURRENCY=${INGPO_SCORE_CONCURRENCY:-model default}
 //   INGPO_VLLM_GPU_MEMORY_UTILIZATION=${INGPO_VLLM_GPU_MEMORY_UTILIZATION:-auto}
 //   INGPO_VLLM_SWAP_SPACE=${vllm_swap_space}  // null by default for newer vLLM
 {
@@ -144,11 +153,7 @@ ensure_runtime_config() {
     inference_strategy+: {
       max_concurrent_programs: ${max_programs},
       max_concurrent_generations: ${max_generations},
-      ingpo_score_concurrency: ${ingpo_score_concurrency},
-      ingpo_K: if ${ingpo_K} == null then super.ingpo_K else ${ingpo_K},
-      ingpo_m: if ${ingpo_m} == null then super.ingpo_m else ${ingpo_m},
-      ingpo_share_pair_budget_fraction: if ${ingpo_share_pair_budget_fraction} == null then super.ingpo_share_pair_budget_fraction else ${ingpo_share_pair_budget_fraction},
-    },
+${ingpo_inference_overrides}    },
     value_estimation_inference_strategy+: {
       max_concurrent_programs: ${value_max_programs},
       max_concurrent_generations: ${value_max_generations},
