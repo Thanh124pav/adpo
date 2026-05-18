@@ -357,16 +357,27 @@ class VLLMServer(FromParams):
             logger.warning(f"Could not query GPU {gpu_idx} processes: {e}")
             pids = []
 
-        vllm_pids = [pid for pid in pids if self._pid_command_starts_with_vllm(pid)]
-        skipped_pids = sorted(set(pids) - set(vllm_pids))
-        if skipped_pids:
+        vllm_processes = [
+            (pid, command)
+            for pid in pids
+            if (command := self._pid_command(pid)) and "vllm" in command.lower()
+        ]
+        vllm_pids = [pid for pid, _ in vllm_processes]
+        skipped_processes = [
+            (pid, command)
+            for pid in pids
+            if pid not in set(vllm_pids) and (command := self._pid_command(pid))
+        ]
+        if skipped_processes:
             logger.info(
-                f"Skipping non-vLLM process(es) still on GPU {gpu_idx}: {skipped_pids}"
+                f"Skipping non-vLLM process(es) still on GPU {gpu_idx}: "
+                f"{[(pid, command[:80]) for pid, command in skipped_processes]}"
             )
 
-        if vllm_pids:
+        if vllm_processes:
             logger.info(
-                f"Force-killing {len(vllm_pids)} vLLM process(es) still on GPU {gpu_idx}: {vllm_pids}"
+                f"Force-killing {len(vllm_processes)} vLLM process(es) still on GPU {gpu_idx}: "
+                f"{[(pid, command[:80]) for pid, command in vllm_processes]}"
             )
             for pid in vllm_pids:
                 try:
@@ -379,7 +390,7 @@ class VLLMServer(FromParams):
         time.sleep(5)
 
     @staticmethod
-    def _pid_command_starts_with_vllm(pid: int) -> bool:
+    def _pid_command(pid: int) -> str:
         try:
             result = subprocess.run(
                 ["ps", "-p", str(pid), "-o", "args="],
@@ -388,15 +399,9 @@ class VLLMServer(FromParams):
             )
         except Exception as e:
             logger.warning(f"Could not inspect PID {pid}: {e}")
-            return False
+            return ""
 
         command = result.stdout.strip()
         if result.returncode != 0 or not command:
-            return False
-
-        try:
-            executable = shlex.split(command)[0]
-        except ValueError:
-            executable = command.split(maxsplit=1)[0]
-
-        return Path(executable).name.startswith("vllm")
+            return ""
+        return command
