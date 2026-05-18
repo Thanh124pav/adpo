@@ -15,8 +15,9 @@ CFG="${INGPO_ROOT}/configs/baselines/${NAME}.jsonnet"
 [[ -f "${CFG}" ]] || { echo "Unknown baseline: ${NAME}"; exit 2; }
 
 CFGS="${CFG}"
-if [[ "${NAME}" == *spo_tree* && "${INGPO_TREE:-}" != "" ]]; then
-  CFGS+=",${INGPO_ROOT}/configs/episode_generators/branch_factor_${INGPO_TREE}.jsonnet"
+TREE="${TREE:-${INGPO_TREE:-}}"
+if [[ "${NAME}" == *spo_tree* && -n "${TREE}" ]]; then
+  CFGS+=",$(ensure_tree_config "${TREE}")"
 fi
 
 EXP_NAME="${APP_EXPERIMENT_NAME:-baseline-${NAME}}"

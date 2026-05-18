@@ -5,12 +5,12 @@
 
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
-INGPO_TREE="${INGPO_TREE:-666}"
+TREE="${TREE:-${INGPO_TREE:-666}}"
 GRID="${GRID:-K1_m20 K5_m50 K10_m200 K20_m100 K20_m500}"
 TAG="${EXP_TAG:-exp-K-m-sweep}"
 
 BASE_CFG="${INGPO_ROOT}/configs/polIter_qwen1_5b_base_ingpo_tree_MATH.jsonnet"
-TREE_CFG="${INGPO_ROOT}/configs/episode_generators/branch_factor_${INGPO_TREE}.jsonnet"
+TREE_CFG="$(ensure_tree_config "${TREE}")"
 
 for cfg in ${GRID}; do
   cfgs="${BASE_CFG},${TREE_CFG},${INGPO_ROOT}/configs/ablations/abl1_${cfg}.jsonnet"

@@ -4,11 +4,11 @@
 
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
-INGPO_TREE="${INGPO_TREE:-666}"
+TREE="${TREE:-${INGPO_TREE:-666}}"
 ABLATIONS="${ABLATIONS:-abl1 abl2 abl3 abl4 abl5 abl6 abl7}"
 
 BASE_CFG="${INGPO_ROOT}/configs/polIter_qwen1_5b_base_ingpo_tree_MATH.jsonnet"
-TREE_CFG="${INGPO_ROOT}/configs/episode_generators/branch_factor_${INGPO_TREE}.jsonnet"
+TREE_CFG="$(ensure_tree_config "${TREE}")"
 
 run() {
   local exp="$1"
