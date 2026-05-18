@@ -878,8 +878,10 @@ class PolicyIterationRuntime(DistributedRuntime):
         def remove_null_columns(ds: Dataset):
             null_columns = []
             for k, v in ds.features.items():
-                if v.dtype == "null":
+                if getattr(v, "dtype", None) == "null":
                     null_columns.append(k)
+            if null_columns:
+                logger.warning(f"Removing null columns from episodes: {null_columns}")
             return ds.remove_columns(null_columns)
 
         # If episode_generator supports distributed, generate in all processes
