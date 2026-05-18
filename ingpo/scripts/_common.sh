@@ -86,7 +86,7 @@ ensure_runtime_config() {
   local gen_dir="${APP_DIRECTORY}/_generated_configs/runtime_overrides"
   local out="${gen_dir}/short_run_fast_runtime.jsonnet"
 
-  local eval_every="${INGPO_EVAL_EVERY_N_ITERATIONS:-1000}"
+  local eval_every="${INGPO_EVAL_EVERY_N_ITERATIONS:-100}"
   local save_steps="${INGPO_SAVE_STEPS:-1}"
   local keep_steps="${INGPO_CHECKPOINT_KEEP_STEPS:-1}"
   local vllm_gpu_mem
